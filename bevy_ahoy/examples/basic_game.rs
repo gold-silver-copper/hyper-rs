@@ -33,8 +33,8 @@ const ROOM_GRID_SIZE: f32 = 8.0;
 const PLAYER_SPAWN_CLEARANCE: f32 = 2.4;
 const WALL_RUN_SPEED: f32 = 11.5;
 const WALL_RUN_STICK_SPEED: f32 = 2.0;
-const SURF_WEDGE_THICKNESS: f32 = 0.22;
-const SURF_RIDGE_HALF_WIDTH: f32 = 0.04;
+const SURF_WEDGE_THICKNESS: f32 = 0.16;
+const SURF_RIDGE_HALF_WIDTH: f32 = 0.14;
 const WALL_RUN_FALL_SPEED: f32 = 2.25;
 const WALL_RUN_MIN_SPEED: f32 = 4.0;
 const WALL_RUN_DURATION: f32 = 0.95;
@@ -1385,7 +1385,7 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
         let projected_gap = projected_gap(step_distance, rooms.last().unwrap().size, room_size);
         let template = choose_module_template(rng, current_socket, difficulty, projected_gap);
         step_distance = match template.kind {
-            ModuleKind::SurfRamp => rng.range_f32(CELL_SIZE * 1.5, CELL_SIZE * 2.18),
+            ModuleKind::SurfRamp => rng.range_f32(CELL_SIZE * 6.0, CELL_SIZE * 10.0),
             ModuleKind::StairRun => rng.range_f32(CELL_SIZE * 1.22, CELL_SIZE * 1.7),
             _ => step_distance,
         };
@@ -1927,10 +1927,10 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.2,
             max_difficulty: 0.92,
             weight: 7,
-            min_rise: 1.7,
-            max_rise: 4.1,
-            min_gap: 13.0,
-            max_gap: 38.0,
+            min_rise: 6.0,
+            max_rise: 15.0,
+            min_gap: 8.0,
+            max_gap: 220.0,
             shortcut_eligible: false,
         },
         ModuleKind::MantleStack => ModuleTemplate {
@@ -3196,40 +3196,53 @@ fn append_css_surf_sequence(
     intense: bool,
 ) {
     let along_x = forward.x.abs() > 0.5;
-    let total_distance = start.distance(end).max(12.0);
-    let segment_count = if intense {
-        ((total_distance / 3.8).round() as usize).clamp(7, 13)
+    let direct_distance = start.distance(end).max(12.0);
+    let entry_margin = if intense {
+        (direct_distance * 0.08).clamp(6.0, 12.0)
     } else {
-        ((total_distance / 4.6).round() as usize).clamp(5, 10)
+        (direct_distance * 0.07).clamp(4.5, 9.0)
+    };
+    let exit_margin = if intense {
+        (direct_distance * 0.06).clamp(5.0, 10.0)
+    } else {
+        (direct_distance * 0.05).clamp(4.0, 7.5)
+    };
+    let surf_start = start + forward * entry_margin + Vec3::Y * 0.4;
+    let surf_end = end - forward * exit_margin + Vec3::Y * 0.18;
+    let total_distance = surf_start.distance(surf_end).max(12.0);
+    let segment_count = if intense {
+        ((total_distance / 14.0).round() as usize).clamp(10, 18)
+    } else {
+        ((total_distance / 16.0).round() as usize).clamp(8, 14)
     };
     let curve_cycles = if intense {
-        rng.range_f32(1.7, 3.3)
+        rng.range_f32(1.4, 2.4)
     } else {
-        rng.range_f32(1.2, 2.4)
+        rng.range_f32(1.0, 1.8)
     };
     let curve_phase = rng.range_f32(0.0, TAU);
     let curve_amplitude = if intense {
-        rng.range_f32(0.9, 1.8)
+        rng.range_f32(1.0, 1.8)
     } else {
-        rng.range_f32(0.7, 1.4)
+        rng.range_f32(0.8, 1.4)
     };
     let ramp_span = if intense {
-        rng.range_f32(6.4, 8.8)
+        rng.range_f32(8.8, 12.4)
     } else {
-        rng.range_f32(5.2, 7.0)
+        rng.range_f32(7.0, 9.8)
     };
     let ramp_drop = if intense {
-        rng.range_f32(5.0, 6.8)
+        rng.range_f32(11.0, 15.0)
     } else {
-        rng.range_f32(4.0, 5.4)
+        rng.range_f32(8.5, 11.5)
     };
     let ridge_lift = if intense {
-        rng.range_f32(1.7, 2.7)
+        rng.range_f32(2.8, 4.4)
     } else {
-        rng.range_f32(1.1, 1.9)
+        rng.range_f32(2.0, 3.1)
     };
-    let start_deck_length = if intense { 3.6 } else { 4.6 };
-    let finish_deck_length = if intense { 3.2 } else { 4.2 };
+    let start_deck_length = entry_margin + if intense { 4.2 } else { 3.8 };
+    let finish_deck_length = exit_margin + if intense { 3.8 } else { 3.2 };
 
     let mut centerline = Vec::with_capacity(segment_count + 1);
     for sample in 0..=segment_count {
@@ -3239,7 +3252,7 @@ fn append_css_surf_sequence(
         let harmonic = (t * (curve_cycles * 0.5 + 0.65) * TAU + curve_phase * 0.37).sin();
         let offset = right * (weave * 0.72 + harmonic * 0.28) * curve_amplitude * envelope;
         let lift = Vec3::Y * ridge_lift * envelope;
-        centerline.push(start.lerp(end, t) + offset + lift);
+        centerline.push(surf_start.lerp(surf_end, t) + offset + lift);
     }
 
     layout.solids.push(SolidSpec {
@@ -3249,8 +3262,8 @@ fn append_css_surf_sequence(
         } else {
             "Flow Start Deck".into()
         },
-        center: top_to_center(start + Vec3::Y * 0.16, 0.28),
-        size: axis_box_size(along_x, start_deck_length, 0.28, 4.2),
+        center: top_to_center(start.lerp(surf_start, 0.52) + Vec3::Y * 0.16, 0.28),
+        size: axis_box_size(along_x, start_deck_length, 0.28, 4.8),
         paint: PaintStyle::ThemeFloor(theme),
         body: SolidBody::Static,
         friction: Some(0.035),
@@ -3266,7 +3279,7 @@ fn append_css_surf_sequence(
             continue;
         }
         let ridge = section_start.lerp(section_end, 0.5);
-        let ramp_length = (section_delta.length() * 1.22).max(if intense { 7.8 } else { 6.6 });
+        let ramp_length = (section_delta.length() * 1.01).max(if intense { 9.5 } else { 8.0 });
         let size = Vec3::new(ramp_length, ramp_drop, ramp_span);
         let rotation = surf_ramp_rotation(local_forward);
 
@@ -3302,8 +3315,8 @@ fn append_css_surf_sequence(
         } else {
             "Flow Finish Deck".into()
         },
-        center: top_to_center(end + Vec3::Y * 0.16, 0.28),
-        size: axis_box_size(along_x, finish_deck_length, 0.28, 4.0),
+        center: top_to_center(surf_end.lerp(end, 0.48) + Vec3::Y * 0.16, 0.28),
+        size: axis_box_size(along_x, finish_deck_length, 0.28, 4.4),
         paint: PaintStyle::ThemeFloor(theme),
         body: SolidBody::Static,
         friction: Some(0.032),
@@ -3774,6 +3787,7 @@ fn surf_wedge_lip_to_center(lip: Vec3, _size: Vec3, _rotation: Quat, _wall_side:
     lip
 }
 
+#[cfg(test)]
 fn surf_wedge_surface_normal(size: Vec3, wall_side: f32) -> Vec3 {
     Vec3::new(0.0, size.z, wall_side * size.y).normalize_or_zero()
 }
@@ -3783,8 +3797,7 @@ fn surf_wedge_points(size: Vec3, wall_side: f32) -> Vec<Vec3> {
     let outer_z = wall_side * (SURF_RIDGE_HALF_WIDTH + size.z);
     let ridge_z = wall_side * SURF_RIDGE_HALF_WIDTH;
     let rise = size.y;
-    let normal = surf_wedge_surface_normal(size, wall_side);
-    let inset = -normal * SURF_WEDGE_THICKNESS;
+    let inset = Vec3::new(0.0, -SURF_WEDGE_THICKNESS, 0.0);
 
     let front_ridge = Vec3::new(-half_length, 0.0, ridge_z);
     let back_ridge = Vec3::new(half_length, 0.0, ridge_z);
