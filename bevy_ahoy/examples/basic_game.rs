@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    f32::consts::TAU,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -7,7 +8,7 @@ use avian3d::prelude::*;
 use bevy::{
     color::palettes::tailwind,
     input::common_conditions::input_just_pressed,
-    math::primitives::Cuboid,
+    math::primitives::{Cuboid, Sphere},
     prelude::*,
     window::{CursorGrabMode, CursorOptions, WindowResolution},
 };
@@ -27,17 +28,19 @@ const ROOM_HEIGHT: f32 = 1.2;
 const ROOM_CLEARANCE_HEIGHT: f32 = 3.4;
 const CELL_SIZE: f32 = 22.0;
 const PLAYER_SPAWN_CLEARANCE: f32 = 2.4;
-const CHECKPOINT_INTERVAL: usize = 3;
 const WALL_RUN_SPEED: f32 = 11.5;
 const WALL_RUN_STICK_SPEED: f32 = 2.0;
 const WALL_RUN_FALL_SPEED: f32 = 2.25;
 const WALL_RUN_MIN_SPEED: f32 = 4.0;
 const WALL_RUN_DURATION: f32 = 0.95;
 const WALL_RUN_COOLDOWN: f32 = 0.2;
+const WALL_SHAFT_BOOST_SPEED: f32 = 8.8;
+const WALL_SHAFT_REPEAT: f32 = 0.11;
 const TREASURE_PICKUP_RADIUS: f32 = 1.8;
 const CHECKPOINT_RADIUS: f32 = 2.8;
 const SUMMIT_RADIUS: f32 = 4.5;
 const SHORTCUT_TRIGGER_RADIUS: f32 = 2.0;
+const SKY_RADIUS: f32 = 950.0;
 
 type SocketMask = u32;
 const SOCKET_SAFE_REST: SocketMask = 1 << 0;
@@ -90,7 +93,12 @@ fn main() -> AppExit {
         )
         .add_systems(
             FixedUpdate,
-            (move_movers, update_crumbling_platforms, apply_wind),
+            (
+                move_movers,
+                update_crumbling_platforms,
+                apply_wind,
+                contain_floating_spheres,
+            ),
         )
         .add_systems(
             FixedPostUpdate,
@@ -201,7 +209,7 @@ fn update_hud(
     let objective = if run.finished {
         "Summit reached. F5 reruns this seed, F6 rolls a new tower."
     } else {
-        "Goal: reach the beacon at the top. F5 same seed, F6 fresh seed."
+        "Goal: reach the beacon. Falling respawns at the highest room you've reached."
     };
 
     hud.0 = format!(
@@ -214,7 +222,7 @@ fn update_hud(
          Gen: attempts {attempts}, repairs {repairs}, overlaps {overlaps}, clearance {clearance}, reach {reach}\n\
          {objective}\n\
          Controls: WASD move | hold Space bhop/jump | Ctrl crouch/mantle\n\
-         RMB pull/drop props | LMB throw | R reset to checkpoint",
+         Hold Space in narrow shafts to climb between walls | RMB pull/drop props | LMB throw",
         seed = run.seed,
         floors = run.floors,
         checkpoint = run.current_checkpoint + 1,
@@ -550,6 +558,13 @@ struct WindZone {
 }
 
 #[derive(Component)]
+struct FloatingSphere {
+    home: Vec3,
+    bounds: Vec3,
+    radius: f32,
+}
+
+#[derive(Component)]
 struct LethalHazard;
 
 #[derive(Component)]
@@ -728,10 +743,12 @@ struct WallRunState {
     active: bool,
     time_left: f32,
     cooldown: f32,
+    shaft_cooldown: f32,
 }
 
 fn apply_wall_run(
     time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
     mut players: Query<
         (
             &CharacterLook,
@@ -747,6 +764,7 @@ fn apply_wall_run(
     let dt = time.delta_secs();
     for (look, state, output, water, mut velocity, mut wall_run) in &mut players {
         wall_run.cooldown = (wall_run.cooldown - dt).max(0.0);
+        wall_run.shaft_cooldown = (wall_run.shaft_cooldown - dt).max(0.0);
 
         let horizontal_velocity = Vec3::new(velocity.x, 0.0, velocity.z);
         let horizontal_speed = horizontal_velocity.length();
@@ -758,6 +776,24 @@ fn apply_wall_run(
         } else {
             look_forward
         };
+
+        if let Some((_left, _right)) = find_wall_shaft(output) {
+            if state.grounded.is_none()
+                && state.mantle.is_none()
+                && state.crane_height_left.is_none()
+                && water.level <= WaterLevel::Feet
+                && keys.pressed(KeyCode::Space)
+            {
+                if wall_run.shaft_cooldown <= 0.0 {
+                    velocity.x *= 0.3;
+                    velocity.z *= 0.3;
+                    velocity.y = velocity.y.max(WALL_SHAFT_BOOST_SPEED);
+                    wall_run.shaft_cooldown = WALL_SHAFT_REPEAT;
+                }
+                wall_run.active = false;
+                continue;
+            }
+        }
 
         let Some(wall_normal) = find_wall_normal(output, travel_dir) else {
             wall_run.active = false;
@@ -819,6 +855,30 @@ fn find_wall_normal(output: &CharacterControllerOutput, travel_dir: Vec3) -> Opt
     }
 
     best_normal
+}
+
+fn find_wall_shaft(output: &CharacterControllerOutput) -> Option<(Vec3, Vec3)> {
+    let walls = output
+        .touching_entities
+        .iter()
+        .filter_map(|touch| {
+            if touch.normal.y.abs() > 0.2 {
+                return None;
+            }
+            let normal = Vec3::new(touch.normal.x, 0.0, touch.normal.z).normalize_or_zero();
+            (normal != Vec3::ZERO).then_some(normal)
+        })
+        .collect::<Vec<_>>();
+
+    for (index, normal) in walls.iter().enumerate() {
+        for other in walls.iter().skip(index + 1) {
+            if normal.dot(*other) < -0.82 {
+                return Some((*normal, *other));
+            }
+        }
+    }
+
+    None
 }
 
 fn move_movers(mut movers: Query<(&GlobalTransform, &mut LinearVelocity, &mut Mover)>) {
@@ -890,6 +950,36 @@ fn apply_wind(
                 0.7 + 0.3 * ((time.elapsed_secs() * zone.gust).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
             velocity.0 +=
                 zone.direction.normalize_or_zero() * zone.strength * pulse * time.delta_secs();
+        }
+    }
+}
+
+fn contain_floating_spheres(
+    mut spheres: Query<(&Transform, &mut LinearVelocity, &FloatingSphere)>,
+) {
+    for (transform, mut velocity, sphere) in &mut spheres {
+        let local = transform.translation - sphere.home;
+        let limits = sphere.bounds - Vec3::splat(sphere.radius);
+        if local.x.abs() > limits.x {
+            velocity.x = if local.x > 0.0 {
+                -velocity.x.abs().max(2.5)
+            } else {
+                velocity.x.abs().max(2.5)
+            };
+        }
+        if local.y.abs() > limits.y {
+            velocity.y = if local.y > 0.0 {
+                -velocity.y.abs().max(2.2)
+            } else {
+                velocity.y.abs().max(2.2)
+            };
+        }
+        if local.z.abs() > limits.z {
+            velocity.z = if local.z > 0.0 {
+                -velocity.z.abs().max(2.5)
+            } else {
+                velocity.z.abs().max(2.5)
+            };
         }
     }
 }
@@ -1157,50 +1247,63 @@ struct RepairStats {
 }
 
 fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
-    let floors = rng.range_usize(12, 17);
+    let floors = rng.range_usize(16, 23);
     let mut rooms = Vec::with_capacity(floors);
     let mut segments = Vec::with_capacity(floors.saturating_sub(1));
-    let mut occupied_rooms = HashSet::default();
+    let mut occupied_rooms: HashSet<IVec2> = HashSet::default();
     let mut occupied_branches = HashSet::default();
     let theme_offset = (rng.next_u64() % 4) as usize;
 
     let mut cell = IVec2::ZERO;
-    let mut heading = IVec2::NEG_Y;
+    let clockwise = rng.chance(0.5);
+    let turn_dirs = if clockwise {
+        [IVec2::X, IVec2::Y, IVec2::NEG_X, IVec2::NEG_Y]
+    } else {
+        [IVec2::X, IVec2::NEG_Y, IVec2::NEG_X, IVec2::Y]
+    };
+    let mut dir_index = rng.range_usize(0, turn_dirs.len());
+    let mut heading = turn_dirs[dir_index];
+    let mut leg_length = 1;
+    let mut leg_progress = 0;
+    let mut legs_at_length = 0;
     let mut current_socket = SOCKET_SAFE_REST;
     let mut current_height = 2.0;
-    let mut next_checkpoint_slot = 1_usize;
 
     occupied_rooms.insert(cell);
     rooms.push(RoomPlan {
         index: 0,
         cell,
         top: Vec3::new(0.0, current_height, 0.0),
-        size: Vec2::splat(13.8),
+        size: Vec2::splat(13.5),
         theme: theme_for(0, floors, theme_offset),
         checkpoint_slot: Some(0),
     });
 
     for index in 1..floors {
         let difficulty = index as f32 / (floors.saturating_sub(1).max(1)) as f32;
-        let next_cell = choose_next_cell(rng, cell, heading, &occupied_rooms);
-        heading = next_cell - cell;
-        cell = next_cell;
+        if leg_progress >= leg_length {
+            leg_progress = 0;
+            dir_index = (dir_index + 1) % turn_dirs.len();
+            heading = turn_dirs[dir_index];
+            legs_at_length += 1;
+            if legs_at_length >= 2 {
+                legs_at_length = 0;
+                leg_length += 1;
+            }
+        }
+
+        cell += heading;
+        leg_progress += 1;
         occupied_rooms.insert(cell);
 
-        let room_size = Vec2::splat(lerp(13.6, 9.1, difficulty)).max(Vec2::splat(8.8));
+        let room_size = Vec2::splat(lerp(13.2, 9.8, difficulty)).max(Vec2::splat(9.2));
         let projected_gap = projected_gap(rooms.last().unwrap().size, room_size);
         let template = choose_module_template(rng, current_socket, difficulty, projected_gap);
-        let rise = rng.range_f32(template.min_rise, template.max_rise) + difficulty * 0.4;
+        let rise = rng.range_f32(template.min_rise, template.max_rise) + difficulty * 0.12;
         current_height += rise;
-
-        let is_checkpoint = index % CHECKPOINT_INTERVAL == 0 || index == floors - 1;
-        let checkpoint_slot = if is_checkpoint {
-            let slot = next_checkpoint_slot;
-            next_checkpoint_slot += 1;
-            Some(slot)
-        } else {
-            None
-        };
+        let bend = Vec3::new(-heading.y as f32, 0.0, heading.x as f32)
+            * rng.range_f32(-1.6, 1.6)
+            * (0.35 + difficulty * 0.3);
 
         rooms.push(RoomPlan {
             index,
@@ -1209,14 +1312,14 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
                 cell.x as f32 * CELL_SIZE,
                 current_height,
                 cell.y as f32 * CELL_SIZE,
-            ),
+            ) + bend,
             size: if index == floors - 1 {
-                Vec2::splat(14.2)
+                Vec2::splat(15.2)
             } else {
                 room_size
             },
             theme: theme_for(index, floors, theme_offset),
-            checkpoint_slot,
+            checkpoint_slot: Some(index),
         });
 
         let shortcut_id = if template.shortcut_eligible && difficulty > 0.45 && rng.chance(0.45) {
@@ -1241,7 +1344,7 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
     let branches = generate_side_branches(seed, rng, &rooms, &segments, &mut occupied_branches);
     let spawn = rooms[0].top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, rooms[0].size.y * 0.18);
     let summit = rooms.last().unwrap().top + Vec3::new(0.0, 1.4, 0.0);
-    let death_plane = -18.0;
+    let death_plane = rooms[0].top.y - 55.0;
 
     RunBlueprint {
         seed,
@@ -1596,45 +1699,6 @@ fn segment_reachable(segment: &SegmentPlan, rooms: &[RoomPlan]) -> bool {
         && gap <= template.max_gap + 1.8
 }
 
-fn choose_next_cell(
-    rng: &mut RunRng,
-    cell: IVec2,
-    heading: IVec2,
-    occupied: &HashSet<IVec2>,
-) -> IVec2 {
-    let dirs = [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y];
-    let mut weighted = Vec::with_capacity(dirs.len());
-
-    for dir in dirs {
-        if dir == -heading {
-            continue;
-        }
-
-        let next = cell + dir;
-        let radius = next.x.abs().max(next.y.abs());
-        let mut weight = 3_u32;
-        if dir == heading {
-            weight += 4;
-        }
-        if !occupied.contains(&next) {
-            weight += 5;
-        }
-        if radius <= 5 {
-            weight += 2;
-        }
-        if radius >= 7 {
-            weight = weight.saturating_sub(2);
-        }
-        weighted.push((next, weight));
-    }
-
-    if weighted.is_empty() {
-        return cell + heading;
-    }
-
-    rng.weighted_choice(&weighted)
-}
-
 fn choose_module_template(
     rng: &mut RunRng,
     current_socket: SocketMask,
@@ -1708,10 +1772,10 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             entry: SOCKET_SAFE_REST | SOCKET_SHORTCUT_ANCHOR,
             exit: SOCKET_SAFE_REST | SOCKET_MANTLE_ENTRY,
             min_difficulty: 0.0,
-            max_difficulty: 0.45,
+            max_difficulty: 0.55,
             weight: 7,
-            min_rise: 3.6,
-            max_rise: 5.5,
+            min_rise: 1.0,
+            max_rise: 1.8,
             min_gap: 7.0,
             max_gap: 10.5,
             shortcut_eligible: false,
@@ -1723,8 +1787,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.15,
             max_difficulty: 0.72,
             weight: 5,
-            min_rise: 4.2,
-            max_rise: 6.8,
+            min_rise: 1.4,
+            max_rise: 2.4,
             min_gap: 7.0,
             max_gap: 10.5,
             shortcut_eligible: false,
@@ -1733,13 +1797,13 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             kind,
             entry: SOCKET_SAFE_REST | SOCKET_WALLRUN_READY,
             exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
-            min_difficulty: 0.25,
-            max_difficulty: 1.0,
-            weight: 5,
-            min_rise: 4.4,
-            max_rise: 6.8,
-            min_gap: 8.2,
-            max_gap: 11.5,
+            min_difficulty: 0.28,
+            max_difficulty: 0.9,
+            weight: 3,
+            min_rise: 2.8,
+            max_rise: 4.4,
+            min_gap: 4.8,
+            max_gap: 7.2,
             shortcut_eligible: true,
         },
         ModuleKind::LiftChasm => ModuleTemplate {
@@ -1749,8 +1813,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.22,
             max_difficulty: 1.0,
             weight: 4,
-            min_rise: 4.8,
-            max_rise: 7.8,
+            min_rise: 1.6,
+            max_rise: 2.8,
             min_gap: 8.0,
             max_gap: 11.8,
             shortcut_eligible: true,
@@ -1762,8 +1826,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.34,
             max_difficulty: 1.0,
             weight: 4,
-            min_rise: 4.6,
-            max_rise: 7.0,
+            min_rise: 1.4,
+            max_rise: 2.4,
             min_gap: 8.0,
             max_gap: 11.6,
             shortcut_eligible: true,
@@ -1775,8 +1839,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.42,
             max_difficulty: 1.0,
             weight: 4,
-            min_rise: 4.8,
-            max_rise: 7.2,
+            min_rise: 1.6,
+            max_rise: 2.8,
             min_gap: 7.8,
             max_gap: 11.2,
             shortcut_eligible: true,
@@ -1788,8 +1852,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.48,
             max_difficulty: 1.0,
             weight: 3,
-            min_rise: 5.2,
-            max_rise: 8.2,
+            min_rise: 1.8,
+            max_rise: 3.0,
             min_gap: 8.0,
             max_gap: 11.6,
             shortcut_eligible: true,
@@ -1801,8 +1865,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.55,
             max_difficulty: 1.0,
             weight: 3,
-            min_rise: 5.4,
-            max_rise: 8.4,
+            min_rise: 1.8,
+            max_rise: 3.2,
             min_gap: 8.4,
             max_gap: 12.0,
             shortcut_eligible: true,
@@ -1814,8 +1878,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.44,
             max_difficulty: 1.0,
             weight: 4,
-            min_rise: 4.8,
-            max_rise: 7.4,
+            min_rise: 1.5,
+            max_rise: 2.6,
             min_gap: 8.0,
             max_gap: 11.4,
             shortcut_eligible: false,
@@ -1827,8 +1891,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.18,
             max_difficulty: 0.68,
             weight: 3,
-            min_rise: 3.8,
-            max_rise: 5.8,
+            min_rise: 1.0,
+            max_rise: 1.9,
             min_gap: 7.0,
             max_gap: 10.5,
             shortcut_eligible: false,
@@ -1840,8 +1904,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.4,
             max_difficulty: 1.0,
             weight: 3,
-            min_rise: 4.8,
-            max_rise: 7.6,
+            min_rise: 1.5,
+            max_rise: 2.8,
             min_gap: 7.8,
             max_gap: 11.2,
             shortcut_eligible: true,
@@ -1850,9 +1914,7 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
 }
 
 fn safe_fallback_kind(difficulty: f32) -> ModuleKind {
-    if difficulty > 0.55 {
-        ModuleKind::LiftChasm
-    } else if difficulty > 0.25 {
+    if difficulty > 0.3 {
         ModuleKind::MantleStack
     } else {
         ModuleKind::StairRun
@@ -1867,23 +1929,8 @@ fn spawn_run_world(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) -> RunSnapshot {
-    spawn_box_spec(
-        &SolidSpec {
-            owner: OwnerTag::Summit,
-            label: "Abyss Floor".into(),
-            center: Vec3::new(0.0, -2.0, 0.0),
-            size: Vec3::new(260.0, 2.0, 260.0),
-            paint: PaintStyle::ThemeShadow(Theme::Stone),
-            body: SolidBody::Static,
-            friction: None,
-            extra: ExtraKind::None,
-        },
-        collected_treasures,
-        unlocked_shortcuts,
-        commands,
-        meshes,
-        materials,
-    );
+    spawn_sky_backdrop(blueprint, commands, meshes, materials);
+    spawn_floating_spheres(blueprint, commands, meshes, materials);
 
     let mut checkpoints = Vec::new();
     let mut total_treasures = 0;
@@ -1937,26 +1984,266 @@ fn spawn_run_world(
         materials,
     );
 
-    commands.spawn((
-        GeneratedWorld,
-        Name::new("Sun"),
-        Transform::from_xyz(
-            blueprint.summit.x - 34.0,
-            blueprint.summit.y + 42.0,
-            blueprint.summit.z + 28.0,
-        )
-        .looking_at(Vec3::new(0.0, blueprint.summit.y * 0.5, 0.0), Vec3::Y),
-        DirectionalLight {
-            shadows_enabled: true,
-            illuminance: 28_000.0,
-            ..default()
-        },
-    ));
-
     RunSnapshot {
         checkpoints,
         total_treasures,
     }
+}
+
+fn spawn_sky_backdrop(
+    blueprint: &RunBlueprint,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let center = blueprint
+        .rooms
+        .iter()
+        .map(|room| room.top)
+        .fold(Vec3::ZERO, |acc, top| acc + top)
+        / blueprint.rooms.len().max(1) as f32;
+
+    let sky_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.012, 0.02, 0.055),
+        emissive: LinearRgba::rgb(0.02, 0.035, 0.08),
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    });
+    let haze_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.17, 0.34, 0.82, 0.07),
+        emissive: LinearRgba::rgb(0.06, 0.1, 0.24),
+        unlit: true,
+        cull_mode: None,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    let star_mesh = meshes.add(Sphere::new(0.8).mesh().ico(3).unwrap());
+    let dome_mesh = meshes.add(Sphere::new(1.0).mesh().ico(6).unwrap());
+
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Sky Dome"),
+        Mesh3d(dome_mesh.clone()),
+        MeshMaterial3d(sky_material),
+        Transform::from_translation(center + Vec3::Y * 120.0).with_scale(Vec3::splat(SKY_RADIUS)),
+    ));
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Sky Haze"),
+        Mesh3d(dome_mesh),
+        MeshMaterial3d(haze_material),
+        Transform::from_translation(center + Vec3::Y * 80.0)
+            .with_scale(Vec3::splat(SKY_RADIUS * 0.78)),
+    ));
+
+    for star_index in 0..280 {
+        let f = star_index as f32 / 280.0;
+        let theta = TAU * f * 21.0;
+        let y = 1.0 - 2.0 * (star_index as f32 + 0.5) / 280.0;
+        let r = (1.0 - y * y).sqrt();
+        let direction = Vec3::new(r * theta.cos(), y, r * theta.sin());
+        let position = center + Vec3::Y * 120.0 + direction * (SKY_RADIUS * 0.9);
+        let size = 0.25 + ((star_index * 37 % 11) as f32) * 0.03;
+        let tint = if star_index % 9 == 0 {
+            Color::srgb(0.72, 0.84, 1.0)
+        } else if star_index % 7 == 0 {
+            Color::srgb(1.0, 0.9, 0.82)
+        } else {
+            Color::srgb(0.96, 0.98, 1.0)
+        };
+        let star_material = materials.add(StandardMaterial {
+            base_color: tint,
+            emissive: LinearRgba::from(tint) * (0.8 + size * 0.5),
+            unlit: true,
+            ..default()
+        });
+        commands.spawn((
+            GeneratedWorld,
+            Name::new("Star"),
+            Mesh3d(star_mesh.clone()),
+            MeshMaterial3d(star_material),
+            Transform::from_translation(position).with_scale(Vec3::splat(size)),
+        ));
+    }
+
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Sun"),
+        Transform::from_xyz(
+            blueprint.summit.x - 80.0,
+            blueprint.summit.y + 140.0,
+            blueprint.summit.z + 90.0,
+        )
+        .looking_at(center + Vec3::Y * 10.0, Vec3::Y),
+        DirectionalLight {
+            shadows_enabled: true,
+            illuminance: 32_000.0,
+            color: Color::srgb(1.0, 0.94, 0.88),
+            ..default()
+        },
+    ));
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Sun Sphere"),
+        Mesh3d(meshes.add(Sphere::new(1.0).mesh().ico(5).unwrap())),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.9, 0.78),
+            emissive: LinearRgba::rgb(2.5, 1.8, 1.2),
+            unlit: true,
+            ..default()
+        })),
+        Transform::from_xyz(
+            blueprint.summit.x - 220.0,
+            blueprint.summit.y + 210.0,
+            blueprint.summit.z + 170.0,
+        )
+        .with_scale(Vec3::splat(28.0)),
+    ));
+}
+
+fn spawn_floating_spheres(
+    blueprint: &RunBlueprint,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let sphere_mesh = meshes.add(Sphere::new(1.0).mesh().ico(5).unwrap());
+    let center = blueprint
+        .rooms
+        .iter()
+        .map(|room| room.top)
+        .fold(Vec3::ZERO, |acc, top| acc + top)
+        / blueprint.rooms.len().max(1) as f32;
+    let mut rng = RunRng::new(blueprint.seed ^ 0x5151_AAAA_9999_7777);
+    let anchor_indices = [
+        2_usize,
+        blueprint.rooms.len() / 2,
+        blueprint.rooms.len().saturating_sub(3),
+    ];
+
+    for (sphere_index, room_index) in anchor_indices.into_iter().enumerate() {
+        let room = &blueprint.rooms[room_index.min(blueprint.rooms.len() - 1)];
+        let radius = match sphere_index {
+            0 => 6.5,
+            1 => 13.5,
+            _ => 20.0,
+        };
+        let dir = if sphere_index % 2 == 0 {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3::new(0.0, 0.0, 1.0)
+        };
+        let distance = room.size.max_element() * 0.5 + radius + 2.4;
+        let center_pos = room.top + dir * distance + Vec3::Y * (1.8 - radius * 0.18);
+        spawn_floating_sphere_entity(
+            commands,
+            sphere_mesh.clone(),
+            materials,
+            radius,
+            center_pos,
+            center,
+            Vec3::new(90.0, 55.0, 90.0),
+            Vec3::new(
+                rng.range_f32(-3.6, 3.6),
+                rng.range_f32(-1.8, 1.8),
+                rng.range_f32(-3.6, 3.6),
+            ),
+            Vec3::new(
+                rng.range_f32(-0.7, 0.7),
+                rng.range_f32(-0.7, 0.7),
+                rng.range_f32(-0.7, 0.7),
+            ),
+            Color::srgb(
+                0.35 + sphere_index as f32 * 0.1,
+                0.55 + sphere_index as f32 * 0.08,
+                0.82,
+            ),
+        );
+    }
+
+    for sphere_index in 0..5 {
+        let radius = rng.range_f32(4.0, 11.0);
+        let angle = TAU * (sphere_index as f32 / 5.0) + rng.range_f32(-0.4, 0.4);
+        let distance = rng.range_f32(36.0, 74.0);
+        let center_pos = center
+            + Vec3::new(
+                angle.cos() * distance,
+                rng.range_f32(6.0, 28.0),
+                angle.sin() * distance,
+            );
+        spawn_floating_sphere_entity(
+            commands,
+            sphere_mesh.clone(),
+            materials,
+            radius,
+            center_pos,
+            center,
+            Vec3::new(95.0, 58.0, 95.0),
+            Vec3::new(
+                rng.range_f32(-4.2, 4.2),
+                rng.range_f32(-2.4, 2.4),
+                rng.range_f32(-4.2, 4.2),
+            ),
+            Vec3::new(
+                rng.range_f32(-1.2, 1.2),
+                rng.range_f32(-1.2, 1.2),
+                rng.range_f32(-1.2, 1.2),
+            ),
+            Color::srgb(
+                rng.range_f32(0.3, 0.7),
+                rng.range_f32(0.45, 0.75),
+                rng.range_f32(0.75, 1.0),
+            ),
+        );
+    }
+}
+
+fn spawn_floating_sphere_entity(
+    commands: &mut Commands,
+    mesh: Handle<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    radius: f32,
+    center_pos: Vec3,
+    home: Vec3,
+    bounds: Vec3,
+    linear_velocity: Vec3,
+    angular_velocity: Vec3,
+    tint: Color,
+) {
+    let mut entity = commands.spawn((
+        GeneratedWorld,
+        Name::new("Floating Sphere"),
+        Mesh3d(mesh),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: tint,
+            emissive: LinearRgba::from(tint) * 0.08,
+            reflectance: 0.5,
+            perceptual_roughness: 0.3,
+            ..default()
+        })),
+        Transform::from_translation(center_pos).with_scale(Vec3::splat(radius)),
+        RigidBody::Dynamic,
+        Collider::sphere(radius),
+        CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
+    ));
+
+    entity.insert((
+        GravityScale(0.0),
+        Restitution::new(0.92),
+        Friction::new(0.82),
+        Mass((radius * radius * radius * 2.0).max(220.0)),
+        LinearVelocity(linear_velocity),
+        AngularVelocity(angular_velocity),
+        LinearDamping(0.03),
+        AngularDamping(0.02),
+        TransformInterpolation,
+        FloatingSphere {
+            home,
+            bounds,
+            radius,
+        },
+    ));
 }
 
 fn spawn_layout(
@@ -2177,26 +2464,12 @@ fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
         extra: ExtraKind::None,
     });
 
-    let support_top = room.top.y - ROOM_HEIGHT;
-    if support_top > -0.2 {
-        layout.solids.push(SolidSpec {
-            owner,
-            label: format!("Room {} Support", room.index),
-            center: Vec3::new(room.top.x, (support_top - 1.0) * 0.5, room.top.z),
-            size: Vec3::new(2.3, support_top + 1.0, 2.3),
-            paint: PaintStyle::ThemeShadow(room.theme),
-            body: SolidBody::Static,
-            friction: None,
-            extra: ExtraKind::None,
-        });
-    }
-
     if let Some(index) = room.checkpoint_slot {
         layout.solids.push(SolidSpec {
             owner,
             label: format!("Checkpoint {}", room.index),
-            center: top_to_center(room.top + Vec3::Y * 0.22, 0.22),
-            size: Vec3::new(3.4, 0.22, 3.4),
+            center: top_to_center(room.top + Vec3::Y * 0.18, 0.18),
+            size: Vec3::new(2.9, 0.18, 2.9),
             paint: PaintStyle::Checkpoint,
             body: SolidBody::Decoration,
             friction: None,
@@ -2290,47 +2563,70 @@ fn build_segment_layout(
             });
         }
         ModuleKind::WallRunHall => {
-            let wall_side = if rng.chance(0.5) { 1.0 } else { -1.0 };
-            let wall_height = rise + 7.6;
-            let wall_mid = start.lerp(end, 0.52) + right * wall_side * 3.9;
+            let shaft_center = start.lerp(end, 0.5);
+            let shaft_floor_top = Vec3::new(shaft_center.x, from.top.y + 0.35, shaft_center.z);
+            let shaft_height = (to.top.y - shaft_floor_top.y + 1.2).max(5.2);
+            let wall_length = 4.8;
+            let wall_thickness = 0.72;
+            let gap_half = 1.08;
+
             layout.solids.push(SolidSpec {
                 owner,
-                label: "Wall Run Wall".into(),
-                center: Vec3::new(
-                    wall_mid.x,
-                    underside_y(from.top.y, ROOM_HEIGHT) + wall_height * 0.5,
-                    wall_mid.z,
-                ),
-                size: axis_box_size(
-                    along_x,
-                    (end - start).xz().length() + 5.0,
-                    wall_height,
-                    1.12,
-                ),
-                paint: PaintStyle::ThemeShadow(to.theme),
-                body: SolidBody::Static,
-                friction: None,
-                extra: ExtraKind::None,
-            });
-            layout.solids.push(SolidSpec {
-                owner,
-                label: "Kick Pad".into(),
-                center: top_to_center(start + right * wall_side * 1.1 + Vec3::Y * 0.58, 0.75),
-                size: axis_box_size(along_x, 2.7, 0.75, 2.7),
+                label: "Shaft Entry".into(),
+                center: top_to_center(start.lerp(end, 0.24) + Vec3::Y * 0.24, 0.5),
+                size: axis_box_size(along_x, 3.0, 0.5, 3.2),
                 paint: PaintStyle::ThemeAccent(to.theme),
                 body: SolidBody::Static,
                 friction: None,
                 extra: ExtraKind::None,
             });
+
+            for side in [-1.0, 1.0] {
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: "Shaft Wall".into(),
+                    center: Vec3::new(
+                        shaft_center.x + right.x * side * (gap_half + wall_thickness * 0.5),
+                        shaft_floor_top.y + shaft_height * 0.5 - 0.2,
+                        shaft_center.z + right.z * side * (gap_half + wall_thickness * 0.5),
+                    ),
+                    size: axis_box_size(along_x, wall_length, shaft_height, wall_thickness),
+                    paint: PaintStyle::ThemeShadow(to.theme),
+                    body: SolidBody::Static,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+
             layout.solids.push(SolidSpec {
                 owner,
-                label: "Wall Run Rest".into(),
-                center: top_to_center(
-                    start.lerp(end, 0.6) - right * wall_side * 2.5 + Vec3::Y * 1.0,
-                    0.82,
-                ),
-                size: axis_box_size(along_x, 3.0, 0.82, 3.2),
+                label: "Shaft Floor".into(),
+                center: top_to_center(shaft_floor_top, 0.46),
+                size: axis_box_size(along_x, wall_length - 0.2, 0.46, gap_half * 1.7),
                 paint: PaintStyle::ThemeFloor(to.theme),
+                body: SolidBody::Static,
+                friction: None,
+                extra: ExtraKind::None,
+            });
+            layout.solids.push(SolidSpec {
+                owner,
+                label: "Shaft Exit".into(),
+                center: top_to_center(end + Vec3::Y * 0.22, 0.48),
+                size: axis_box_size(along_x, 3.4, 0.48, 3.4),
+                paint: PaintStyle::ThemeFloor(to.theme),
+                body: SolidBody::Static,
+                friction: None,
+                extra: ExtraKind::None,
+            });
+            layout.solids.push(SolidSpec {
+                owner,
+                label: "Exit Ramp".into(),
+                center: top_to_center(
+                    shaft_center.lerp(end, 0.6) + Vec3::Y * (rise * 0.72 - 0.1),
+                    0.4,
+                ),
+                size: axis_box_size(along_x, 2.8, 0.4, 2.6),
+                paint: PaintStyle::ThemeAccent(to.theme),
                 body: SolidBody::Static,
                 friction: None,
                 extra: ExtraKind::None,
@@ -2661,20 +2957,6 @@ fn build_branch_layout(
         },
         extra: ExtraKind::None,
     });
-
-    let support_top = platform_top.y - 0.82;
-    if support_top > -0.2 {
-        layout.solids.push(SolidSpec {
-            owner,
-            label: "Branch Support".into(),
-            center: Vec3::new(platform_top.x, (support_top - 1.0) * 0.5, platform_top.z),
-            size: Vec3::new(1.7, support_top + 1.0, 1.7),
-            paint: PaintStyle::ThemeShadow(branch.theme),
-            body: SolidBody::Static,
-            friction: None,
-            extra: ExtraKind::None,
-        });
-    }
 
     match branch.kind {
         BranchKind::TreasureAlcove => {
