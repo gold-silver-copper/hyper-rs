@@ -266,9 +266,12 @@ fn queue_run_controls(
 
 fn activate_checkpoints(
     players: Query<&Transform, With<Player>>,
-    pads: Query<(&Transform, &CheckpointPad)>,
+    pads: Query<(&Transform, &CheckpointPad), Without<SpawnPlayer>>,
     mut run: ResMut<RunState>,
-    mut spawn_marker: Single<&mut Transform, (With<SpawnPlayer>, Without<Player>)>,
+    mut spawn_marker: Single<
+        &mut Transform,
+        (With<SpawnPlayer>, Without<Player>, Without<CheckpointPad>),
+    >,
 ) {
     let Ok(player) = players.single() else {
         return;
@@ -413,8 +416,11 @@ fn process_run_request(
         ),
         With<Player>,
     >,
-    mut camera: Query<&mut Transform, (With<Camera3d>, Without<Player>)>,
-    mut spawn_marker: Single<&mut Transform, (With<SpawnPlayer>, Without<Player>)>,
+    mut camera: Query<&mut Transform, (With<Camera3d>, Without<Player>, Without<SpawnPlayer>)>,
+    mut spawn_marker: Single<
+        &mut Transform,
+        (With<SpawnPlayer>, Without<Player>, Without<Camera3d>),
+    >,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
