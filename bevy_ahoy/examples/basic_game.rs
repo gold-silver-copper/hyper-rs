@@ -33,6 +33,8 @@ const ROOM_GRID_SIZE: f32 = 8.0;
 const PLAYER_SPAWN_CLEARANCE: f32 = 2.4;
 const WALL_RUN_SPEED: f32 = 11.5;
 const WALL_RUN_STICK_SPEED: f32 = 2.0;
+const SURF_WEDGE_THICKNESS: f32 = 0.22;
+const SURF_RIDGE_HALF_WIDTH: f32 = 0.04;
 const WALL_RUN_FALL_SPEED: f32 = 2.25;
 const WALL_RUN_MIN_SPEED: f32 = 4.0;
 const WALL_RUN_DURATION: f32 = 0.95;
@@ -1740,21 +1742,20 @@ impl SolidSpec {
             SolidBody::Static | SolidBody::Crumbling { .. } | SolidBody::ShortcutBridge { .. } => {
                 self.size
             }
-            SolidBody::StaticSurfWedge { rotation, .. } => {
-                let half = self.size * 0.5;
-                let basis = Mat3::from_quat(*rotation);
-                let extents = Vec3::new(
-                    basis.x_axis.x.abs() * half.x
-                        + basis.y_axis.x.abs() * half.y
-                        + basis.z_axis.x.abs() * half.z,
-                    basis.x_axis.y.abs() * half.x
-                        + basis.y_axis.y.abs() * half.y
-                        + basis.z_axis.y.abs() * half.z,
-                    basis.x_axis.z.abs() * half.x
-                        + basis.y_axis.z.abs() * half.y
-                        + basis.z_axis.z.abs() * half.z,
+            SolidBody::StaticSurfWedge {
+                rotation,
+                wall_side,
+            } => {
+                let (min, max) = transformed_point_bounds(
+                    self.center,
+                    *rotation,
+                    &surf_wedge_points(self.size, *wall_side),
                 );
-                extents * 2.0
+                return Some(AabbVolume {
+                    owner: self.owner,
+                    center: (min + max) * 0.5,
+                    size: max - min,
+                });
             }
             SolidBody::Moving { end, .. } => {
                 let min = (self.center - self.size * 0.5).min(*end - self.size * 0.5);
@@ -2494,10 +2495,14 @@ fn spawn_box_spec(
         }
         _ => meshes.add(Cuboid::new(spec.size.x, spec.size.y, spec.size.z)),
     };
-    let material = materials.add(material_for_paint(
+    let mut material_spec = material_for_paint(
         spec.paint,
         matches!(spec.body, SolidBody::ShortcutBridge { active: false, .. }),
-    ));
+    );
+    if matches!(spec.body, SolidBody::StaticSurfWedge { .. }) {
+        material_spec.cull_mode = None;
+    }
+    let material = materials.add(material_spec);
 
     let mut transform = Transform::from_translation(spec.center);
     match &spec.body {
@@ -3204,26 +3209,25 @@ fn append_css_surf_sequence(
     };
     let curve_phase = rng.range_f32(0.0, TAU);
     let curve_amplitude = if intense {
-        rng.range_f32(1.5, 2.6)
+        rng.range_f32(0.9, 1.8)
     } else {
-        rng.range_f32(1.1, 2.0)
-    };
-    let lip_offset = if intense {
-        rng.range_f32(2.2, 3.1)
-    } else {
-        rng.range_f32(1.8, 2.7)
+        rng.range_f32(0.7, 1.4)
     };
     let ramp_span = if intense {
-        rng.range_f32(4.8, 6.5)
+        rng.range_f32(6.4, 8.8)
     } else {
-        rng.range_f32(3.9, 5.4)
+        rng.range_f32(5.2, 7.0)
     };
-    let surf_angle = if intense {
-        rng.range_f32(49.5_f32.to_radians(), 53.5_f32.to_radians())
+    let ramp_drop = if intense {
+        rng.range_f32(5.0, 6.8)
     } else {
-        rng.range_f32(48.0_f32.to_radians(), 52.0_f32.to_radians())
+        rng.range_f32(4.0, 5.4)
     };
-    let ramp_rise = ramp_span * surf_angle.tan();
+    let ridge_lift = if intense {
+        rng.range_f32(1.7, 2.7)
+    } else {
+        rng.range_f32(1.1, 1.9)
+    };
     let start_deck_length = if intense { 3.6 } else { 4.6 };
     let finish_deck_length = if intense { 3.2 } else { 4.2 };
 
@@ -3234,7 +3238,8 @@ fn append_css_surf_sequence(
         let weave = (t * curve_cycles * TAU + curve_phase).sin();
         let harmonic = (t * (curve_cycles * 0.5 + 0.65) * TAU + curve_phase * 0.37).sin();
         let offset = right * (weave * 0.72 + harmonic * 0.28) * curve_amplitude * envelope;
-        centerline.push(start.lerp(end, t) + offset);
+        let lift = Vec3::Y * ridge_lift * envelope;
+        centerline.push(start.lerp(end, t) + offset + lift);
     }
 
     layout.solids.push(SolidSpec {
@@ -3252,26 +3257,7 @@ fn append_css_surf_sequence(
         extra: ExtraKind::None,
     });
 
-    let mut side = if rng.chance(0.5) { -1.0_f32 } else { 1.0 };
-    let mut segments_until_switch = if intense {
-        rng.range_usize(2, 4)
-    } else {
-        rng.range_usize(1, 3)
-    };
-
     for index in 0..segment_count {
-        if index > 0 {
-            segments_until_switch = segments_until_switch.saturating_sub(1);
-            if segments_until_switch == 0 {
-                side = -side;
-                segments_until_switch = if intense {
-                    rng.range_usize(2, 4)
-                } else {
-                    rng.range_usize(1, 3)
-                };
-            }
-        }
-
         let section_start = centerline[index];
         let section_end = centerline[index + 1];
         let section_delta = section_end - section_start;
@@ -3279,34 +3265,34 @@ fn append_css_surf_sequence(
         if local_forward == Vec3::ZERO {
             continue;
         }
-        let local_right = Vec3::new(-local_forward.z, 0.0, local_forward.x);
-        let outward = local_right * side;
-        let lip = section_start.lerp(section_end, 0.5) + outward * lip_offset;
-        let ramp_length = (section_delta.length() * 1.18).max(if intense { 7.4 } else { 6.2 });
-        let size = Vec3::new(ramp_length, ramp_rise, ramp_span);
-        let rotation = surf_ramp_rotation(local_forward, side, size);
+        let ridge = section_start.lerp(section_end, 0.5);
+        let ramp_length = (section_delta.length() * 1.22).max(if intense { 7.8 } else { 6.6 });
+        let size = Vec3::new(ramp_length, ramp_drop, ramp_span);
+        let rotation = surf_ramp_rotation(local_forward);
 
-        layout.solids.push(SolidSpec {
-            owner,
-            label: if intense {
-                format!("Surf Wedge {} {}", index, side)
-            } else {
-                format!("Flow Wedge {} {}", index, side)
-            },
-            center: surf_wedge_lip_to_center(lip, size, rotation, side),
-            size,
-            paint: if side < 0.0 {
-                PaintStyle::ThemeAccent(theme)
-            } else {
-                PaintStyle::ThemeFloor(theme)
-            },
-            body: SolidBody::StaticSurfWedge {
-                rotation,
-                wall_side: side,
-            },
-            friction: Some(if intense { 0.02 } else { 0.026 }),
-            extra: ExtraKind::None,
-        });
+        for side in [-1.0_f32, 1.0] {
+            layout.solids.push(SolidSpec {
+                owner,
+                label: if intense {
+                    format!("Surf Wedge {} {}", index, side)
+                } else {
+                    format!("Flow Wedge {} {}", index, side)
+                },
+                center: surf_wedge_lip_to_center(ridge, size, rotation, side),
+                size,
+                paint: if side < 0.0 {
+                    PaintStyle::ThemeAccent(theme)
+                } else {
+                    PaintStyle::ThemeFloor(theme)
+                },
+                body: SolidBody::StaticSurfWedge {
+                    rotation,
+                    wall_side: side,
+                },
+                friction: Some(if intense { 0.018 } else { 0.024 }),
+                extra: ExtraKind::None,
+            });
+        }
     }
 
     layout.solids.push(SolidSpec {
@@ -3734,12 +3720,12 @@ mod tests {
     }
 
     #[test]
-    fn surf_ramp_rotation_matches_utopia_style_wedge() {
+    fn surf_ramp_rotation_matches_shared_ridge_surf() {
         for &forward in &[Vec3::X, Vec3::Z] {
             for side in [-1.0_f32, 1.0] {
-                let size = Vec3::new(8.0, 5.0, 4.0);
+                let size = Vec3::new(8.0, 5.2, 7.0);
                 let outward = Vec3::new(-forward.z, 0.0, forward.x) * side;
-                let rotation = surf_ramp_rotation(forward, side, size);
+                let rotation = surf_ramp_rotation(forward);
                 let normal = rotation * surf_wedge_surface_normal(size, side);
                 let length_axis = rotation * Vec3::X;
                 let slope_angle = normal.angle_between(Vec3::Y).to_degrees();
@@ -3757,14 +3743,14 @@ mod tests {
                     forward
                 );
                 assert!(
-                    normal.dot(outward) < 0.0,
-                    "surface normal {:?} should point inward relative to wall side {:?}",
+                    normal.dot(outward).abs() > 0.45,
+                    "surface normal {:?} should lean sideways relative to wall side {:?}",
                     normal,
                     outward
                 );
                 assert!(
-                    (49.0..54.5).contains(&slope_angle),
-                    "surface angle {} should stay near the authored utopia range",
+                    (32.0..48.0).contains(&slope_angle),
+                    "surface angle {} should stay within the playable surf range",
                     slope_angle
                 );
             }
@@ -3784,28 +3770,36 @@ fn top_to_center(top: Vec3, height: f32) -> Vec3 {
     Vec3::new(top.x, top.y - height * 0.5, top.z)
 }
 
-fn surf_wedge_lip_to_center(lip: Vec3, size: Vec3, rotation: Quat, wall_side: f32) -> Vec3 {
-    lip - rotation * Vec3::new(0.0, size.y * 0.5, wall_side * size.z * 0.5)
+fn surf_wedge_lip_to_center(lip: Vec3, _size: Vec3, _rotation: Quat, _wall_side: f32) -> Vec3 {
+    lip
 }
 
 fn surf_wedge_surface_normal(size: Vec3, wall_side: f32) -> Vec3 {
-    Vec3::new(0.0, wall_side * size.z, -size.y).normalize_or_zero()
+    Vec3::new(0.0, size.z, wall_side * size.y).normalize_or_zero()
 }
 
 fn surf_wedge_points(size: Vec3, wall_side: f32) -> Vec<Vec3> {
     let half_length = size.x * 0.5;
-    let half_height = size.y * 0.5;
-    let half_width = size.z * 0.5;
-    let outer_z = wall_side * half_width;
-    let inner_z = -wall_side * half_width;
+    let outer_z = wall_side * (SURF_RIDGE_HALF_WIDTH + size.z);
+    let ridge_z = wall_side * SURF_RIDGE_HALF_WIDTH;
+    let rise = size.y;
+    let normal = surf_wedge_surface_normal(size, wall_side);
+    let inset = -normal * SURF_WEDGE_THICKNESS;
+
+    let front_ridge = Vec3::new(-half_length, 0.0, ridge_z);
+    let back_ridge = Vec3::new(half_length, 0.0, ridge_z);
+    let front_outer = Vec3::new(-half_length, -rise, outer_z);
+    let back_outer = Vec3::new(half_length, -rise, outer_z);
 
     vec![
-        Vec3::new(-half_length, -half_height, inner_z),
-        Vec3::new(-half_length, -half_height, outer_z),
-        Vec3::new(-half_length, half_height, outer_z),
-        Vec3::new(half_length, -half_height, inner_z),
-        Vec3::new(half_length, -half_height, outer_z),
-        Vec3::new(half_length, half_height, outer_z),
+        front_ridge,
+        back_ridge,
+        front_outer,
+        back_outer,
+        front_ridge + inset,
+        back_ridge + inset,
+        front_outer + inset,
+        back_outer + inset,
     ]
 }
 
@@ -3817,16 +3811,22 @@ fn build_surf_wedge_mesh(size: Vec3, wall_side: f32) -> Mesh {
     let d = points[3];
     let e = points[4];
     let f = points[5];
+    let g = points[6];
+    let h = points[7];
 
     let triangles = vec![
-        [a, b, c],
-        [d, f, e],
-        [a, d, e],
-        [a, e, b],
-        [b, e, f],
-        [b, f, c],
-        [a, c, f],
-        [a, f, d],
+        [a, b, d],
+        [a, d, c],
+        [e, g, h],
+        [e, h, f],
+        [a, c, g],
+        [a, g, e],
+        [b, f, h],
+        [b, h, d],
+        [a, e, f],
+        [a, f, b],
+        [c, d, h],
+        [c, h, g],
     ];
 
     let positions: Vec<[f32; 3]> = triangles
@@ -3843,20 +3843,21 @@ fn build_surf_wedge_mesh(size: Vec3, wall_side: f32) -> Mesh {
     .with_computed_flat_normals()
 }
 
-fn surf_ramp_rotation(forward: Vec3, side: f32, size: Vec3) -> Quat {
+fn surf_ramp_rotation(forward: Vec3) -> Quat {
     let forward = forward.normalize_or_zero();
-    let outward = Vec3::new(-forward.z, 0.0, forward.x) * side;
-    let world_normal = (Vec3::Y * size.z - outward * size.y).normalize_or_zero();
-    let world_side = forward.cross(world_normal).normalize_or_zero();
+    let right = Vec3::new(-forward.z, 0.0, forward.x);
+    Quat::from_mat3(&Mat3::from_cols(forward, Vec3::Y, right))
+}
 
-    let local_forward = Vec3::X;
-    let local_normal = surf_wedge_surface_normal(size, side);
-    let local_side = local_forward.cross(local_normal).normalize_or_zero();
-
-    let local_basis = Mat3::from_cols(local_forward, local_normal, local_side);
-    let world_basis = Mat3::from_cols(forward, world_normal, world_side);
-
-    Quat::from_mat3(&(world_basis * local_basis.transpose()))
+fn transformed_point_bounds(origin: Vec3, rotation: Quat, points: &[Vec3]) -> (Vec3, Vec3) {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for point in points {
+        let world = origin + rotation * *point;
+        min = min.min(world);
+        max = max.max(world);
+    }
+    (min, max)
 }
 
 fn intersects(a: AabbVolume, b: AabbVolume, epsilon: f32) -> bool {
