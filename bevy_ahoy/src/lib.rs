@@ -343,6 +343,9 @@ pub struct CharacterControllerState {
     pub last_step_up: Stopwatch,
     pub last_step_down: Stopwatch,
     pub crane_height_left: Option<f32>,
+    /// While true, a held jump input is being consumed by a climb and must be released before it
+    /// can trigger another jump.
+    pub jump_hold_consumed: bool,
     /// The current state of the mantle, if a mantle is in progress.
     ///
     /// This is [`None`] if a mantle is not in progress.
@@ -363,6 +366,7 @@ impl Default for CharacterControllerState {
             last_step_up: max_stopwatch(),
             last_step_down: max_stopwatch(),
             crane_height_left: None,
+            jump_hold_consumed: false,
             mantle: None,
         }
     }

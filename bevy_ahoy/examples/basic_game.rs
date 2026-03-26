@@ -1,15 +1,17 @@
 use std::{
     collections::HashSet,
-    f32::consts::TAU,
+    f32::consts::{PI, TAU},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use avian3d::prelude::*;
 use bevy::{
+    asset::RenderAssetUsages,
     color::palettes::tailwind,
     input::common_conditions::input_just_pressed,
     math::primitives::{Cuboid, Sphere},
     prelude::*,
+    render::render_resource::PrimitiveTopology,
     window::{CursorGrabMode, CursorOptions, WindowResolution},
 };
 use bevy_ahoy::{
@@ -27,6 +29,7 @@ mod util;
 const ROOM_HEIGHT: f32 = 1.2;
 const ROOM_CLEARANCE_HEIGHT: f32 = 3.4;
 const CELL_SIZE: f32 = 22.0;
+const ROOM_GRID_SIZE: f32 = 8.0;
 const PLAYER_SPAWN_CLEARANCE: f32 = 2.4;
 const WALL_RUN_SPEED: f32 = 11.5;
 const WALL_RUN_STICK_SPEED: f32 = 2.0;
@@ -41,6 +44,7 @@ const CHECKPOINT_RADIUS: f32 = 2.8;
 const SUMMIT_RADIUS: f32 = 4.5;
 const SHORTCUT_TRIGGER_RADIUS: f32 = 2.0;
 const SKY_RADIUS: f32 = 950.0;
+const MAX_SECTION_TURN_RADIANS: f32 = 4.5_f32.to_radians();
 
 type SocketMask = u32;
 const SOCKET_SAFE_REST: SocketMask = 1 << 0;
@@ -81,6 +85,7 @@ fn main() -> AppExit {
                 release_cursor.run_if(input_just_pressed(KeyCode::Escape)),
                 tick_run_timer,
                 queue_run_controls,
+                handle_reset_seed_button,
                 activate_checkpoints,
                 collect_treasures,
                 activate_shortcuts,
@@ -142,6 +147,18 @@ fn setup_scene(
                 air_speed: 2.3,
                 jump_height: 1.9,
                 max_speed: 26.0,
+                step_size: 1.0,
+                mantle_height: 3.4,
+                crane_height: 4.1,
+                mantle_speed: 2.2,
+                crane_speed: 3.5,
+                min_mantle_ledge_space: 0.28,
+                min_crane_ledge_space: 0.22,
+                min_ledge_grab_space: Cuboid::new(0.18, 0.08, 0.22),
+                max_ledge_grab_distance: 0.72,
+                climb_pull_up_height: 0.48,
+                min_mantle_cos: 24.0_f32.to_radians().cos(),
+                min_crane_cos: 18.0_f32.to_radians().cos(),
                 ..default()
             },
             RigidBody::Kinematic,
@@ -191,6 +208,23 @@ fn setup_hud(mut commands: Commands) {
         BackgroundColor(Color::BLACK.with_alpha(0.44)),
         RunHud,
     ));
+
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(12.0),
+                right: px(12.0),
+                padding: UiRect::axes(px(16.0), px(10.0)),
+                ..default()
+            },
+            Button,
+            BackgroundColor(Color::srgba(0.09, 0.16, 0.28, 0.88)),
+            ResetSeedButton,
+        ))
+        .with_children(|parent| {
+            parent.spawn((Text::new("New Seed"),));
+        });
 }
 
 fn update_hud(
@@ -202,33 +236,42 @@ fn update_hud(
         return;
     };
 
-    let current_height = player.translation.y.max(0.0);
-    let summit_height = run.summit.y.max(1.0);
-    let progress = (current_height / summit_height).clamp(0.0, 1.0) * 100.0;
+    let current_height = player.translation.y;
+    let start_height = run
+        .checkpoints
+        .first()
+        .map(|checkpoint| checkpoint.y)
+        .unwrap_or(current_height);
+    let finish_height = run.summit.y;
+    let total_descent = (start_height - finish_height).max(1.0);
+    let descended = (start_height - current_height).clamp(0.0, total_descent);
+    let progress = (descended / total_descent).clamp(0.0, 1.0) * 100.0;
     let elapsed = run.timer.elapsed_secs();
     let objective = if run.finished {
-        "Summit reached. F5 reruns this seed, F6 rolls a new tower."
+        "Finish reached. F5 reruns this seed, F6 or the button rolls a new downhill run."
     } else {
-        "Goal: reach the beacon. Falling respawns at the highest room you've reached."
+        "Goal: ride the course down to the beacon. Falling respawns at the furthest section you've reached."
     };
 
     hud.0 = format!(
         "Chronoclimb\n\
          Seed: {seed:016x}\n\
          Floors: {floors} | Checkpoint: {checkpoint}/{checkpoint_total}\n\
-         Height: {height:.1}m / {summit:.1}m ({progress:.0}%)\n\
+         Altitude: {height:.1}m -> {finish:.1}m | Descent {descended:.1}m / {total_descent:.1}m ({progress:.0}%)\n\
          Time: {elapsed:.1}s | Deaths: {deaths}\n\
          Treasures: {treasures}/{treasure_total} | Shortcuts: {shortcuts}\n\
          Gen: attempts {attempts}, repairs {repairs}, overlaps {overlaps}, clearance {clearance}, reach {reach}\n\
          {objective}\n\
-         Controls: WASD move | hold Space bhop/jump | Ctrl crouch/mantle\n\
-         Hold Space in narrow shafts to climb between walls | RMB pull/drop props | LMB throw",
+         Controls: WASD move | hold Space bhop/jump/climb | Ctrl crouch/climbdown | Esc releases cursor\n\
+         Hold Space on ledges to pull up and in narrow shafts to climb between walls | RMB pull/drop props | LMB throw",
         seed = run.seed,
         floors = run.floors,
         checkpoint = run.current_checkpoint + 1,
         checkpoint_total = run.checkpoints.len(),
         height = current_height,
-        summit = summit_height,
+        finish = finish_height,
+        descended = descended,
+        total_descent = total_descent,
         progress = progress,
         elapsed = elapsed,
         deaths = run.deaths,
@@ -269,6 +312,34 @@ fn queue_run_controls(
             kind: RunRequestKind::RestartNewSeed,
             seed: current_run_seed(),
         });
+    }
+}
+
+fn handle_reset_seed_button(
+    mut buttons: Query<
+        (&Interaction, &mut BackgroundColor),
+        (Changed<Interaction>, With<ResetSeedButton>),
+    >,
+    mut director: ResMut<RunDirector>,
+) {
+    for (interaction, mut background) in &mut buttons {
+        match interaction {
+            Interaction::Pressed => {
+                background.0 = Color::srgba(0.18, 0.34, 0.58, 0.96);
+                if director.pending.is_none() {
+                    director.pending = Some(RunRequest {
+                        kind: RunRequestKind::RestartNewSeed,
+                        seed: current_run_seed(),
+                    });
+                }
+            }
+            Interaction::Hovered => {
+                background.0 = Color::srgba(0.13, 0.24, 0.42, 0.92);
+            }
+            Interaction::None => {
+                background.0 = Color::srgba(0.09, 0.16, 0.28, 0.88);
+            }
+        }
     }
 }
 
@@ -502,7 +573,16 @@ fn tune_player_camera(mut cameras: Query<&mut Projection, With<Camera3d>>) {
     }
 }
 
-fn capture_cursor(mut cursor: Single<&mut CursorOptions>) {
+fn capture_cursor(
+    mut cursor: Single<&mut CursorOptions>,
+    hovered_buttons: Query<&Interaction, With<Button>>,
+) {
+    if hovered_buttons
+        .iter()
+        .any(|interaction| *interaction != Interaction::None)
+    {
+        return;
+    }
     cursor.grab_mode = CursorGrabMode::Locked;
     cursor.visible = false;
 }
@@ -521,6 +601,9 @@ struct Player;
 
 #[derive(Component)]
 struct RunHud;
+
+#[derive(Component)]
+struct ResetSeedButton;
 
 #[derive(Component)]
 struct GeneratedWorld;
@@ -685,7 +768,7 @@ impl PlayerInput {
                 ),
                 (
                     Action::<Mantle>::new(),
-                    Hold::new(0.18),
+                    Hold::new(0.1),
                     bindings![KeyCode::Space, GamepadButton::South],
                 ),
                 (
@@ -1004,6 +1087,8 @@ struct RoomPlan {
     top: Vec3,
     size: Vec2,
     theme: Theme,
+    seed: u64,
+    section: RoomSectionKind,
     checkpoint_slot: Option<usize>,
 }
 
@@ -1022,7 +1107,7 @@ struct SegmentPlan {
 #[derive(Clone)]
 struct BranchPlan {
     room_index: usize,
-    dir: IVec2,
+    dir: Vec3,
     top: Vec3,
     size: Vec2,
     theme: Theme,
@@ -1046,11 +1131,11 @@ struct GenerationStats {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ModuleKind {
     StairRun,
+    SurfRamp,
     MantleStack,
     WallRunHall,
     LiftChasm,
     CrumbleBridge,
-    SweepHall,
     PistonGate,
     WindTunnel,
     IceSpine,
@@ -1064,6 +1149,14 @@ enum BranchKind {
     PropCache,
     ShortcutLever,
     RiskDetour,
+}
+
+#[derive(Clone, Copy)]
+enum RoomSectionKind {
+    OpenPad,
+    SplitPad,
+    Terrace,
+    CornerPerches,
 }
 
 #[derive(Clone, Copy)]
@@ -1112,6 +1205,7 @@ struct SolidSpec {
 #[derive(Clone)]
 enum SolidBody {
     Static,
+    StaticSurfWedge { rotation: Quat, wall_side: f32 },
     Decoration,
     DynamicProp,
     Water { speed: f32 },
@@ -1247,78 +1341,83 @@ struct RepairStats {
 }
 
 fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
-    let floors = rng.range_usize(16, 23);
+    let floors = rng.range_usize(34, 49);
     let mut rooms = Vec::with_capacity(floors);
     let mut segments = Vec::with_capacity(floors.saturating_sub(1));
     let mut occupied_rooms: HashSet<IVec2> = HashSet::default();
     let mut occupied_branches = HashSet::default();
     let theme_offset = (rng.next_u64() % 4) as usize;
 
-    let mut cell = IVec2::ZERO;
-    let clockwise = rng.chance(0.5);
-    let turn_dirs = if clockwise {
-        [IVec2::X, IVec2::Y, IVec2::NEG_X, IVec2::NEG_Y]
-    } else {
-        [IVec2::X, IVec2::NEG_Y, IVec2::NEG_X, IVec2::Y]
-    };
-    let mut dir_index = rng.range_usize(0, turn_dirs.len());
-    let mut heading = turn_dirs[dir_index];
-    let mut leg_length = 1;
-    let mut leg_progress = 0;
-    let mut legs_at_length = 0;
     let mut current_socket = SOCKET_SAFE_REST;
-    let mut current_height = 2.0;
+    let mut current_height = 96.0;
+    let mut current_top = Vec3::new(0.0, current_height, 0.0);
+    let heading_phase = rng.range_f32(0.0, TAU);
+    let heading_frequency = rng.range_f32(0.34, 0.58);
+    let heading_bias = if rng.chance(0.5) { 1.0 } else { -1.0 };
+    let mut heading_angle = rng.range_f32(0.0, TAU);
 
+    let cell = room_grid_cell(current_top);
     occupied_rooms.insert(cell);
     rooms.push(RoomPlan {
         index: 0,
         cell,
-        top: Vec3::new(0.0, current_height, 0.0),
+        top: current_top,
         size: Vec2::splat(13.5),
         theme: theme_for(0, floors, theme_offset),
+        seed: rng.next_u64(),
+        section: RoomSectionKind::OpenPad,
         checkpoint_slot: Some(0),
     });
 
     for index in 1..floors {
         let difficulty = index as f32 / (floors.saturating_sub(1).max(1)) as f32;
-        if leg_progress >= leg_length {
-            leg_progress = 0;
-            dir_index = (dir_index + 1) % turn_dirs.len();
-            heading = turn_dirs[dir_index];
-            legs_at_length += 1;
-            if legs_at_length >= 2 {
-                legs_at_length = 0;
-                leg_length += 1;
-            }
-        }
-
-        cell += heading;
-        leg_progress += 1;
-        occupied_rooms.insert(cell);
-
         let room_size = Vec2::splat(lerp(13.2, 9.8, difficulty)).max(Vec2::splat(9.2));
-        let projected_gap = projected_gap(rooms.last().unwrap().size, room_size);
+        let turn_wave = ((index as f32 * heading_frequency + heading_phase).sin() * 0.82
+            + heading_bias * 0.18)
+            * MAX_SECTION_TURN_RADIANS;
+        let turn_jitter = rng.range_f32(-0.7_f32.to_radians(), 0.7_f32.to_radians());
+        heading_angle +=
+            (turn_wave + turn_jitter).clamp(-MAX_SECTION_TURN_RADIANS, MAX_SECTION_TURN_RADIANS);
+        let heading = Vec3::new(heading_angle.cos(), 0.0, heading_angle.sin()).normalize_or_zero();
+        let mut step_distance = rng.range_f32(CELL_SIZE * 0.92, CELL_SIZE * 1.03);
+        let projected_gap = projected_gap(step_distance, rooms.last().unwrap().size, room_size);
         let template = choose_module_template(rng, current_socket, difficulty, projected_gap);
-        let rise = rng.range_f32(template.min_rise, template.max_rise) + difficulty * 0.12;
-        current_height += rise;
-        let bend = Vec3::new(-heading.y as f32, 0.0, heading.x as f32)
-            * rng.range_f32(-1.6, 1.6)
-            * (0.35 + difficulty * 0.3);
+        step_distance = match template.kind {
+            ModuleKind::SurfRamp => rng.range_f32(CELL_SIZE * 1.5, CELL_SIZE * 2.18),
+            ModuleKind::StairRun => rng.range_f32(CELL_SIZE * 1.22, CELL_SIZE * 1.7),
+            _ => step_distance,
+        };
+        let descent =
+            rng.range_f32(template.min_rise, template.max_rise) + 0.45 + difficulty * 0.28;
+        current_height -= descent;
+        let right = Vec3::new(-heading.z, 0.0, heading.x);
+        let bend = right * rng.range_f32(-0.8, 0.8) * (0.35 + difficulty * 0.3);
+        let mut top = Vec3::new(current_top.x, current_height, current_top.z)
+            + heading * step_distance
+            + bend;
+        top.y = current_height;
+        let mut cell = room_grid_cell(top);
+        let mut retries = 0;
+        while occupied_rooms.contains(&cell) && retries < 6 {
+            top += heading * (ROOM_GRID_SIZE * 0.75);
+            cell = room_grid_cell(top);
+            retries += 1;
+        }
+        occupied_rooms.insert(cell);
+        current_top = top;
 
         rooms.push(RoomPlan {
             index,
             cell,
-            top: Vec3::new(
-                cell.x as f32 * CELL_SIZE,
-                current_height,
-                cell.y as f32 * CELL_SIZE,
-            ) + bend,
+            top,
             size: if index == floors - 1 {
                 Vec2::splat(15.2)
             } else {
                 room_size
             },
             theme: theme_for(index, floors, theme_offset),
+            seed: rng.next_u64(),
+            section: choose_room_section(rng, difficulty, index, floors),
             checkpoint_slot: Some(index),
         });
 
@@ -1344,7 +1443,7 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
     let branches = generate_side_branches(seed, rng, &rooms, &segments, &mut occupied_branches);
     let spawn = rooms[0].top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, rooms[0].size.y * 0.18);
     let summit = rooms.last().unwrap().top + Vec3::new(0.0, 1.4, 0.0);
-    let death_plane = rooms[0].top.y - 55.0;
+    let death_plane = rooms.last().unwrap().top.y - 90.0;
 
     RunBlueprint {
         seed,
@@ -1444,6 +1543,28 @@ fn fallback_blueprint(seed: u64) -> RunBlueprint {
     blueprint
 }
 
+fn choose_room_section(
+    rng: &mut RunRng,
+    difficulty: f32,
+    index: usize,
+    floors: usize,
+) -> RoomSectionKind {
+    if index == 0 || index + 1 == floors {
+        return RoomSectionKind::OpenPad;
+    }
+
+    let roll = rng.range_f32(0.0, 1.0);
+    if difficulty < 0.22 || roll < 0.28 {
+        RoomSectionKind::OpenPad
+    } else if roll < 0.53 {
+        RoomSectionKind::Terrace
+    } else if roll < 0.78 {
+        RoomSectionKind::SplitPad
+    } else {
+        RoomSectionKind::CornerPerches
+    }
+}
+
 fn generate_side_branches(
     seed: u64,
     rng: &mut RunRng,
@@ -1457,20 +1578,20 @@ fn generate_side_branches(
     for room in rooms.iter().skip(1).take(rooms.len().saturating_sub(2)) {
         let difficulty = room.index as f32 / rooms.len().max(1) as f32;
         let main_forward = if room.index < rooms.len() - 1 {
-            rooms[room.index + 1].cell - room.cell
+            direction_from_delta(rooms[room.index + 1].top - room.top)
         } else {
-            room.cell - rooms[room.index - 1].cell
+            direction_from_delta(room.top - rooms[room.index - 1].top)
         };
+        if main_forward == Vec3::ZERO {
+            continue;
+        }
         let branch_dirs = [
-            IVec2::new(-main_forward.y, main_forward.x),
-            IVec2::new(main_forward.y, -main_forward.x),
+            Vec3::new(-main_forward.z, 0.0, main_forward.x),
+            Vec3::new(main_forward.z, 0.0, -main_forward.x),
         ];
 
         for dir in branch_dirs {
-            if dir == IVec2::ZERO {
-                continue;
-            }
-            let branch_cell = room.cell + dir;
+            let branch_cell = room_grid_cell(room.top + dir * (CELL_SIZE * 0.72));
             if occupied_rooms.contains(&branch_cell) || occupied_branches.contains(&branch_cell) {
                 continue;
             }
@@ -1502,9 +1623,8 @@ fn generate_side_branches(
                 BranchKind::PropCache
             };
 
-            let branch_top = room.top
-                + Vec3::new(dir.x as f32, 0.0, dir.y as f32) * (CELL_SIZE * 0.68)
-                + Vec3::Y * rng.range_f32(0.2, 1.8);
+            let branch_top =
+                room.top + dir * (CELL_SIZE * 0.68) + Vec3::Y * rng.range_f32(0.2, 1.8);
             let size = Vec2::new(rng.range_f32(5.0, 6.8), rng.range_f32(5.0, 6.8));
             let treasure_id = matches!(kind, BranchKind::TreasureAlcove | BranchKind::RiskDetour)
                 .then_some(seed ^ rng.next_u64());
@@ -1620,6 +1740,22 @@ impl SolidSpec {
             SolidBody::Static | SolidBody::Crumbling { .. } | SolidBody::ShortcutBridge { .. } => {
                 self.size
             }
+            SolidBody::StaticSurfWedge { rotation, .. } => {
+                let half = self.size * 0.5;
+                let basis = Mat3::from_quat(*rotation);
+                let extents = Vec3::new(
+                    basis.x_axis.x.abs() * half.x
+                        + basis.y_axis.x.abs() * half.y
+                        + basis.z_axis.x.abs() * half.z,
+                    basis.x_axis.y.abs() * half.x
+                        + basis.y_axis.y.abs() * half.y
+                        + basis.z_axis.y.abs() * half.z,
+                    basis.x_axis.z.abs() * half.x
+                        + basis.y_axis.z.abs() * half.y
+                        + basis.z_axis.z.abs() * half.z,
+                );
+                extents * 2.0
+            }
             SolidBody::Moving { end, .. } => {
                 let min = (self.center - self.size * 0.5).min(*end - self.size * 0.5);
                 let max = (self.center + self.size * 0.5).max(*end + self.size * 0.5);
@@ -1691,7 +1827,7 @@ fn segment_reachable(segment: &SegmentPlan, rooms: &[RoomPlan]) -> bool {
     let from = &rooms[segment.from];
     let to = &rooms[segment.to];
     let template = module_template(segment.kind);
-    let rise = to.top.y - from.top.y;
+    let rise = (to.top.y - from.top.y).abs();
     let gap = edge_gap(from, to);
     rise >= template.min_rise - 0.2
         && rise <= template.max_rise + 0.9
@@ -1722,8 +1858,8 @@ fn choose_module_template(
         if difficulty > 0.55
             && matches!(
                 template.kind,
-                ModuleKind::CrumbleBridge
-                    | ModuleKind::SweepHall
+                ModuleKind::SurfRamp
+                    | ModuleKind::CrumbleBridge
                     | ModuleKind::WindTunnel
                     | ModuleKind::PistonGate
                     | ModuleKind::TimedDoor
@@ -1731,10 +1867,13 @@ fn choose_module_template(
         {
             weight += 3;
         }
+        if difficulty > 0.2 && matches!(template.kind, ModuleKind::SurfRamp) {
+            weight += 2;
+        }
         if difficulty < 0.35
             && matches!(
                 template.kind,
-                ModuleKind::StairRun | ModuleKind::MantleStack | ModuleKind::WaterGarden
+                ModuleKind::SurfRamp | ModuleKind::MantleStack | ModuleKind::WaterGarden
             )
         {
             weight += 4;
@@ -1752,11 +1891,11 @@ fn choose_module_template(
 fn all_templates() -> [ModuleTemplate; 11] {
     [
         module_template(ModuleKind::StairRun),
+        module_template(ModuleKind::SurfRamp),
         module_template(ModuleKind::MantleStack),
         module_template(ModuleKind::WallRunHall),
         module_template(ModuleKind::LiftChasm),
         module_template(ModuleKind::CrumbleBridge),
-        module_template(ModuleKind::SweepHall),
         module_template(ModuleKind::PistonGate),
         module_template(ModuleKind::WindTunnel),
         module_template(ModuleKind::IceSpine),
@@ -1773,11 +1912,24 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             exit: SOCKET_SAFE_REST | SOCKET_MANTLE_ENTRY,
             min_difficulty: 0.0,
             max_difficulty: 0.55,
+            weight: 2,
+            min_rise: 1.2,
+            max_rise: 2.9,
+            min_gap: 10.0,
+            max_gap: 26.0,
+            shortcut_eligible: false,
+        },
+        ModuleKind::SurfRamp => ModuleTemplate {
+            kind,
+            entry: SOCKET_SAFE_REST | SOCKET_SHORTCUT_ANCHOR,
+            exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
+            min_difficulty: 0.2,
+            max_difficulty: 0.92,
             weight: 7,
-            min_rise: 1.0,
-            max_rise: 1.8,
-            min_gap: 7.0,
-            max_gap: 10.5,
+            min_rise: 1.7,
+            max_rise: 4.1,
+            min_gap: 13.0,
+            max_gap: 38.0,
             shortcut_eligible: false,
         },
         ModuleKind::MantleStack => ModuleTemplate {
@@ -1830,19 +1982,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 2.4,
             min_gap: 8.0,
             max_gap: 11.6,
-            shortcut_eligible: true,
-        },
-        ModuleKind::SweepHall => ModuleTemplate {
-            kind,
-            entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
-            exit: SOCKET_SAFE_REST | SOCKET_SHORTCUT_ANCHOR,
-            min_difficulty: 0.42,
-            max_difficulty: 1.0,
-            weight: 4,
-            min_rise: 1.6,
-            max_rise: 2.8,
-            min_gap: 7.8,
-            max_gap: 11.2,
             shortcut_eligible: true,
         },
         ModuleKind::PistonGate => ModuleTemplate {
@@ -1917,7 +2056,7 @@ fn safe_fallback_kind(difficulty: f32) -> ModuleKind {
     if difficulty > 0.3 {
         ModuleKind::MantleStack
     } else {
-        ModuleKind::StairRun
+        ModuleKind::SurfRamp
     }
 }
 
@@ -2116,26 +2255,34 @@ fn spawn_floating_spheres(
         .fold(Vec3::ZERO, |acc, top| acc + top)
         / blueprint.rooms.len().max(1) as f32;
     let mut rng = RunRng::new(blueprint.seed ^ 0x5151_AAAA_9999_7777);
+    let global_radius_cap = blueprint
+        .rooms
+        .iter()
+        .map(max_floating_sphere_radius_for_room)
+        .fold(6.0, f32::min);
     let anchor_indices = [
-        2_usize,
+        3_usize,
         blueprint.rooms.len() / 2,
-        blueprint.rooms.len().saturating_sub(3),
+        blueprint.rooms.len().saturating_sub(4),
     ];
 
     for (sphere_index, room_index) in anchor_indices.into_iter().enumerate() {
         let room = &blueprint.rooms[room_index.min(blueprint.rooms.len() - 1)];
-        let radius = match sphere_index {
+        let desired_radius: f32 = match sphere_index {
             0 => 6.5,
             1 => 13.5,
             _ => 20.0,
         };
+        let radius = desired_radius
+            .min(max_floating_sphere_radius_for_room(room))
+            .min(global_radius_cap);
         let dir = if sphere_index % 2 == 0 {
             Vec3::new(1.0, 0.0, 0.0)
         } else {
             Vec3::new(0.0, 0.0, 1.0)
         };
-        let distance = room.size.max_element() * 0.5 + radius + 2.4;
-        let center_pos = room.top + dir * distance + Vec3::Y * (1.8 - radius * 0.18);
+        let distance = room.size.max_element() * 0.5 + radius + 5.5;
+        let center_pos = room.top + dir * distance + Vec3::Y * (radius + 1.6);
         spawn_floating_sphere_entity(
             commands,
             sphere_mesh.clone(),
@@ -2163,13 +2310,13 @@ fn spawn_floating_spheres(
     }
 
     for sphere_index in 0..5 {
-        let radius = rng.range_f32(4.0, 11.0);
+        let radius = rng.range_f32(4.0, global_radius_cap.max(4.6));
         let angle = TAU * (sphere_index as f32 / 5.0) + rng.range_f32(-0.4, 0.4);
         let distance = rng.range_f32(36.0, 74.0);
         let center_pos = center
             + Vec3::new(
                 angle.cos() * distance,
-                rng.range_f32(6.0, 28.0),
+                rng.range_f32(radius + 5.0, radius + 24.0),
                 angle.sin() * distance,
             );
         spawn_floating_sphere_entity(
@@ -2330,24 +2477,42 @@ fn spawn_box_spec(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) {
+    if let Err(reason) = validate_solid_spec(spec) {
+        eprintln!("Skipping invalid solid '{}': {}", spec.label, reason);
+        return;
+    }
+
     if let ExtraKind::Treasure { id } = spec.extra {
         if collected_treasures.contains(&id) {
             return;
         }
     }
 
-    let mesh = meshes.add(Cuboid::new(spec.size.x, spec.size.y, spec.size.z));
+    let mesh = match spec.body {
+        SolidBody::StaticSurfWedge { wall_side, .. } => {
+            meshes.add(build_surf_wedge_mesh(spec.size, wall_side))
+        }
+        _ => meshes.add(Cuboid::new(spec.size.x, spec.size.y, spec.size.z)),
+    };
     let material = materials.add(material_for_paint(
         spec.paint,
         matches!(spec.body, SolidBody::ShortcutBridge { active: false, .. }),
     ));
+
+    let mut transform = Transform::from_translation(spec.center);
+    match &spec.body {
+        SolidBody::StaticSurfWedge { rotation, .. } => {
+            transform.rotation = *rotation;
+        }
+        _ => {}
+    }
 
     let mut entity = commands.spawn((
         GeneratedWorld,
         Name::new(spec.label.clone()),
         Mesh3d(mesh),
         MeshMaterial3d(material),
-        Transform::from_translation(spec.center),
+        transform,
     ));
 
     match &spec.body {
@@ -2357,6 +2522,16 @@ fn spawn_box_spec(
                 Collider::cuboid(spec.size.x, spec.size.y, spec.size.z),
                 CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
             ));
+        }
+        SolidBody::StaticSurfWedge { wall_side, .. } => {
+            if let Some(collider) = Collider::convex_hull(surf_wedge_points(spec.size, *wall_side))
+            {
+                entity.insert((
+                    RigidBody::Static,
+                    collider,
+                    CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
+                ));
+            }
         }
         SolidBody::Decoration => {}
         SolidBody::DynamicProp => {
@@ -2448,6 +2623,58 @@ fn spawn_box_spec(
     }
 }
 
+fn validate_solid_spec(spec: &SolidSpec) -> Result<(), String> {
+    if !spec.center.is_finite() {
+        return Err(format!("non-finite center {:?}", spec.center));
+    }
+    if !spec.size.is_finite() {
+        return Err(format!("non-finite size {:?}", spec.size));
+    }
+    if spec.size.x <= 0.01 || spec.size.y <= 0.01 || spec.size.z <= 0.01 {
+        return Err(format!("non-positive size {:?}", spec.size));
+    }
+
+    let rotation = match spec.body {
+        SolidBody::StaticSurfWedge { rotation, .. } => {
+            if !rotation.is_finite() {
+                return Err(format!("non-finite rotation {:?}", rotation));
+            }
+            rotation
+        }
+        _ => Quat::IDENTITY,
+    };
+
+    if let SolidBody::Moving { end, .. } = spec.body
+        && !end.is_finite()
+    {
+        return Err(format!("non-finite mover end {:?}", end));
+    }
+
+    let needs_collider = !matches!(spec.body, SolidBody::Decoration);
+    if !needs_collider {
+        return Ok(());
+    }
+
+    let aabb = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match spec.body {
+        SolidBody::StaticSurfWedge { wall_side, .. } => {
+            Collider::convex_hull(surf_wedge_points(spec.size, wall_side))
+                .unwrap()
+                .aabb(spec.center, rotation)
+        }
+        _ => Collider::cuboid(spec.size.x, spec.size.y, spec.size.z).aabb(spec.center, rotation),
+    }))
+    .map_err(|_| "collider AABB construction panicked".to_string())?;
+
+    if !aabb.min.is_finite() || !aabb.max.is_finite() {
+        return Err(format!(
+            "non-finite collider AABB min {:?} max {:?}",
+            aabb.min, aabb.max
+        ));
+    }
+
+    Ok(())
+}
+
 fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
     let mut layout = ModuleLayout::default();
     let owner = OwnerTag::Room(room.index);
@@ -2463,6 +2690,81 @@ fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
         friction: None,
         extra: ExtraKind::None,
     });
+
+    match room.section {
+        RoomSectionKind::OpenPad => {}
+        RoomSectionKind::SplitPad => {
+            for side in [-1.0, 1.0] {
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: "Split Rest Wing".into(),
+                    center: top_to_center(
+                        room.top + Vec3::new(side * room.size.x * 0.23, 0.28, 0.0),
+                        0.4,
+                    ),
+                    size: Vec3::new(room.size.x * 0.34, 0.4, room.size.y * 0.46),
+                    paint: PaintStyle::ThemeAccent(room.theme),
+                    body: SolidBody::Static,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+            layout.solids.push(SolidSpec {
+                owner,
+                label: "Split Rest Spine".into(),
+                center: top_to_center(room.top + Vec3::Y * 0.22, 0.28),
+                size: Vec3::new(room.size.x * 0.18, 0.28, room.size.y * 0.74),
+                paint: PaintStyle::ThemeShadow(room.theme),
+                body: SolidBody::Static,
+                friction: None,
+                extra: ExtraKind::None,
+            });
+        }
+        RoomSectionKind::Terrace => {
+            let along_x = room.seed & 1 == 0;
+            let sign = if room.seed & 2 == 0 { 1.0 } else { -1.0 };
+            let offset = if along_x {
+                Vec3::X * sign * room.size.x * 0.16
+            } else {
+                Vec3::Z * sign * room.size.y * 0.16
+            };
+            let terrace_size = if along_x {
+                Vec3::new(room.size.x * 0.42, 0.5, room.size.y * 0.72)
+            } else {
+                Vec3::new(room.size.x * 0.72, 0.5, room.size.y * 0.42)
+            };
+            layout.solids.push(SolidSpec {
+                owner,
+                label: "Terrace Shelf".into(),
+                center: top_to_center(room.top + offset + Vec3::Y * 0.34, 0.5),
+                size: terrace_size,
+                paint: PaintStyle::ThemeAccent(room.theme),
+                body: SolidBody::Static,
+                friction: None,
+                extra: ExtraKind::None,
+            });
+        }
+        RoomSectionKind::CornerPerches => {
+            for x in [-1.0, 1.0] {
+                for z in [-1.0, 1.0] {
+                    layout.solids.push(SolidSpec {
+                        owner,
+                        label: "Corner Perch".into(),
+                        center: top_to_center(
+                            room.top
+                                + Vec3::new(x * room.size.x * 0.23, 0.18, z * room.size.y * 0.23),
+                            0.34,
+                        ),
+                        size: Vec3::new(room.size.x * 0.24, 0.34, room.size.y * 0.24),
+                        paint: PaintStyle::ThemeAccent(room.theme),
+                        body: SolidBody::Static,
+                        friction: None,
+                        extra: ExtraKind::None,
+                    });
+                }
+            }
+        }
+    }
 
     if let Some(index) = room.checkpoint_slot {
         layout.solids.push(SolidSpec {
@@ -2510,22 +2812,30 @@ fn build_segment_layout(
 
     match segment.kind {
         ModuleKind::StairRun => {
-            let steps = 5 + usize::from(segment.difficulty > 0.18);
-            for step in 0..steps {
-                let t = (step + 1) as f32 / (steps + 1) as f32;
-                let mut top = start.lerp(end, t);
-                top.y = from.top.y + rise * t - 0.12;
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Stair Step".into(),
-                    center: top_to_center(top, 0.78 + t * 0.2),
-                    size: axis_box_size(along_x, 3.4, 0.78 + t * 0.2, 3.5),
-                    paint: PaintStyle::ThemeAccent(to.theme),
-                    body: SolidBody::Static,
-                    friction: None,
-                    extra: ExtraKind::None,
-                });
-            }
+            append_css_surf_sequence(
+                &mut layout,
+                owner,
+                &mut rng,
+                start,
+                end,
+                forward,
+                right,
+                to.theme,
+                false,
+            );
+        }
+        ModuleKind::SurfRamp => {
+            append_css_surf_sequence(
+                &mut layout,
+                owner,
+                &mut rng,
+                start,
+                end,
+                forward,
+                right,
+                to.theme,
+                true,
+            );
         }
         ModuleKind::MantleStack => {
             let ledges = [(0.28, 1.6_f32), (0.54, 3.3), (0.82, 5.0)];
@@ -2652,15 +2962,16 @@ fn build_segment_layout(
             });
             for anchor in [start_top, end_top] {
                 let support_top = anchor.y - mover_size.y;
+                let support_height = lerp(5.6, 8.4, segment.difficulty);
                 layout.solids.push(SolidSpec {
                     owner,
                     label: "Lift Support".into(),
                     center: Vec3::new(
                         anchor.x - right.x * 3.2,
-                        (support_top - 1.0) * 0.5,
+                        support_top - support_height * 0.5,
                         anchor.z - right.z * 3.2,
                     ),
-                    size: Vec3::new(1.4, support_top + 1.0, 1.4),
+                    size: Vec3::new(1.4, support_height, 1.4),
                     paint: PaintStyle::ThemeShadow(to.theme),
                     body: SolidBody::Static,
                     friction: None,
@@ -2689,38 +3000,6 @@ fn build_segment_layout(
                 });
             }
         }
-        ModuleKind::SweepHall => {
-            for perch in [0.22, 0.5, 0.78] {
-                let mut top = start.lerp(end, perch);
-                top.y = from.top.y + rise * perch - 0.15;
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Sweep Perch".into(),
-                    center: top_to_center(top, 0.72),
-                    size: axis_box_size(along_x, 2.6, 0.72, 2.8),
-                    paint: PaintStyle::ThemeFloor(to.theme),
-                    body: SolidBody::Static,
-                    friction: None,
-                    extra: ExtraKind::None,
-                });
-            }
-            let beam_start = start.lerp(end, 0.5) + right * 3.0 + Vec3::Y * (rise * 0.5 + 1.1);
-            let beam_end = beam_start - right * 6.0;
-            layout.solids.push(SolidSpec {
-                owner,
-                label: "Sweep Beam".into(),
-                center: beam_start,
-                size: axis_box_size(along_x, 1.1, 1.1, 6.2),
-                paint: PaintStyle::Hazard,
-                body: SolidBody::Moving {
-                    end: beam_end,
-                    speed: lerp(2.2, 4.4, segment.difficulty),
-                    lethal: true,
-                },
-                friction: None,
-                extra: ExtraKind::None,
-            });
-        }
         ModuleKind::PistonGate => {
             for perch in [0.2, 0.45, 0.72] {
                 let mut top = start.lerp(end, perch);
@@ -2748,7 +3027,7 @@ fn build_segment_layout(
                     body: SolidBody::Moving {
                         end: center - right * side * 3.2,
                         speed: lerp(2.0, 3.8, segment.difficulty),
-                        lethal: true,
+                        lethal: false,
                     },
                     friction: None,
                     extra: ExtraKind::None,
@@ -2864,7 +3143,7 @@ fn build_segment_layout(
                     body: SolidBody::Moving {
                         end: center + Vec3::Y * 3.5,
                         speed: lerp(1.6, 3.1, segment.difficulty),
-                        lethal: true,
+                        lethal: false,
                     },
                     friction: None,
                     extra: ExtraKind::None,
@@ -2900,6 +3179,152 @@ fn build_segment_layout(
     layout
 }
 
+fn append_css_surf_sequence(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    rng: &mut RunRng,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    theme: Theme,
+    intense: bool,
+) {
+    let along_x = forward.x.abs() > 0.5;
+    let total_distance = start.distance(end).max(12.0);
+    let pair_count = if intense {
+        ((total_distance / 3.8).round() as usize).clamp(7, 13)
+    } else {
+        ((total_distance / 4.6).round() as usize).clamp(5, 10)
+    };
+    let curve_cycles = if intense {
+        rng.range_f32(1.7, 3.3)
+    } else {
+        rng.range_f32(1.2, 2.4)
+    };
+    let curve_phase = rng.range_f32(0.0, TAU);
+    let curve_amplitude = if intense {
+        rng.range_f32(1.5, 2.6)
+    } else {
+        rng.range_f32(1.1, 2.0)
+    };
+    let lane_gap = if intense {
+        rng.range_f32(0.12, 0.24)
+    } else {
+        rng.range_f32(0.16, 0.34)
+    };
+    let ramp_width = if intense {
+        rng.range_f32(8.8, 12.4)
+    } else {
+        rng.range_f32(7.2, 9.8)
+    };
+    let ramp_thickness = if intense {
+        rng.range_f32(0.18, 0.24)
+    } else {
+        rng.range_f32(0.2, 0.28)
+    };
+    let start_deck_length = if intense { 3.6 } else { 4.6 };
+    let finish_deck_length = if intense { 3.2 } else { 4.2 };
+
+    let mut centerline = Vec::with_capacity(pair_count + 1);
+    for sample in 0..=pair_count {
+        let t = sample as f32 / pair_count as f32;
+        let envelope = (t * PI).sin().powf(0.85);
+        let weave = (t * curve_cycles * TAU + curve_phase).sin();
+        let harmonic = (t * (curve_cycles * 0.5 + 0.65) * TAU + curve_phase * 0.37).sin();
+        let offset = right * (weave * 0.72 + harmonic * 0.28) * curve_amplitude * envelope;
+        centerline.push(start.lerp(end, t) + offset);
+    }
+
+    layout.solids.push(SolidSpec {
+        owner,
+        label: if intense {
+            "Surf Start Deck".into()
+        } else {
+            "Flow Start Deck".into()
+        },
+        center: top_to_center(start + Vec3::Y * 0.16, 0.28),
+        size: axis_box_size(along_x, start_deck_length, 0.28, 4.2),
+        paint: PaintStyle::ThemeFloor(theme),
+        body: SolidBody::Static,
+        friction: Some(0.035),
+        extra: ExtraKind::None,
+    });
+
+    for index in 0..pair_count {
+        let section_start = centerline[index];
+        let section_end = centerline[index + 1];
+        let section_delta = section_end - section_start;
+        let local_forward = direction_from_delta(section_delta);
+        if local_forward == Vec3::ZERO {
+            continue;
+        }
+        let local_right = Vec3::new(-local_forward.z, 0.0, local_forward.x);
+        let lip_center = section_start.lerp(section_end, 0.5) + Vec3::Y * 0.02;
+        let ramp_length = (section_delta.length() * 1.24).max(if intense { 6.8 } else { 5.9 });
+        let downhill_bias = if intense {
+            rng.range_f32(1.18, 1.46)
+        } else {
+            rng.range_f32(0.98, 1.24)
+        };
+        let bank_bias = if intense {
+            rng.range_f32(2.05, 2.55)
+        } else {
+            rng.range_f32(1.72, 2.16)
+        };
+
+        for side in [-1.0_f32, 1.0] {
+            let outward = local_right * side;
+            let rotation =
+                surf_ramp_rotation(local_forward, local_right, side, downhill_bias, bank_bias);
+            let wall_side = if (rotation * Vec3::Z).dot(outward) >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            };
+            let lip = lip_center + outward * (lane_gap * 0.5);
+            let size = Vec3::new(ramp_length, ramp_thickness, ramp_width);
+
+            layout.solids.push(SolidSpec {
+                owner,
+                label: if intense {
+                    format!("Surf Wedge {} {}", index, side)
+                } else {
+                    format!("Flow Wedge {} {}", index, side)
+                },
+                center: surf_wedge_lip_to_center(lip, size, rotation, wall_side),
+                size,
+                paint: if side < 0.0 {
+                    PaintStyle::ThemeAccent(theme)
+                } else {
+                    PaintStyle::ThemeFloor(theme)
+                },
+                body: SolidBody::StaticSurfWedge {
+                    rotation,
+                    wall_side,
+                },
+                friction: Some(if intense { 0.022 } else { 0.03 }),
+                extra: ExtraKind::None,
+            });
+        }
+    }
+
+    layout.solids.push(SolidSpec {
+        owner,
+        label: if intense {
+            "Surf Finish Deck".into()
+        } else {
+            "Flow Finish Deck".into()
+        },
+        center: top_to_center(end + Vec3::Y * 0.16, 0.28),
+        size: axis_box_size(along_x, finish_deck_length, 0.28, 4.0),
+        paint: PaintStyle::ThemeFloor(theme),
+        body: SolidBody::Static,
+        friction: Some(0.032),
+        extra: ExtraKind::None,
+    });
+}
+
 fn build_branch_layout(
     index: usize,
     branch: &BranchPlan,
@@ -2909,7 +3334,7 @@ fn build_branch_layout(
     let mut layout = ModuleLayout::default();
     let owner = OwnerTag::Branch(index);
     let room = &rooms[branch.room_index];
-    let branch_dir = Vec3::new(branch.dir.x as f32, 0.0, branch.dir.y as f32).normalize_or_zero();
+    let branch_dir = branch.dir.normalize_or_zero();
     let along_x = branch_dir.x.abs() > 0.5;
     let start = room_edge(room, branch_dir);
     let bridge_top = room.top + branch_dir * (CELL_SIZE * 0.34) + Vec3::Y * 0.22;
@@ -3207,25 +3632,18 @@ fn theme_prop_color(theme: Theme) -> Color {
     }
 }
 
-fn projected_gap(from_size: Vec2, to_size: Vec2) -> f32 {
-    CELL_SIZE - (from_size.x + to_size.x) * 0.5
+fn projected_gap(step_distance: f32, from_size: Vec2, to_size: Vec2) -> f32 {
+    step_distance - (from_size.max_element() + to_size.max_element()) * 0.5
 }
 
 fn edge_gap(from: &RoomPlan, to: &RoomPlan) -> f32 {
-    let dir = to.cell - from.cell;
-    if dir.x != 0 {
-        CELL_SIZE - (from.size.x + to.size.x) * 0.5
-    } else {
-        CELL_SIZE - (from.size.y + to.size.y) * 0.5
-    }
+    let forward = direction_from_delta(to.top - from.top);
+    let center_gap = (to.top - from.top).xz().length();
+    center_gap - (room_forward_extent(from, forward) + room_forward_extent(to, -forward)) * 0.5
 }
 
 fn room_edge(room: &RoomPlan, forward: Vec3) -> Vec3 {
-    let extent = if forward.x.abs() > 0.5 {
-        room.size.x
-    } else {
-        room.size.y
-    };
+    let extent = room_forward_extent(room, forward);
     room.top + forward * (extent * 0.5 - 1.05)
 }
 
@@ -3234,10 +3652,117 @@ fn underside_y(top: f32, thickness: f32) -> f32 {
 }
 
 fn direction_from_delta(delta: Vec3) -> Vec3 {
-    if delta.x.abs() >= delta.z.abs() {
-        Vec3::new(delta.x.signum(), 0.0, 0.0)
-    } else {
-        Vec3::new(0.0, 0.0, delta.z.signum())
+    Vec3::new(delta.x, 0.0, delta.z).normalize_or_zero()
+}
+
+fn room_forward_extent(room: &RoomPlan, forward: Vec3) -> f32 {
+    let dir = forward.xz().normalize_or_zero();
+    dir.x.abs() * room.size.x + dir.y.abs() * room.size.y
+}
+
+fn room_grid_cell(top: Vec3) -> IVec2 {
+    IVec2::new(
+        (top.x / ROOM_GRID_SIZE).round() as i32,
+        (top.z / ROOM_GRID_SIZE).round() as i32,
+    )
+}
+
+fn max_floating_sphere_radius_for_room(room: &RoomPlan) -> f32 {
+    (room.size.min_element() * 0.46).clamp(4.6, 6.4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_solids_have_valid_collider_bounds() {
+        for seed in 0_u64..256 {
+            let blueprint = build_run_blueprint(seed);
+
+            for room in &blueprint.rooms {
+                let layout = build_room_layout(room);
+                for solid in &layout.solids {
+                    assert!(
+                        validate_solid_spec(solid).is_ok(),
+                        "seed {seed} room {} solid '{}' invalid: {}",
+                        room.index,
+                        solid.label,
+                        validate_solid_spec(solid).unwrap_err()
+                    );
+                }
+            }
+
+            for segment in &blueprint.segments {
+                let layout = build_segment_layout(segment, &blueprint.rooms, &HashSet::default());
+                for solid in &layout.solids {
+                    assert!(
+                        validate_solid_spec(solid).is_ok(),
+                        "seed {seed} segment {} {:?} solid '{}' invalid: {}",
+                        segment.index,
+                        segment.kind,
+                        solid.label,
+                        validate_solid_spec(solid).unwrap_err()
+                    );
+                }
+            }
+
+            for (index, branch) in blueprint.branches.iter().enumerate() {
+                let layout =
+                    build_branch_layout(index, branch, &blueprint.rooms, &HashSet::default());
+                for solid in &layout.solids {
+                    assert!(
+                        validate_solid_spec(solid).is_ok(),
+                        "seed {seed} branch {} solid '{}' invalid: {}",
+                        index,
+                        solid.label,
+                        validate_solid_spec(solid).unwrap_err()
+                    );
+                }
+            }
+
+            let summit = build_summit_layout(blueprint.rooms.last().unwrap(), blueprint.summit);
+            for solid in &summit.solids {
+                assert!(
+                    validate_solid_spec(solid).is_ok(),
+                    "seed {seed} summit solid '{}' invalid: {}",
+                    solid.label,
+                    validate_solid_spec(solid).unwrap_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn surf_ramp_rotation_descends_forward_and_rises_to_wall() {
+        for &forward in &[Vec3::X, Vec3::Z] {
+            let right = Vec3::new(-forward.z, 0.0, forward.x);
+            for side in [-1.0_f32, 1.0] {
+                let rotation = surf_ramp_rotation(forward, right, side, 0.6, 1.0);
+                let normal = rotation * Vec3::Y;
+                let outward = right * side;
+                let length_axis = rotation * Vec3::X;
+
+                assert!(
+                    length_axis.dot(forward) > 0.9,
+                    "length axis {:?} should follow forward {:?}",
+                    length_axis,
+                    forward
+                );
+                assert!(
+                    normal.dot(forward) > 0.0,
+                    "normal {:?} should tilt forward for downhill motion {:?}",
+                    normal,
+                    forward
+                );
+                assert!(
+                    normal.dot(outward) < 0.0,
+                    "normal {:?} should point inward relative to wall side {:?}",
+                    normal,
+                    outward
+                );
+            }
+        }
     }
 }
 
@@ -3251,6 +3776,86 @@ fn axis_box_size(along_x: bool, length: f32, height: f32, width: f32) -> Vec3 {
 
 fn top_to_center(top: Vec3, height: f32) -> Vec3 {
     Vec3::new(top.x, top.y - height * 0.5, top.z)
+}
+
+fn surf_wedge_lip_to_center(lip: Vec3, size: Vec3, rotation: Quat, wall_side: f32) -> Vec3 {
+    lip - rotation * Vec3::new(0.0, size.y * 0.5, wall_side * size.z * 0.5)
+}
+
+fn surf_wedge_points(size: Vec3, wall_side: f32) -> Vec<Vec3> {
+    let half_length = size.x * 0.5;
+    let half_height = size.y * 0.5;
+    let half_width = size.z * 0.5;
+    let outer_z = wall_side * half_width;
+    let inner_z = -wall_side * half_width;
+
+    vec![
+        Vec3::new(-half_length, -half_height, inner_z),
+        Vec3::new(-half_length, -half_height, outer_z),
+        Vec3::new(-half_length, half_height, outer_z),
+        Vec3::new(half_length, -half_height, inner_z),
+        Vec3::new(half_length, -half_height, outer_z),
+        Vec3::new(half_length, half_height, outer_z),
+    ]
+}
+
+fn build_surf_wedge_mesh(size: Vec3, wall_side: f32) -> Mesh {
+    let points = surf_wedge_points(size, wall_side);
+    let a = points[0];
+    let b = points[1];
+    let c = points[2];
+    let d = points[3];
+    let e = points[4];
+    let f = points[5];
+
+    let triangles = vec![
+        [a, b, c],
+        [d, f, e],
+        [a, d, e],
+        [a, e, b],
+        [b, e, f],
+        [b, f, c],
+        [a, c, f],
+        [a, f, d],
+    ];
+
+    let positions: Vec<[f32; 3]> = triangles
+        .into_iter()
+        .flatten()
+        .map(|point| [point.x, point.y, point.z])
+        .collect();
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_computed_flat_normals()
+}
+
+fn surf_ramp_rotation(
+    forward: Vec3,
+    right: Vec3,
+    side: f32,
+    downhill_bias: f32,
+    bank_bias: f32,
+) -> Quat {
+    let inward = -right * side;
+    let normal = (Vec3::Y + forward * downhill_bias + inward * bank_bias).normalize_or_zero();
+    let tangent_forward = (forward - normal * forward.dot(normal)).normalize_or_zero();
+    let tangent_forward = if tangent_forward.length_squared() > 0.0001 {
+        tangent_forward
+    } else {
+        forward
+    };
+
+    // Build an explicit orthonormal basis so the ramp length always follows the course
+    // direction and the bank always rises toward the wall side.
+    let local_x = tangent_forward;
+    let local_y = normal;
+    let local_z = local_x.cross(local_y).normalize_or_zero();
+
+    Quat::from_mat3(&Mat3::from_cols(local_x, local_y, local_z))
 }
 
 fn intersects(a: AabbVolume, b: AabbVolume, epsilon: f32) -> bool {

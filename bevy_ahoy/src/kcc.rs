@@ -181,6 +181,9 @@ fn run_kcc(
         ctx.state.last_tac.tick(time.delta());
         ctx.state.last_step_up.tick(time.delta());
         ctx.state.last_step_down.tick(time.delta());
+        if ctx.input.jumped.is_none() {
+            ctx.state.jump_hold_consumed = false;
+        }
 
         depenetrate_character(&move_and_slide, &mut ctx, &mut transform);
         update_grounded(&move_and_slide, &colliders, &time, &mut ctx, &mut transform);
@@ -681,10 +684,18 @@ fn handle_mantle_movement(
     }
 
     let climb_dir = Vec3::Y;
-    let wish_y = calc_climb_factor(ctx, wish_velocity);
+    let mut wish_y = calc_climb_factor(ctx, wish_velocity);
+    if ctx.input.jumped.is_some() {
+        wish_y = wish_y.max(1.0);
+    }
+    let pull_up_factor = if mantle_state.height_left < ctx.cfg.climb_pull_up_height + 0.35 {
+        0.72
+    } else {
+        1.0
+    };
 
-    let mut climb_dist =
-        (ctx.cfg.mantle_speed * time.delta_secs() * wish_y).min(mantle_state.height_left);
+    let mut climb_dist = (ctx.cfg.mantle_speed * pull_up_factor * time.delta_secs() * wish_y)
+        .min(mantle_state.height_left);
     if mantle_state.height_left - climb_dist
         > ctx.cfg.mantle_height - ctx.cfg.min_ledge_grab_space.size().y
     {
@@ -728,6 +739,9 @@ fn update_crane_state(
     ctx: &mut CtxItem,
     transform: &mut Transform,
 ) {
+    if ctx.state.jump_hold_consumed && ctx.input.jumped.is_some() {
+        return;
+    }
     let Some(crane_time) = ctx.input.craned.clone() else {
         return;
     };
@@ -750,6 +764,7 @@ fn update_crane_state(
 
     ctx.state.mantle = None;
     ctx.state.crane_height_left = Some(crane_height);
+    ctx.state.jump_hold_consumed = true;
 }
 
 fn available_crane_height(
@@ -896,6 +911,9 @@ fn update_mantle_state(
     if ctx.state.mantle.is_some() {
         return;
     }
+    if ctx.state.jump_hold_consumed && ctx.input.jumped.is_some() {
+        return;
+    }
 
     let Some(mantle_time) = ctx.input.mantled.clone() else {
         return;
@@ -917,6 +935,7 @@ fn update_mantle_state(
 
     ctx.state.mantle = Some(mantle_state);
     ctx.output.mantle = Some(mantle_output);
+    ctx.state.jump_hold_consumed = true;
 }
 
 fn available_mantle_height(
@@ -1088,6 +1107,7 @@ fn handle_climbdown(
 
     ctx.state.mantle = Some(mantle_state);
     ctx.output.mantle = Some(mantle_output);
+    ctx.state.jump_hold_consumed = true;
 }
 
 fn move_character(
@@ -1455,6 +1475,14 @@ fn handle_jump(
     ctx: &mut CtxItem,
     transform: &mut Transform,
 ) {
+    if ctx.state.jump_hold_consumed {
+        if ctx.input.jumped.is_none() {
+            ctx.state.jump_hold_consumed = false;
+        } else {
+            ctx.input.jumped = None;
+            return;
+        }
+    }
     // Handle tic tacs when we're in the air beyond coyote-time.
     let jumpdir =
         if ctx.state.grounded.is_none() && ctx.state.last_ground.elapsed() > ctx.cfg.coyote_time {
