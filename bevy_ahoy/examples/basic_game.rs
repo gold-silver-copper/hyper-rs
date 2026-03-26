@@ -16,7 +16,7 @@ use bevy::{
 };
 use bevy_ahoy::{
     CharacterControllerOutput, CharacterLook, PickupConfig, PickupHoldConfig, PickupPullConfig,
-    prelude::*,
+    input::AccumulatedInput, prelude::*,
 };
 use bevy_ecs::{lifecycle::HookContext, world::DeferredWorld};
 use bevy_enhanced_input::prelude::{Hold, Press, *};
@@ -109,7 +109,10 @@ fn main() -> AppExit {
         )
         .add_systems(
             FixedPostUpdate,
-            apply_wall_run.after(AhoySystems::MoveCharacters),
+            (
+                normalize_surfing_motion.before(AhoySystems::MoveCharacters),
+                apply_wall_run.after(AhoySystems::MoveCharacters),
+            ),
         )
         .run()
 }
@@ -143,12 +146,14 @@ fn setup_scene(
             Name::new("Player"),
             Player,
             PlayerInput,
+            SurfMovementState::default(),
             WallRunState::default(),
             CharacterController {
-                speed: 9.2,
-                air_speed: 2.3,
+                speed: 9.8,
+                air_speed: 4.2,
+                air_acceleration_hz: 42.0,
                 jump_height: 1.9,
-                max_speed: 26.0,
+                max_speed: 3000.0,
                 step_size: 1.0,
                 mantle_height: 3.4,
                 crane_height: 4.1,
@@ -611,6 +616,9 @@ struct ResetSeedButton;
 struct GeneratedWorld;
 
 #[derive(Component)]
+struct SurfRampSurface;
+
+#[derive(Component)]
 struct CheckpointPad {
     index: usize,
 }
@@ -831,6 +839,11 @@ struct WallRunState {
     shaft_cooldown: f32,
 }
 
+#[derive(Component, Default)]
+struct SurfMovementState {
+    jump_lock: f32,
+}
+
 fn apply_wall_run(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -920,6 +933,40 @@ fn apply_wall_run(
     }
 }
 
+fn normalize_surfing_motion(
+    time: Res<Time>,
+    surf_surfaces: Query<(), With<SurfRampSurface>>,
+    mut players: Query<
+        (
+            &CharacterControllerOutput,
+            &mut AccumulatedInput,
+            &mut SurfMovementState,
+        ),
+        With<Player>,
+    >,
+) {
+    let dt = time.delta_secs();
+    for (output, mut input, mut surf_state) in &mut players {
+        let touching_surf = output
+            .touching_entities
+            .iter()
+            .any(|touch| surf_surfaces.contains(touch.entity) && is_surf_touch(touch.normal));
+
+        if touching_surf {
+            surf_state.jump_lock = 0.18;
+        } else {
+            surf_state.jump_lock = (surf_state.jump_lock - dt).max(0.0);
+        }
+
+        if surf_state.jump_lock > 0.0 {
+            input.jumped = None;
+            input.tac = None;
+            input.craned = None;
+            input.mantled = None;
+        }
+    }
+}
+
 fn find_wall_normal(output: &CharacterControllerOutput, travel_dir: Vec3) -> Option<Vec3> {
     let mut best_normal = None;
     let mut best_alignment = 0.15;
@@ -940,6 +987,10 @@ fn find_wall_normal(output: &CharacterControllerOutput, travel_dir: Vec3) -> Opt
     }
 
     best_normal
+}
+
+fn is_surf_touch(normal: Dir3) -> bool {
+    normal.y > 0.18 && normal.y < 0.93 && Vec2::new(normal.x, normal.z).length_squared() > 0.08
 }
 
 fn find_wall_shaft(output: &CharacterControllerOutput) -> Option<(Vec3, Vec3)> {
@@ -1351,7 +1402,7 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
     let theme_offset = (rng.next_u64() % 4) as usize;
 
     let mut current_socket = SOCKET_SAFE_REST;
-    let mut current_height = 96.0;
+    let mut current_height = 420.0;
     let mut current_top = Vec3::new(0.0, current_height, 0.0);
     let heading_phase = rng.range_f32(0.0, TAU);
     let heading_frequency = rng.range_f32(0.34, 0.58);
@@ -1385,7 +1436,7 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
         let projected_gap = projected_gap(step_distance, rooms.last().unwrap().size, room_size);
         let template = choose_module_template(rng, current_socket, difficulty, projected_gap);
         step_distance = match template.kind {
-            ModuleKind::SurfRamp => rng.range_f32(CELL_SIZE * 6.0, CELL_SIZE * 10.0),
+            ModuleKind::SurfRamp => rng.range_f32(CELL_SIZE * 14.0, CELL_SIZE * 22.0),
             ModuleKind::StairRun => rng.range_f32(CELL_SIZE * 1.22, CELL_SIZE * 1.7),
             _ => step_distance,
         };
@@ -1393,7 +1444,12 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
             rng.range_f32(template.min_rise, template.max_rise) + 0.45 + difficulty * 0.28;
         current_height -= descent;
         let right = Vec3::new(-heading.z, 0.0, heading.x);
-        let bend = right * rng.range_f32(-0.8, 0.8) * (0.35 + difficulty * 0.3);
+        let bend_scale = if matches!(template.kind, ModuleKind::SurfRamp) {
+            0.06 + difficulty * 0.05
+        } else {
+            0.35 + difficulty * 0.3
+        };
+        let bend = right * rng.range_f32(-0.8, 0.8) * bend_scale;
         let mut top = Vec3::new(current_top.x, current_height, current_top.z)
             + heading * step_distance
             + bend;
@@ -1408,18 +1464,31 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
         occupied_rooms.insert(cell);
         current_top = top;
 
+        if matches!(template.kind, ModuleKind::SurfRamp) {
+            if let Some(previous_room) = rooms.last_mut() {
+                previous_room.section = RoomSectionKind::OpenPad;
+                previous_room.size = previous_room.size.max(Vec2::splat(15.4));
+            }
+        }
+
         rooms.push(RoomPlan {
             index,
             cell,
             top,
             size: if index == floors - 1 {
                 Vec2::splat(15.2)
+            } else if matches!(template.kind, ModuleKind::SurfRamp) {
+                room_size.max(Vec2::splat(15.4))
             } else {
                 room_size
             },
             theme: theme_for(index, floors, theme_offset),
             seed: rng.next_u64(),
-            section: choose_room_section(rng, difficulty, index, floors),
+            section: if matches!(template.kind, ModuleKind::SurfRamp) {
+                RoomSectionKind::OpenPad
+            } else {
+                choose_room_section(rng, difficulty, index, floors)
+            },
             checkpoint_slot: Some(index),
         });
 
@@ -1578,6 +1647,15 @@ fn generate_side_branches(
     let occupied_rooms = rooms.iter().map(|room| room.cell).collect::<HashSet<_>>();
 
     for room in rooms.iter().skip(1).take(rooms.len().saturating_sub(2)) {
+        let adjacent_to_surf = segments
+            .get(room.index.saturating_sub(1))
+            .is_some_and(|segment| matches!(segment.kind, ModuleKind::SurfRamp))
+            || segments
+                .get(room.index)
+                .is_some_and(|segment| matches!(segment.kind, ModuleKind::SurfRamp));
+        if adjacent_to_surf {
+            continue;
+        }
         let difficulty = room.index as f32 / rooms.len().max(1) as f32;
         let main_forward = if room.index < rooms.len() - 1 {
             direction_from_delta(rooms[room.index + 1].top - room.top)
@@ -1927,10 +2005,10 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.2,
             max_difficulty: 0.92,
             weight: 7,
-            min_rise: 6.0,
-            max_rise: 15.0,
-            min_gap: 8.0,
-            max_gap: 220.0,
+            min_rise: 24.0,
+            max_rise: 110.0,
+            min_gap: 40.0,
+            max_gap: 520.0,
             shortcut_eligible: false,
         },
         ModuleKind::MantleStack => ModuleTemplate {
@@ -2534,6 +2612,7 @@ fn spawn_box_spec(
                 entity.insert((
                     RigidBody::Static,
                     collider,
+                    SurfRampSurface,
                     CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
                 ));
             }
@@ -3198,48 +3277,48 @@ fn append_css_surf_sequence(
     let along_x = forward.x.abs() > 0.5;
     let direct_distance = start.distance(end).max(12.0);
     let entry_margin = if intense {
-        (direct_distance * 0.08).clamp(6.0, 12.0)
+        (direct_distance * 0.06).clamp(8.0, 18.0)
     } else {
-        (direct_distance * 0.07).clamp(4.5, 9.0)
+        (direct_distance * 0.05).clamp(6.0, 14.0)
     };
     let exit_margin = if intense {
-        (direct_distance * 0.06).clamp(5.0, 10.0)
+        (direct_distance * 0.04).clamp(6.0, 14.0)
     } else {
-        (direct_distance * 0.05).clamp(4.0, 7.5)
+        (direct_distance * 0.035).clamp(5.0, 11.0)
     };
     let surf_start = start + forward * entry_margin + Vec3::Y * 0.4;
     let surf_end = end - forward * exit_margin + Vec3::Y * 0.18;
     let total_distance = surf_start.distance(surf_end).max(12.0);
     let segment_count = if intense {
-        ((total_distance / 14.0).round() as usize).clamp(10, 18)
+        ((total_distance / 11.0).round() as usize).clamp(24, 56)
     } else {
-        ((total_distance / 16.0).round() as usize).clamp(8, 14)
+        ((total_distance / 12.0).round() as usize).clamp(18, 42)
     };
     let curve_cycles = if intense {
-        rng.range_f32(1.4, 2.4)
+        rng.range_f32(0.7, 1.2)
     } else {
-        rng.range_f32(1.0, 1.8)
+        rng.range_f32(0.5, 0.95)
     };
     let curve_phase = rng.range_f32(0.0, TAU);
     let curve_amplitude = if intense {
-        rng.range_f32(1.0, 1.8)
+        rng.range_f32(0.45, 0.9)
     } else {
-        rng.range_f32(0.8, 1.4)
+        rng.range_f32(0.3, 0.7)
     };
     let ramp_span = if intense {
-        rng.range_f32(8.8, 12.4)
+        rng.range_f32(9.6, 13.8)
     } else {
-        rng.range_f32(7.0, 9.8)
+        rng.range_f32(7.6, 10.6)
     };
     let ramp_drop = if intense {
-        rng.range_f32(11.0, 15.0)
+        rng.range_f32(16.0, 24.0)
     } else {
-        rng.range_f32(8.5, 11.5)
+        rng.range_f32(12.0, 18.0)
     };
     let ridge_lift = if intense {
-        rng.range_f32(2.8, 4.4)
+        rng.range_f32(3.8, 5.8)
     } else {
-        rng.range_f32(2.0, 3.1)
+        rng.range_f32(2.6, 4.2)
     };
     let start_deck_length = entry_margin + if intense { 4.2 } else { 3.8 };
     let finish_deck_length = exit_margin + if intense { 3.8 } else { 3.2 };
@@ -3247,12 +3326,31 @@ fn append_css_surf_sequence(
     let mut centerline = Vec::with_capacity(segment_count + 1);
     for sample in 0..=segment_count {
         let t = sample as f32 / segment_count as f32;
-        let envelope = (t * PI).sin().powf(0.85);
+        let envelope = (t * PI).sin().max(0.0).powf(0.85);
         let weave = (t * curve_cycles * TAU + curve_phase).sin();
-        let harmonic = (t * (curve_cycles * 0.5 + 0.65) * TAU + curve_phase * 0.37).sin();
-        let offset = right * (weave * 0.72 + harmonic * 0.28) * curve_amplitude * envelope;
+        let offset = right * weave * curve_amplitude * envelope;
         let lift = Vec3::Y * ridge_lift * envelope;
         centerline.push(surf_start.lerp(surf_end, t) + offset + lift);
+    }
+
+    let mut tangents = Vec::with_capacity(segment_count + 1);
+    for index in 0..=segment_count {
+        let prev = if index == 0 {
+            centerline[1] - centerline[0]
+        } else {
+            centerline[index] - centerline[index - 1]
+        };
+        let next = if index == segment_count {
+            centerline[index] - centerline[index - 1]
+        } else {
+            centerline[index + 1] - centerline[index]
+        };
+        let tangent = direction_from_delta(prev + next);
+        tangents.push(if tangent == Vec3::ZERO {
+            forward
+        } else {
+            tangent
+        });
     }
 
     layout.solids.push(SolidSpec {
@@ -3274,12 +3372,17 @@ fn append_css_surf_sequence(
         let section_start = centerline[index];
         let section_end = centerline[index + 1];
         let section_delta = section_end - section_start;
-        let local_forward = direction_from_delta(section_delta);
+        let tangent = direction_from_delta(tangents[index] + tangents[index + 1]);
+        let local_forward = if tangent == Vec3::ZERO {
+            direction_from_delta(section_delta)
+        } else {
+            tangent
+        };
         if local_forward == Vec3::ZERO {
             continue;
         }
         let ridge = section_start.lerp(section_end, 0.5);
-        let ramp_length = (section_delta.length() * 1.01).max(if intense { 9.5 } else { 8.0 });
+        let ramp_length = (section_delta.length() * 0.995).max(if intense { 10.0 } else { 8.4 });
         let size = Vec3::new(ramp_length, ramp_drop, ramp_span);
         let rotation = surf_ramp_rotation(local_forward);
 
