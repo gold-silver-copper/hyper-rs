@@ -3192,7 +3192,7 @@ fn append_css_surf_sequence(
 ) {
     let along_x = forward.x.abs() > 0.5;
     let total_distance = start.distance(end).max(12.0);
-    let pair_count = if intense {
+    let segment_count = if intense {
         ((total_distance / 3.8).round() as usize).clamp(7, 13)
     } else {
         ((total_distance / 4.6).round() as usize).clamp(5, 10)
@@ -3208,27 +3208,28 @@ fn append_css_surf_sequence(
     } else {
         rng.range_f32(1.1, 2.0)
     };
-    let lane_gap = if intense {
-        rng.range_f32(0.12, 0.24)
+    let lip_offset = if intense {
+        rng.range_f32(2.2, 3.1)
     } else {
-        rng.range_f32(0.16, 0.34)
+        rng.range_f32(1.8, 2.7)
     };
-    let ramp_width = if intense {
-        rng.range_f32(8.8, 12.4)
+    let ramp_span = if intense {
+        rng.range_f32(4.8, 6.5)
     } else {
-        rng.range_f32(7.2, 9.8)
+        rng.range_f32(3.9, 5.4)
     };
-    let ramp_thickness = if intense {
-        rng.range_f32(0.18, 0.24)
+    let surf_angle = if intense {
+        rng.range_f32(49.5_f32.to_radians(), 53.5_f32.to_radians())
     } else {
-        rng.range_f32(0.2, 0.28)
+        rng.range_f32(48.0_f32.to_radians(), 52.0_f32.to_radians())
     };
+    let ramp_rise = ramp_span * surf_angle.tan();
     let start_deck_length = if intense { 3.6 } else { 4.6 };
     let finish_deck_length = if intense { 3.2 } else { 4.2 };
 
-    let mut centerline = Vec::with_capacity(pair_count + 1);
-    for sample in 0..=pair_count {
-        let t = sample as f32 / pair_count as f32;
+    let mut centerline = Vec::with_capacity(segment_count + 1);
+    for sample in 0..=segment_count {
+        let t = sample as f32 / segment_count as f32;
         let envelope = (t * PI).sin().powf(0.85);
         let weave = (t * curve_cycles * TAU + curve_phase).sin();
         let harmonic = (t * (curve_cycles * 0.5 + 0.65) * TAU + curve_phase * 0.37).sin();
@@ -3251,7 +3252,26 @@ fn append_css_surf_sequence(
         extra: ExtraKind::None,
     });
 
-    for index in 0..pair_count {
+    let mut side = if rng.chance(0.5) { -1.0_f32 } else { 1.0 };
+    let mut segments_until_switch = if intense {
+        rng.range_usize(2, 4)
+    } else {
+        rng.range_usize(1, 3)
+    };
+
+    for index in 0..segment_count {
+        if index > 0 {
+            segments_until_switch = segments_until_switch.saturating_sub(1);
+            if segments_until_switch == 0 {
+                side = -side;
+                segments_until_switch = if intense {
+                    rng.range_usize(2, 4)
+                } else {
+                    rng.range_usize(1, 3)
+                };
+            }
+        }
+
         let section_start = centerline[index];
         let section_end = centerline[index + 1];
         let section_delta = section_end - section_start;
@@ -3260,53 +3280,33 @@ fn append_css_surf_sequence(
             continue;
         }
         let local_right = Vec3::new(-local_forward.z, 0.0, local_forward.x);
-        let lip_center = section_start.lerp(section_end, 0.5) + Vec3::Y * 0.02;
-        let ramp_length = (section_delta.length() * 1.24).max(if intense { 6.8 } else { 5.9 });
-        let downhill_bias = if intense {
-            rng.range_f32(1.18, 1.46)
-        } else {
-            rng.range_f32(0.98, 1.24)
-        };
-        let bank_bias = if intense {
-            rng.range_f32(2.05, 2.55)
-        } else {
-            rng.range_f32(1.72, 2.16)
-        };
+        let outward = local_right * side;
+        let lip = section_start.lerp(section_end, 0.5) + outward * lip_offset;
+        let ramp_length = (section_delta.length() * 1.18).max(if intense { 7.4 } else { 6.2 });
+        let size = Vec3::new(ramp_length, ramp_rise, ramp_span);
+        let rotation = surf_ramp_rotation(local_forward, side, size);
 
-        for side in [-1.0_f32, 1.0] {
-            let outward = local_right * side;
-            let rotation =
-                surf_ramp_rotation(local_forward, local_right, side, downhill_bias, bank_bias);
-            let wall_side = if (rotation * Vec3::Z).dot(outward) >= 0.0 {
-                1.0
+        layout.solids.push(SolidSpec {
+            owner,
+            label: if intense {
+                format!("Surf Wedge {} {}", index, side)
             } else {
-                -1.0
-            };
-            let lip = lip_center + outward * (lane_gap * 0.5);
-            let size = Vec3::new(ramp_length, ramp_thickness, ramp_width);
-
-            layout.solids.push(SolidSpec {
-                owner,
-                label: if intense {
-                    format!("Surf Wedge {} {}", index, side)
-                } else {
-                    format!("Flow Wedge {} {}", index, side)
-                },
-                center: surf_wedge_lip_to_center(lip, size, rotation, wall_side),
-                size,
-                paint: if side < 0.0 {
-                    PaintStyle::ThemeAccent(theme)
-                } else {
-                    PaintStyle::ThemeFloor(theme)
-                },
-                body: SolidBody::StaticSurfWedge {
-                    rotation,
-                    wall_side,
-                },
-                friction: Some(if intense { 0.022 } else { 0.03 }),
-                extra: ExtraKind::None,
-            });
-        }
+                format!("Flow Wedge {} {}", index, side)
+            },
+            center: surf_wedge_lip_to_center(lip, size, rotation, side),
+            size,
+            paint: if side < 0.0 {
+                PaintStyle::ThemeAccent(theme)
+            } else {
+                PaintStyle::ThemeFloor(theme)
+            },
+            body: SolidBody::StaticSurfWedge {
+                rotation,
+                wall_side: side,
+            },
+            friction: Some(if intense { 0.02 } else { 0.026 }),
+            extra: ExtraKind::None,
+        });
     }
 
     layout.solids.push(SolidSpec {
@@ -3734,14 +3734,15 @@ mod tests {
     }
 
     #[test]
-    fn surf_ramp_rotation_descends_forward_and_rises_to_wall() {
+    fn surf_ramp_rotation_matches_utopia_style_wedge() {
         for &forward in &[Vec3::X, Vec3::Z] {
-            let right = Vec3::new(-forward.z, 0.0, forward.x);
             for side in [-1.0_f32, 1.0] {
-                let rotation = surf_ramp_rotation(forward, right, side, 0.6, 1.0);
-                let normal = rotation * Vec3::Y;
-                let outward = right * side;
+                let size = Vec3::new(8.0, 5.0, 4.0);
+                let outward = Vec3::new(-forward.z, 0.0, forward.x) * side;
+                let rotation = surf_ramp_rotation(forward, side, size);
+                let normal = rotation * surf_wedge_surface_normal(size, side);
                 let length_axis = rotation * Vec3::X;
+                let slope_angle = normal.angle_between(Vec3::Y).to_degrees();
 
                 assert!(
                     length_axis.dot(forward) > 0.9,
@@ -3750,16 +3751,21 @@ mod tests {
                     forward
                 );
                 assert!(
-                    normal.dot(forward) > 0.0,
-                    "normal {:?} should tilt forward for downhill motion {:?}",
+                    normal.dot(forward).abs() < 0.05,
+                    "surface normal {:?} should stay nearly constant along forward {:?}",
                     normal,
                     forward
                 );
                 assert!(
                     normal.dot(outward) < 0.0,
-                    "normal {:?} should point inward relative to wall side {:?}",
+                    "surface normal {:?} should point inward relative to wall side {:?}",
                     normal,
                     outward
+                );
+                assert!(
+                    (49.0..54.5).contains(&slope_angle),
+                    "surface angle {} should stay near the authored utopia range",
+                    slope_angle
                 );
             }
         }
@@ -3780,6 +3786,10 @@ fn top_to_center(top: Vec3, height: f32) -> Vec3 {
 
 fn surf_wedge_lip_to_center(lip: Vec3, size: Vec3, rotation: Quat, wall_side: f32) -> Vec3 {
     lip - rotation * Vec3::new(0.0, size.y * 0.5, wall_side * size.z * 0.5)
+}
+
+fn surf_wedge_surface_normal(size: Vec3, wall_side: f32) -> Vec3 {
+    Vec3::new(0.0, wall_side * size.z, -size.y).normalize_or_zero()
 }
 
 fn surf_wedge_points(size: Vec3, wall_side: f32) -> Vec<Vec3> {
@@ -3833,29 +3843,20 @@ fn build_surf_wedge_mesh(size: Vec3, wall_side: f32) -> Mesh {
     .with_computed_flat_normals()
 }
 
-fn surf_ramp_rotation(
-    forward: Vec3,
-    right: Vec3,
-    side: f32,
-    downhill_bias: f32,
-    bank_bias: f32,
-) -> Quat {
-    let inward = -right * side;
-    let normal = (Vec3::Y + forward * downhill_bias + inward * bank_bias).normalize_or_zero();
-    let tangent_forward = (forward - normal * forward.dot(normal)).normalize_or_zero();
-    let tangent_forward = if tangent_forward.length_squared() > 0.0001 {
-        tangent_forward
-    } else {
-        forward
-    };
+fn surf_ramp_rotation(forward: Vec3, side: f32, size: Vec3) -> Quat {
+    let forward = forward.normalize_or_zero();
+    let outward = Vec3::new(-forward.z, 0.0, forward.x) * side;
+    let world_normal = (Vec3::Y * size.z - outward * size.y).normalize_or_zero();
+    let world_side = forward.cross(world_normal).normalize_or_zero();
 
-    // Build an explicit orthonormal basis so the ramp length always follows the course
-    // direction and the bank always rises toward the wall side.
-    let local_x = tangent_forward;
-    let local_y = normal;
-    let local_z = local_x.cross(local_y).normalize_or_zero();
+    let local_forward = Vec3::X;
+    let local_normal = surf_wedge_surface_normal(size, side);
+    let local_side = local_forward.cross(local_normal).normalize_or_zero();
 
-    Quat::from_mat3(&Mat3::from_cols(local_x, local_y, local_z))
+    let local_basis = Mat3::from_cols(local_forward, local_normal, local_side);
+    let world_basis = Mat3::from_cols(forward, world_normal, world_side);
+
+    Quat::from_mat3(&(world_basis * local_basis.transpose()))
 }
 
 fn intersects(a: AabbVolume, b: AabbVolume, epsilon: f32) -> bool {
