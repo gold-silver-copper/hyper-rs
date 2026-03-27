@@ -34,7 +34,6 @@ const PLAYER_SPAWN_CLEARANCE: f32 = 2.4;
 const WALL_RUN_SPEED: f32 = 11.5;
 const WALL_RUN_STICK_SPEED: f32 = 2.0;
 const SURF_WEDGE_THICKNESS: f32 = 0.16;
-const SURF_RIDGE_HALF_WIDTH: f32 = 0.14;
 const WALL_RUN_FALL_SPEED: f32 = 2.25;
 const WALL_RUN_MIN_SPEED: f32 = 4.0;
 const WALL_RUN_DURATION: f32 = 0.95;
@@ -1186,11 +1185,9 @@ enum ModuleKind {
     WallRunHall,
     LiftChasm,
     CrumbleBridge,
-    PistonGate,
     WindTunnel,
     IceSpine,
     WaterGarden,
-    TimedDoor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1255,13 +1252,28 @@ struct SolidSpec {
 #[derive(Clone)]
 enum SolidBody {
     Static,
-    StaticSurfWedge { rotation: Quat, wall_side: f32 },
+    StaticSurfWedge {
+        wall_side: f32,
+        local_points: Vec<Vec3>,
+    },
     Decoration,
     DynamicProp,
-    Water { speed: f32 },
-    Moving { end: Vec3, speed: f32, lethal: bool },
-    Crumbling { delay: f32, sink_speed: f32 },
-    ShortcutBridge { id: u64, active: bool },
+    Water {
+        speed: f32,
+    },
+    Moving {
+        end: Vec3,
+        speed: f32,
+        lethal: bool,
+    },
+    Crumbling {
+        delay: f32,
+        sink_speed: f32,
+    },
+    ShortcutBridge {
+        id: u64,
+        active: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1429,22 +1441,32 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
         heading_angle +=
             (turn_wave + turn_jitter).clamp(-MAX_SECTION_TURN_RADIANS, MAX_SECTION_TURN_RADIANS);
         let heading = Vec3::new(heading_angle.cos(), 0.0, heading_angle.sin()).normalize_or_zero();
-        let mut step_distance = rng.range_f32(CELL_SIZE * 0.92, CELL_SIZE * 1.03);
+        let mut step_distance = rng.range_f32(CELL_SIZE * 5.8, CELL_SIZE * 8.4);
         let projected_gap = projected_gap(step_distance, rooms.last().unwrap().size, room_size);
         let template = choose_module_template(rng, current_socket, difficulty, projected_gap);
         step_distance = match template.kind {
             ModuleKind::SurfRamp => rng.range_f32(CELL_SIZE * 14.0, CELL_SIZE * 22.0),
-            ModuleKind::StairRun => rng.range_f32(CELL_SIZE * 1.22, CELL_SIZE * 1.7),
-            _ => step_distance,
+            ModuleKind::StairRun => rng.range_f32(CELL_SIZE * 9.0, CELL_SIZE * 15.0),
+            ModuleKind::IceSpine | ModuleKind::CrumbleBridge | ModuleKind::WindTunnel => {
+                rng.range_f32(CELL_SIZE * 7.0, CELL_SIZE * 11.5)
+            }
+            ModuleKind::WallRunHall => rng.range_f32(CELL_SIZE * 6.0, CELL_SIZE * 9.0),
+            ModuleKind::MantleStack | ModuleKind::LiftChasm | ModuleKind::WaterGarden => {
+                rng.range_f32(CELL_SIZE * 5.0, CELL_SIZE * 8.0)
+            }
         };
-        let descent =
-            rng.range_f32(template.min_rise, template.max_rise) + 0.45 + difficulty * 0.28;
+        let descent = rng.range_f32(template.min_rise, template.max_rise) + 1.2 + difficulty * 1.1;
         current_height -= descent;
         let right = Vec3::new(-heading.z, 0.0, heading.x);
-        let bend_scale = if matches!(template.kind, ModuleKind::SurfRamp) {
-            0.06 + difficulty * 0.05
+        let bend_scale = if matches!(template.kind, ModuleKind::SurfRamp | ModuleKind::StairRun) {
+            0.04 + difficulty * 0.04
+        } else if matches!(
+            template.kind,
+            ModuleKind::IceSpine | ModuleKind::CrumbleBridge | ModuleKind::WindTunnel
+        ) {
+            0.08 + difficulty * 0.08
         } else {
-            0.35 + difficulty * 0.3
+            0.16 + difficulty * 0.14
         };
         let bend = right * rng.range_f32(-0.8, 0.8) * bend_scale;
         let mut top = Vec3::new(current_top.x, current_height, current_top.z)
@@ -1596,7 +1618,7 @@ fn fallback_blueprint(seed: u64) -> RunBlueprint {
     blueprint.branches.clear();
     for segment in &mut blueprint.segments {
         segment.kind = if segment.difficulty > 0.55 {
-            ModuleKind::LiftChasm
+            ModuleKind::SurfRamp
         } else {
             ModuleKind::StairRun
         };
@@ -1817,15 +1839,9 @@ impl SolidSpec {
             SolidBody::Static | SolidBody::Crumbling { .. } | SolidBody::ShortcutBridge { .. } => {
                 self.size
             }
-            SolidBody::StaticSurfWedge {
-                rotation,
-                wall_side,
-            } => {
-                let (min, max) = transformed_point_bounds(
-                    self.center,
-                    *rotation,
-                    &surf_wedge_points(self.size, *wall_side),
-                );
+            SolidBody::StaticSurfWedge { local_points, .. } => {
+                let (min, max) =
+                    transformed_point_bounds(self.center, Quat::IDENTITY, local_points);
                 return Some(AabbVolume {
                     owner: self.owner,
                     center: (min + max) * 0.5,
@@ -1935,16 +1951,20 @@ fn choose_module_template(
             && matches!(
                 template.kind,
                 ModuleKind::SurfRamp
+                    | ModuleKind::StairRun
                     | ModuleKind::CrumbleBridge
                     | ModuleKind::WindTunnel
-                    | ModuleKind::PistonGate
-                    | ModuleKind::TimedDoor
+                    | ModuleKind::IceSpine
+                    | ModuleKind::WallRunHall
             )
         {
-            weight += 3;
+            weight += 5;
         }
         if difficulty > 0.2 && matches!(template.kind, ModuleKind::SurfRamp) {
-            weight += 2;
+            weight += 3;
+        }
+        if difficulty > 0.35 && matches!(template.kind, ModuleKind::StairRun) {
+            weight += 4;
         }
         if difficulty < 0.35
             && matches!(
@@ -1952,7 +1972,15 @@ fn choose_module_template(
                 ModuleKind::SurfRamp | ModuleKind::MantleStack | ModuleKind::WaterGarden
             )
         {
-            weight += 4;
+            weight += 3;
+        }
+        if difficulty > 0.45
+            && matches!(
+                template.kind,
+                ModuleKind::MantleStack | ModuleKind::LiftChasm | ModuleKind::WaterGarden
+            )
+        {
+            weight = weight.saturating_sub(3).max(1);
         }
         weighted.push((template, weight));
     }
@@ -1972,11 +2000,11 @@ fn all_templates() -> [ModuleTemplate; 11] {
         module_template(ModuleKind::WallRunHall),
         module_template(ModuleKind::LiftChasm),
         module_template(ModuleKind::CrumbleBridge),
-        module_template(ModuleKind::PistonGate),
         module_template(ModuleKind::WindTunnel),
         module_template(ModuleKind::IceSpine),
         module_template(ModuleKind::WaterGarden),
-        module_template(ModuleKind::TimedDoor),
+        module_template(ModuleKind::StairRun),
+        module_template(ModuleKind::SurfRamp),
     ]
 }
 
@@ -1987,20 +2015,20 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             entry: SOCKET_SAFE_REST | SOCKET_SHORTCUT_ANCHOR,
             exit: SOCKET_SAFE_REST | SOCKET_MANTLE_ENTRY,
             min_difficulty: 0.0,
-            max_difficulty: 0.55,
-            weight: 2,
-            min_rise: 1.2,
-            max_rise: 2.9,
-            min_gap: 10.0,
-            max_gap: 26.0,
+            max_difficulty: 1.0,
+            weight: 5,
+            min_rise: 12.0,
+            max_rise: 42.0,
+            min_gap: 26.0,
+            max_gap: 320.0,
             shortcut_eligible: false,
         },
         ModuleKind::SurfRamp => ModuleTemplate {
             kind,
             entry: SOCKET_SAFE_REST | SOCKET_SHORTCUT_ANCHOR,
             exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
-            min_difficulty: 0.2,
-            max_difficulty: 0.92,
+            min_difficulty: 0.12,
+            max_difficulty: 1.0,
             weight: 7,
             min_rise: 24.0,
             max_rise: 110.0,
@@ -2013,12 +2041,12 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             entry: SOCKET_SAFE_REST | SOCKET_MANTLE_ENTRY,
             exit: SOCKET_SAFE_REST | SOCKET_WALLRUN_READY,
             min_difficulty: 0.15,
-            max_difficulty: 0.72,
-            weight: 5,
-            min_rise: 1.4,
-            max_rise: 2.4,
-            min_gap: 7.0,
-            max_gap: 10.5,
+            max_difficulty: 0.42,
+            weight: 2,
+            min_rise: 8.0,
+            max_rise: 20.0,
+            min_gap: 18.0,
+            max_gap: 64.0,
             shortcut_eligible: false,
         },
         ModuleKind::WallRunHall => ModuleTemplate {
@@ -2027,11 +2055,11 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
             min_difficulty: 0.28,
             max_difficulty: 0.9,
-            weight: 3,
-            min_rise: 2.8,
-            max_rise: 4.4,
-            min_gap: 4.8,
-            max_gap: 7.2,
+            weight: 4,
+            min_rise: 10.0,
+            max_rise: 28.0,
+            min_gap: 20.0,
+            max_gap: 90.0,
             shortcut_eligible: true,
         },
         ModuleKind::LiftChasm => ModuleTemplate {
@@ -2039,12 +2067,12 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH | SOCKET_SHORTCUT_ANCHOR,
             exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
             min_difficulty: 0.22,
-            max_difficulty: 1.0,
-            weight: 4,
-            min_rise: 1.6,
-            max_rise: 2.8,
-            min_gap: 8.0,
-            max_gap: 11.8,
+            max_difficulty: 0.45,
+            weight: 1,
+            min_rise: 10.0,
+            max_rise: 22.0,
+            min_gap: 20.0,
+            max_gap: 70.0,
             shortcut_eligible: true,
         },
         ModuleKind::CrumbleBridge => ModuleTemplate {
@@ -2052,51 +2080,38 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
             exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH | SOCKET_SHORTCUT_ANCHOR,
             min_difficulty: 0.34,
-            max_difficulty: 1.0,
+            max_difficulty: 0.95,
             weight: 4,
-            min_rise: 1.4,
-            max_rise: 2.4,
-            min_gap: 8.0,
-            max_gap: 11.6,
-            shortcut_eligible: true,
-        },
-        ModuleKind::PistonGate => ModuleTemplate {
-            kind,
-            entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
-            exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
-            min_difficulty: 0.48,
-            max_difficulty: 1.0,
-            weight: 3,
-            min_rise: 1.8,
-            max_rise: 3.0,
-            min_gap: 8.0,
-            max_gap: 11.6,
+            min_rise: 10.0,
+            max_rise: 28.0,
+            min_gap: 18.0,
+            max_gap: 96.0,
             shortcut_eligible: true,
         },
         ModuleKind::WindTunnel => ModuleTemplate {
             kind,
             entry: SOCKET_SAFE_REST | SOCKET_WALLRUN_READY | SOCKET_HAZARD_BRANCH,
             exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH | SOCKET_SHORTCUT_ANCHOR,
-            min_difficulty: 0.55,
+            min_difficulty: 0.35,
             max_difficulty: 1.0,
-            weight: 3,
-            min_rise: 1.8,
-            max_rise: 3.2,
-            min_gap: 8.4,
-            max_gap: 12.0,
+            weight: 5,
+            min_rise: 12.0,
+            max_rise: 32.0,
+            min_gap: 22.0,
+            max_gap: 110.0,
             shortcut_eligible: true,
         },
         ModuleKind::IceSpine => ModuleTemplate {
             kind,
             entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
             exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
-            min_difficulty: 0.44,
+            min_difficulty: 0.28,
             max_difficulty: 1.0,
-            weight: 4,
-            min_rise: 1.5,
-            max_rise: 2.6,
-            min_gap: 8.0,
-            max_gap: 11.4,
+            weight: 5,
+            min_rise: 10.0,
+            max_rise: 30.0,
+            min_gap: 20.0,
+            max_gap: 120.0,
             shortcut_eligible: false,
         },
         ModuleKind::WaterGarden => ModuleTemplate {
@@ -2104,33 +2119,20 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             entry: SOCKET_SAFE_REST | SOCKET_MANTLE_ENTRY,
             exit: SOCKET_SAFE_REST,
             min_difficulty: 0.18,
-            max_difficulty: 0.68,
-            weight: 3,
-            min_rise: 1.0,
-            max_rise: 1.9,
-            min_gap: 7.0,
-            max_gap: 10.5,
+            max_difficulty: 0.32,
+            weight: 1,
+            min_rise: 8.0,
+            max_rise: 18.0,
+            min_gap: 18.0,
+            max_gap: 52.0,
             shortcut_eligible: false,
-        },
-        ModuleKind::TimedDoor => ModuleTemplate {
-            kind,
-            entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
-            exit: SOCKET_SAFE_REST | SOCKET_SHORTCUT_ANCHOR,
-            min_difficulty: 0.4,
-            max_difficulty: 1.0,
-            weight: 3,
-            min_rise: 1.5,
-            max_rise: 2.8,
-            min_gap: 7.8,
-            max_gap: 11.2,
-            shortcut_eligible: true,
         },
     }
 }
 
 fn safe_fallback_kind(difficulty: f32) -> ModuleKind {
-    if difficulty > 0.3 {
-        ModuleKind::MantleStack
+    if difficulty > 0.4 {
+        ModuleKind::StairRun
     } else {
         ModuleKind::SurfRamp
     }
@@ -2978,17 +2980,17 @@ fn spawn_box_spec(
         }
     }
 
-    let mesh = match spec.body {
-        SolidBody::StaticSurfWedge { wall_side, .. } => {
-            meshes.add(build_surf_wedge_mesh(spec.size, wall_side))
+    let mesh = match &spec.body {
+        SolidBody::StaticSurfWedge { local_points, .. } => {
+            meshes.add(build_surf_wedge_mesh(local_points))
         }
         _ => meshes.add(Cuboid::new(spec.size.x, spec.size.y, spec.size.z)),
     };
     let mut material_spec = material_for_paint(
         spec.paint,
-        matches!(spec.body, SolidBody::ShortcutBridge { active: false, .. }),
+        matches!(&spec.body, SolidBody::ShortcutBridge { active: false, .. }),
     );
-    if matches!(spec.body, SolidBody::StaticSurfWedge { .. }) {
+    if matches!(&spec.body, SolidBody::StaticSurfWedge { .. }) {
         material_spec.cull_mode = None;
         material_spec.perceptual_roughness = 0.12;
         material_spec.reflectance = 0.82;
@@ -2997,13 +2999,7 @@ fn spawn_box_spec(
     }
     let material = materials.add(material_spec);
 
-    let mut transform = Transform::from_translation(spec.center);
-    match &spec.body {
-        SolidBody::StaticSurfWedge { rotation, .. } => {
-            transform.rotation = *rotation;
-        }
-        _ => {}
-    }
+    let transform = Transform::from_translation(spec.center);
 
     let mut entity = commands.spawn((
         GeneratedWorld,
@@ -3021,9 +3017,11 @@ fn spawn_box_spec(
                 CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
             ));
         }
-        SolidBody::StaticSurfWedge { wall_side, .. } => {
-            if let Some(collider) = Collider::convex_hull(surf_wedge_points(spec.size, *wall_side))
-            {
+        SolidBody::StaticSurfWedge {
+            wall_side,
+            local_points,
+        } => {
+            if let Some(collider) = Collider::convex_hull(local_points.clone()) {
                 entity.insert((
                     RigidBody::Static,
                     collider,
@@ -3033,7 +3031,7 @@ fn spawn_box_spec(
             }
             spawn_surf_lane_stripes(
                 &mut entity,
-                spec.size,
+                local_points,
                 *wall_side,
                 spec.paint,
                 meshes,
@@ -3141,34 +3139,25 @@ fn validate_solid_spec(spec: &SolidSpec) -> Result<(), String> {
         return Err(format!("non-positive size {:?}", spec.size));
     }
 
-    let rotation = match spec.body {
-        SolidBody::StaticSurfWedge { rotation, .. } => {
-            if !rotation.is_finite() {
-                return Err(format!("non-finite rotation {:?}", rotation));
-            }
-            rotation
-        }
-        _ => Quat::IDENTITY,
-    };
-
-    if let SolidBody::Moving { end, .. } = spec.body
+    if let SolidBody::Moving { end, .. } = &spec.body
         && !end.is_finite()
     {
         return Err(format!("non-finite mover end {:?}", end));
     }
 
-    let needs_collider = !matches!(spec.body, SolidBody::Decoration);
+    let needs_collider = !matches!(&spec.body, SolidBody::Decoration);
     if !needs_collider {
         return Ok(());
     }
 
-    let aabb = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match spec.body {
-        SolidBody::StaticSurfWedge { wall_side, .. } => {
-            Collider::convex_hull(surf_wedge_points(spec.size, wall_side))
+    let aabb = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &spec.body {
+        SolidBody::StaticSurfWedge { local_points, .. } => {
+            Collider::convex_hull(local_points.clone())
                 .unwrap()
-                .aabb(spec.center, rotation)
+                .aabb(spec.center, Quat::IDENTITY)
         }
-        _ => Collider::cuboid(spec.size.x, spec.size.y, spec.size.z).aabb(spec.center, rotation),
+        _ => Collider::cuboid(spec.size.x, spec.size.y, spec.size.z)
+            .aabb(spec.center, Quat::IDENTITY),
     }))
     .map_err(|_| "collider AABB construction panicked".to_string())?;
 
@@ -3345,25 +3334,27 @@ fn build_segment_layout(
             );
         }
         ModuleKind::MantleStack => {
-            let ledges = [(0.28, 1.6_f32), (0.54, 3.3), (0.82, 5.0)];
-            for (index, (t, local_rise)) in ledges.into_iter().enumerate() {
-                let mut top = start.lerp(end, t);
-                top.y = (from.top.y + local_rise).min(to.top.y - 0.35);
-                top += right * ((index as f32 - 1.0) * 1.1);
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Mantle Ledge".into(),
-                    center: top_to_center(top, 1.0 + index as f32 * 0.28),
-                    size: axis_box_size(along_x, 3.3, 1.0 + index as f32 * 0.28, 3.6),
-                    paint: PaintStyle::ThemeAccent(to.theme),
-                    body: SolidBody::Static,
-                    friction: None,
-                    extra: ExtraKind::None,
-                });
-            }
+            append_descending_pad_sequence(
+                &mut layout,
+                owner,
+                &mut rng,
+                start,
+                end,
+                forward,
+                right,
+                PaintStyle::ThemeAccent(to.theme),
+                |_| SolidBody::Static,
+                None,
+                "Mantle Ledge",
+                8.8,
+                4.6,
+                0.92,
+                3.4,
+                1.35,
+            );
 
-            let wall_height = rise + 4.8;
-            let wall_mid = start.lerp(end, 0.68) + right * 2.4;
+            let wall_height = (from.top.y - to.top.y).abs() + 6.8;
+            let wall_mid = start.lerp(end, 0.62) + right * 2.8;
             layout.solids.push(SolidSpec {
                 owner,
                 label: "Mantle Wall".into(),
@@ -3381,9 +3372,9 @@ fn build_segment_layout(
         }
         ModuleKind::WallRunHall => {
             let shaft_center = start.lerp(end, 0.5);
-            let shaft_floor_top = Vec3::new(shaft_center.x, from.top.y + 0.35, shaft_center.z);
-            let shaft_height = (to.top.y - shaft_floor_top.y + 1.2).max(5.2);
-            let wall_length = 4.8;
+            let shaft_floor_top = Vec3::new(shaft_center.x, start.y - 0.55, shaft_center.z);
+            let shaft_height = (from.top.y - to.top.y).abs() + 7.2;
+            let wall_length = (end - start).xz().length().max(14.0);
             let wall_thickness = 0.72;
             let gap_half = 1.08;
 
@@ -3391,7 +3382,7 @@ fn build_segment_layout(
                 owner,
                 label: "Shaft Entry".into(),
                 center: top_to_center(start.lerp(end, 0.24) + Vec3::Y * 0.24, 0.5),
-                size: axis_box_size(along_x, 3.0, 0.5, 3.2),
+                size: axis_box_size(along_x, 5.2, 0.5, 3.4),
                 paint: PaintStyle::ThemeAccent(to.theme),
                 body: SolidBody::Static,
                 friction: None,
@@ -3429,25 +3420,30 @@ fn build_segment_layout(
                 owner,
                 label: "Shaft Exit".into(),
                 center: top_to_center(end + Vec3::Y * 0.22, 0.48),
-                size: axis_box_size(along_x, 3.4, 0.48, 3.4),
+                size: axis_box_size(along_x, 5.0, 0.48, 3.4),
                 paint: PaintStyle::ThemeFloor(to.theme),
                 body: SolidBody::Static,
                 friction: None,
                 extra: ExtraKind::None,
             });
-            layout.solids.push(SolidSpec {
+            append_descending_pad_sequence(
+                &mut layout,
                 owner,
-                label: "Exit Ramp".into(),
-                center: top_to_center(
-                    shaft_center.lerp(end, 0.6) + Vec3::Y * (rise * 0.72 - 0.1),
-                    0.4,
-                ),
-                size: axis_box_size(along_x, 2.8, 0.4, 2.6),
-                paint: PaintStyle::ThemeAccent(to.theme),
-                body: SolidBody::Static,
-                friction: None,
-                extra: ExtraKind::None,
-            });
+                &mut rng,
+                start.lerp(end, 0.12),
+                end.lerp(start, 0.12),
+                forward,
+                right,
+                PaintStyle::ThemeFloor(to.theme),
+                |_| SolidBody::Static,
+                None,
+                "Shaft Floor Pad",
+                10.0,
+                3.8,
+                0.42,
+                gap_half * 1.55,
+                0.28,
+            );
         }
         ModuleKind::LiftChasm => {
             let mover_size = Vec3::new(3.2, 0.72, 3.2);
@@ -3487,98 +3483,73 @@ fn build_segment_layout(
             }
         }
         ModuleKind::CrumbleBridge => {
-            let pieces = 5;
-            for step in 0..pieces {
-                let t = (step + 1) as f32 / (pieces + 1) as f32;
-                let mut top = start.lerp(end, t);
-                top.y = from.top.y + rise * t - 0.12;
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Crumble Span".into(),
-                    center: top_to_center(top, 0.55),
-                    size: axis_box_size(along_x, 2.1, 0.55, 2.2),
-                    paint: PaintStyle::Hazard,
-                    body: SolidBody::Crumbling {
-                        delay: lerp(0.9, 0.45, segment.difficulty),
-                        sink_speed: lerp(2.8, 5.0, segment.difficulty),
-                    },
-                    friction: None,
-                    extra: ExtraKind::None,
-                });
-            }
-        }
-        ModuleKind::PistonGate => {
-            for perch in [0.2, 0.45, 0.72] {
-                let mut top = start.lerp(end, perch);
-                top.y = from.top.y + rise * perch - 0.15;
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Piston Perch".into(),
-                    center: top_to_center(top, 0.7),
-                    size: axis_box_size(along_x, 2.4, 0.7, 2.8),
-                    paint: PaintStyle::ThemeFloor(to.theme),
-                    body: SolidBody::Static,
-                    friction: None,
-                    extra: ExtraKind::None,
-                });
-            }
-            for side in [-1.0, 1.0] {
-                let center =
-                    start.lerp(end, 0.55) + right * side * 3.6 + Vec3::Y * (rise * 0.55 + 1.3);
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Piston Wall".into(),
-                    center,
-                    size: axis_box_size(along_x, 1.3, 2.8, 2.2),
-                    paint: PaintStyle::Hazard,
-                    body: SolidBody::Moving {
-                        end: center - right * side * 3.2,
-                        speed: lerp(2.0, 3.8, segment.difficulty),
-                        lethal: false,
-                    },
-                    friction: None,
-                    extra: ExtraKind::None,
-                });
-            }
+            let delay = lerp(0.9, 0.45, segment.difficulty);
+            let sink_speed = lerp(2.8, 5.0, segment.difficulty);
+            append_descending_pad_sequence(
+                &mut layout,
+                owner,
+                &mut rng,
+                start,
+                end,
+                forward,
+                right,
+                PaintStyle::Hazard,
+                |_| SolidBody::Crumbling { delay, sink_speed },
+                None,
+                "Crumble Span",
+                8.0,
+                4.4,
+                0.55,
+                2.3,
+                0.95,
+            );
         }
         ModuleKind::WindTunnel => {
-            for perch in [0.18, 0.5, 0.84] {
-                let mut top = start.lerp(end, perch);
-                top.y = from.top.y + rise * perch - 0.18;
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Wind Perch".into(),
-                    center: top_to_center(top, 0.58),
-                    size: axis_box_size(along_x, 2.3, 0.58, 1.8),
-                    paint: PaintStyle::ThemeFloor(to.theme),
-                    body: SolidBody::Static,
-                    friction: None,
-                    extra: ExtraKind::None,
-                });
-            }
+            append_descending_pad_sequence(
+                &mut layout,
+                owner,
+                &mut rng,
+                start,
+                end,
+                forward,
+                right,
+                PaintStyle::ThemeFloor(to.theme),
+                |_| SolidBody::Static,
+                None,
+                "Wind Perch",
+                8.8,
+                4.2,
+                0.58,
+                1.95,
+                1.15,
+            );
             layout.features.push(FeatureSpec::WindZone {
                 center: start.lerp(end, 0.52) + Vec3::Y * (rise * 0.55 + 1.5),
-                size: axis_box_size(along_x, (end - start).xz().length() + 2.0, 3.6, 7.0),
+                size: axis_box_size(along_x, (end - start).xz().length() + 6.0, 3.8, 7.4),
                 direction: right * if rng.chance(0.5) { 1.0 } else { -1.0 } + Vec3::Y * 0.1,
                 strength: lerp(6.0, 11.0, segment.difficulty),
                 gust: lerp(1.2, 2.8, segment.difficulty),
             });
         }
         ModuleKind::IceSpine => {
-            for span in [0.2, 0.5, 0.8] {
-                let mut top = start.lerp(end, span);
-                top.y = from.top.y + rise * span - 0.15;
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Ice Spine".into(),
-                    center: top_to_center(top, 0.58),
-                    size: axis_box_size(along_x, 3.0, 0.58, 1.7),
-                    paint: PaintStyle::Ice,
-                    body: SolidBody::Static,
-                    friction: Some(0.02),
-                    extra: ExtraKind::None,
-                });
-            }
+            append_descending_pad_sequence(
+                &mut layout,
+                owner,
+                &mut rng,
+                start,
+                end,
+                forward,
+                right,
+                PaintStyle::Ice,
+                |_| SolidBody::Static,
+                Some(0.02),
+                "Ice Spine",
+                7.6,
+                4.6,
+                0.58,
+                1.85,
+                0.88,
+            );
         }
         ModuleKind::WaterGarden => {
             let basin_top = from.top.y.min(to.top.y) - 2.3;
@@ -3619,39 +3590,6 @@ fn build_segment_layout(
                     size: Vec3::new(2.4, top.y - basin_top, 2.4),
                     paint: PaintStyle::ThemeFloor(to.theme),
                     body: SolidBody::Static,
-                    friction: None,
-                    extra: ExtraKind::None,
-                });
-            }
-        }
-        ModuleKind::TimedDoor => {
-            for perch in [0.2, 0.55, 0.84] {
-                let mut top = start.lerp(end, perch);
-                top.y = from.top.y + rise * perch - 0.15;
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Door Perch".into(),
-                    center: top_to_center(top, 0.7),
-                    size: axis_box_size(along_x, 2.6, 0.7, 2.9),
-                    paint: PaintStyle::ThemeFloor(to.theme),
-                    body: SolidBody::Static,
-                    friction: None,
-                    extra: ExtraKind::None,
-                });
-            }
-            for offset in [0.34, 0.68] {
-                let center = start.lerp(end, offset) + Vec3::Y * (rise * offset + 1.4);
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Timed Door".into(),
-                    center,
-                    size: axis_box_size(along_x, 1.2, 3.0, 4.2),
-                    paint: PaintStyle::Hazard,
-                    body: SolidBody::Moving {
-                        end: center + Vec3::Y * 3.5,
-                        speed: lerp(1.6, 3.1, segment.difficulty),
-                        lethal: false,
-                    },
                     friction: None,
                     extra: ExtraKind::None,
                 });
@@ -3713,9 +3651,9 @@ fn append_css_surf_sequence(
     let surf_end = end - forward * exit_margin + Vec3::Y * 0.18;
     let total_distance = surf_start.distance(surf_end).max(12.0);
     let segment_count = if intense {
-        ((total_distance / 11.0).round() as usize).clamp(24, 56)
+        ((total_distance / 7.5).round() as usize).clamp(34, 96)
     } else {
-        ((total_distance / 12.0).round() as usize).clamp(18, 42)
+        ((total_distance / 8.2).round() as usize).clamp(28, 72)
     };
     let curve_cycles = if intense {
         rng.range_f32(0.7, 1.2)
@@ -3756,7 +3694,7 @@ fn append_css_surf_sequence(
         centerline.push(surf_start.lerp(surf_end, t) + offset + lift);
     }
 
-    let mut tangents = Vec::with_capacity(segment_count + 1);
+    let mut seam_rights = Vec::with_capacity(segment_count + 1);
     for index in 0..=segment_count {
         let prev = if index == 0 {
             centerline[1] - centerline[0]
@@ -3769,11 +3707,18 @@ fn append_css_surf_sequence(
             centerline[index + 1] - centerline[index]
         };
         let tangent = direction_from_delta(prev + next);
-        tangents.push(if tangent == Vec3::ZERO {
+        let tangent = if tangent == Vec3::ZERO {
             forward
         } else {
             tangent
-        });
+        };
+        let mut seam_right = Vec3::new(-tangent.z, 0.0, tangent.x).normalize_or_zero();
+        if seam_right == Vec3::ZERO {
+            seam_right = right;
+        } else if seam_right.dot(right) < 0.0 {
+            seam_right = -seam_right;
+        }
+        seam_rights.push(seam_right);
     }
 
     layout.solids.push(SolidSpec {
@@ -3795,21 +3740,19 @@ fn append_css_surf_sequence(
         let section_start = centerline[index];
         let section_end = centerline[index + 1];
         let section_delta = section_end - section_start;
-        let tangent = direction_from_delta(tangents[index] + tangents[index + 1]);
-        let local_forward = if tangent == Vec3::ZERO {
-            direction_from_delta(section_delta)
-        } else {
-            tangent
-        };
-        if local_forward == Vec3::ZERO {
+        let section_forward = direction_from_delta(section_delta);
+        if section_forward == Vec3::ZERO {
             continue;
         }
-        let ridge = section_start.lerp(section_end, 0.5);
-        let ramp_length = (section_delta.length() * 0.995).max(if intense { 10.0 } else { 8.4 });
-        let size = Vec3::new(ramp_length, ramp_drop, ramp_span);
-        let rotation = surf_ramp_rotation(local_forward);
-
         for side in [-1.0_f32, 1.0] {
+            let (center, local_points, bounds) = surf_wedge_from_seams(
+                section_start,
+                section_end,
+                seam_rights[index] * side,
+                seam_rights[index + 1] * side,
+                ramp_span,
+                ramp_drop,
+            );
             layout.solids.push(SolidSpec {
                 owner,
                 label: if intense {
@@ -3817,16 +3760,16 @@ fn append_css_surf_sequence(
                 } else {
                     format!("Flow Wedge {} {}", index, side)
                 },
-                center: surf_wedge_lip_to_center(ridge, size, rotation, side),
-                size,
+                center,
+                size: bounds,
                 paint: if side < 0.0 {
                     PaintStyle::ThemeAccent(theme)
                 } else {
                     PaintStyle::ThemeFloor(theme)
                 },
                 body: SolidBody::StaticSurfWedge {
-                    rotation,
                     wall_side: side,
+                    local_points,
                 },
                 friction: Some(if intense { 0.018 } else { 0.024 }),
                 extra: ExtraKind::None,
@@ -3848,6 +3791,49 @@ fn append_css_surf_sequence(
         friction: Some(0.032),
         extra: ExtraKind::None,
     });
+}
+
+fn append_descending_pad_sequence(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    rng: &mut RunRng,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    paint: PaintStyle,
+    body: impl Fn(f32) -> SolidBody,
+    friction: Option<f32>,
+    label_prefix: &str,
+    cadence: f32,
+    pad_length: f32,
+    pad_height: f32,
+    pad_width: f32,
+    lateral_amplitude: f32,
+) {
+    let along_x = forward.x.abs() > 0.5;
+    let distance = start.distance(end).max(12.0);
+    let pad_count = ((distance / cadence).round() as usize).clamp(6, 28);
+    let weave_cycles = rng.range_f32(0.8, 1.8);
+    let phase = rng.range_f32(0.0, TAU);
+
+    for step in 0..pad_count {
+        let t = (step + 1) as f32 / (pad_count + 1) as f32;
+        let envelope = (t * PI).sin().max(0.0).powf(0.75);
+        let weave = (t * weave_cycles * TAU + phase).sin();
+        let mut top = start.lerp(end, t) + right * weave * lateral_amplitude * envelope;
+        top.y += pad_height * 0.45;
+        layout.solids.push(SolidSpec {
+            owner,
+            label: format!("{label_prefix} {step}"),
+            center: top_to_center(top, pad_height),
+            size: axis_box_size(along_x, pad_length, pad_height, pad_width),
+            paint,
+            body: body(t),
+            friction,
+            extra: ExtraKind::None,
+        });
+    }
 }
 
 fn build_branch_layout(
@@ -4202,12 +4188,15 @@ fn paint_stripe_color(paint: PaintStyle) -> Color {
 
 fn spawn_surf_lane_stripes(
     entity: &mut EntityCommands,
-    size: Vec3,
-    wall_side: f32,
+    local_points: &[Vec3],
+    _wall_side: f32,
     paint: PaintStyle,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) {
+    if local_points.len() < 4 {
+        return;
+    }
     let stripe_color = paint_stripe_color(paint);
     let stripe_material = materials.add(StandardMaterial {
         base_color: stripe_color.with_alpha(0.72),
@@ -4225,34 +4214,55 @@ fn spawn_surf_lane_stripes(
         cull_mode: None,
         ..default()
     });
-    let surface_normal = Vec3::new(0.0, size.z, wall_side * size.y).normalize_or_zero();
-    let pitch = f32::atan2(wall_side * size.y, size.z);
-    let ridge_z = wall_side * SURF_RIDGE_HALF_WIDTH;
-    let stripe_length = (size.x - 0.28).max(1.0);
-    let stripe_mesh = meshes.add(Cuboid::new(stripe_length, 0.03, 0.16));
-    let glow_mesh = meshes.add(Cuboid::new(stripe_length * 0.98, 0.06, 0.3));
+    let front_ridge = local_points[0];
+    let back_ridge = local_points[1];
+    let front_outer = local_points[2];
+    let back_outer = local_points[3];
+    let mut surface_normal = (back_ridge - front_ridge)
+        .cross(front_outer - front_ridge)
+        .normalize_or_zero();
+    if surface_normal.y < 0.0 {
+        surface_normal = -surface_normal;
+    }
 
     entity.with_children(|parent| {
-        for &(t, width_scale, lift) in &[(0.18, 1.0, 0.024), (0.64, 0.72, 0.02)] {
-            let stripe_center = Vec3::new(0.0, -size.y * t, ridge_z + wall_side * size.z * t)
-                + surface_normal * lift;
-            let rotation = Quat::from_rotation_x(pitch);
+        for &(t, stripe_width, glow_width, lift) in
+            &[(0.18, 0.16, 0.3, 0.022), (0.64, 0.11, 0.22, 0.018)]
+        {
+            let front_center = front_ridge.lerp(front_outer, t);
+            let back_center = back_ridge.lerp(back_outer, t);
+            let front_face_dir = (front_outer - front_ridge).normalize_or_zero();
+            let back_face_dir = (back_outer - back_ridge).normalize_or_zero();
+            let glow_quad = [
+                front_center - front_face_dir * (glow_width * 0.5) + surface_normal * lift,
+                back_center - back_face_dir * (glow_width * 0.5) + surface_normal * lift,
+                back_center + back_face_dir * (glow_width * 0.5) + surface_normal * lift,
+                front_center + front_face_dir * (glow_width * 0.5) + surface_normal * lift,
+            ];
+            let stripe_quad = [
+                front_center - front_face_dir * (stripe_width * 0.5)
+                    + surface_normal * (lift + 0.012),
+                back_center - back_face_dir * (stripe_width * 0.5)
+                    + surface_normal * (lift + 0.012),
+                back_center
+                    + back_face_dir * (stripe_width * 0.5)
+                    + surface_normal * (lift + 0.012),
+                front_center
+                    + front_face_dir * (stripe_width * 0.5)
+                    + surface_normal * (lift + 0.012),
+            ];
 
             parent.spawn((
                 Name::new("Surf Glow Stripe"),
-                Mesh3d(glow_mesh.clone()),
+                Mesh3d(meshes.add(build_quad_mesh(glow_quad))),
                 MeshMaterial3d(glow_material.clone()),
-                Transform::from_translation(stripe_center)
-                    .with_rotation(rotation)
-                    .with_scale(Vec3::new(1.0, 1.0, width_scale)),
+                Transform::default(),
             ));
             parent.spawn((
                 Name::new("Surf Neon Stripe"),
-                Mesh3d(stripe_mesh.clone()),
+                Mesh3d(meshes.add(build_quad_mesh(stripe_quad))),
                 MeshMaterial3d(stripe_material.clone()),
-                Transform::from_translation(stripe_center + surface_normal * 0.014)
-                    .with_rotation(rotation)
-                    .with_scale(Vec3::new(1.0, 1.0, width_scale)),
+                Transform::default(),
             ));
         }
     });
@@ -4401,6 +4411,57 @@ mod tests {
     }
 
     #[test]
+    fn surf_segments_share_seam_edges() {
+        let mut layout = ModuleLayout::default();
+        let mut rng = RunRng::new(0x5eed_cafe_u64);
+        append_css_surf_sequence(
+            &mut layout,
+            OwnerTag::Segment(0),
+            &mut rng,
+            Vec3::new(0.0, 40.0, 0.0),
+            Vec3::new(120.0, 18.0, 26.0),
+            Vec3::X,
+            Vec3::Z,
+            Theme::Frost,
+            true,
+        );
+
+        let wedges = layout
+            .solids
+            .iter()
+            .filter_map(|solid| match &solid.body {
+                SolidBody::StaticSurfWedge {
+                    wall_side,
+                    local_points,
+                } if *wall_side > 0.0 => Some((solid.center, local_points)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for pair in wedges.windows(2) {
+            let (a_center, a_points) = &pair[0];
+            let (b_center, b_points) = &pair[1];
+            let a_back_ridge = *a_center + a_points[1];
+            let a_back_outer = *a_center + a_points[3];
+            let b_front_ridge = *b_center + b_points[0];
+            let b_front_outer = *b_center + b_points[2];
+
+            assert!(
+                a_back_ridge.distance(b_front_ridge) < 0.001,
+                "ridge seam mismatch: {:?} vs {:?}",
+                a_back_ridge,
+                b_front_ridge
+            );
+            assert!(
+                a_back_outer.distance(b_front_outer) < 0.001,
+                "outer seam mismatch: {:?} vs {:?}",
+                a_back_outer,
+                b_front_outer
+            );
+        }
+    }
+
+    #[test]
     fn surf_ramp_rotation_matches_shared_ridge_surf() {
         for &forward in &[Vec3::X, Vec3::Z] {
             for side in [-1.0_f32, 1.0] {
@@ -4451,41 +4512,49 @@ fn top_to_center(top: Vec3, height: f32) -> Vec3 {
     Vec3::new(top.x, top.y - height * 0.5, top.z)
 }
 
-fn surf_wedge_lip_to_center(lip: Vec3, _size: Vec3, _rotation: Quat, _wall_side: f32) -> Vec3 {
-    lip
-}
-
 #[cfg(test)]
 fn surf_wedge_surface_normal(size: Vec3, wall_side: f32) -> Vec3 {
     Vec3::new(0.0, size.z, wall_side * size.y).normalize_or_zero()
 }
 
-fn surf_wedge_points(size: Vec3, wall_side: f32) -> Vec<Vec3> {
-    let half_length = size.x * 0.5;
-    let outer_z = wall_side * (SURF_RIDGE_HALF_WIDTH + size.z);
-    let ridge_z = wall_side * SURF_RIDGE_HALF_WIDTH;
-    let rise = size.y;
-    let inset = Vec3::new(0.0, -SURF_WEDGE_THICKNESS, 0.0);
-
-    let front_ridge = Vec3::new(-half_length, 0.0, ridge_z);
-    let back_ridge = Vec3::new(half_length, 0.0, ridge_z);
-    let front_outer = Vec3::new(-half_length, -rise, outer_z);
-    let back_outer = Vec3::new(half_length, -rise, outer_z);
-
-    vec![
-        front_ridge,
-        back_ridge,
-        front_outer,
-        back_outer,
-        front_ridge + inset,
-        back_ridge + inset,
-        front_outer + inset,
-        back_outer + inset,
-    ]
+fn surf_wedge_from_seams(
+    start_ridge: Vec3,
+    end_ridge: Vec3,
+    start_outward: Vec3,
+    end_outward: Vec3,
+    ramp_span: f32,
+    ramp_drop: f32,
+) -> (Vec3, Vec<Vec3>, Vec3) {
+    let start_outer =
+        start_ridge + start_outward.normalize_or_zero() * ramp_span - Vec3::Y * ramp_drop;
+    let end_outer = end_ridge + end_outward.normalize_or_zero() * ramp_span - Vec3::Y * ramp_drop;
+    let world_points = [
+        start_ridge,
+        end_ridge,
+        start_outer,
+        end_outer,
+        start_ridge - Vec3::Y * SURF_WEDGE_THICKNESS,
+        end_ridge - Vec3::Y * SURF_WEDGE_THICKNESS,
+        start_outer - Vec3::Y * SURF_WEDGE_THICKNESS,
+        end_outer - Vec3::Y * SURF_WEDGE_THICKNESS,
+    ];
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let mut center = Vec3::ZERO;
+    for point in world_points {
+        min = min.min(point);
+        max = max.max(point);
+        center += point;
+    }
+    center /= world_points.len() as f32;
+    let local_points = world_points
+        .into_iter()
+        .map(|point| point - center)
+        .collect::<Vec<_>>();
+    (center, local_points, max - min)
 }
 
-fn build_surf_wedge_mesh(size: Vec3, wall_side: f32) -> Mesh {
-    let points = surf_wedge_points(size, wall_side);
+fn build_prism_mesh(points: &[Vec3]) -> Mesh {
     let a = points[0];
     let b = points[1];
     let c = points[2];
@@ -4524,6 +4593,35 @@ fn build_surf_wedge_mesh(size: Vec3, wall_side: f32) -> Mesh {
     .with_computed_flat_normals()
 }
 
+fn build_surf_wedge_mesh(points: &[Vec3]) -> Mesh {
+    build_prism_mesh(points)
+}
+
+fn build_quad_mesh(points: [Vec3; 4]) -> Mesh {
+    let positions = vec![
+        [points[0].x, points[0].y, points[0].z],
+        [points[1].x, points[1].y, points[1].z],
+        [points[2].x, points[2].y, points[2].z],
+        [points[0].x, points[0].y, points[0].z],
+        [points[2].x, points[2].y, points[2].z],
+        [points[3].x, points[3].y, points[3].z],
+        [points[0].x, points[0].y, points[0].z],
+        [points[2].x, points[2].y, points[2].z],
+        [points[1].x, points[1].y, points[1].z],
+        [points[0].x, points[0].y, points[0].z],
+        [points[3].x, points[3].y, points[3].z],
+        [points[2].x, points[2].y, points[2].z],
+    ];
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_computed_flat_normals()
+}
+
+#[cfg(test)]
 fn surf_ramp_rotation(forward: Vec3) -> Quat {
     let forward = forward.normalize_or_zero();
     let right = Vec3::new(-forward.z, 0.0, forward.x);
