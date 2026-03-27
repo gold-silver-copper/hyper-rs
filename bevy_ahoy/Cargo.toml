@@ -9,7 +9,11 @@ readme = "readme.md"
 repository = "https://github.com/janhohenheim/bevy_ahoy"
 keywords = ["kcc", "character", "controller", "source", "quake"]
 categories = ["game-development"]
-include = ["/src", "/license*", "/examples"]
+include = ["/src", "/license*", "/examples", "/basic_game"]
+
+[workspace]
+members = ["basic_game"]
+resolver = "3"
 
 [features]
 default = ["pickup"]

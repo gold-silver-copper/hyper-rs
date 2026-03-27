@@ -1,0 +1,20 @@
+[package]
+name = "basic_game"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bevy_ahoy = { path = ".." }
+avian3d = "0.6.0-rc.1"
+bevy = { version = "0.18", features = ["track_location", "dynamic_linking", "file_watcher"] }
+bevy_ecs = { version = "0.18", default-features = false }
+bevy_enhanced_input = { version = "0.24", default-features = false }
+bevy_fix_cursor_unlock_web = "0.3.0"
+bevy_framepace = { version = "0.21.0", git = "https://github.com/aevyrie/bevy_framepace" }
+bevy_mod_mipmap_generator = { version = "0.1.0", git = "https://github.com/DGriffin91/bevy_mod_mipmap_generator" }
+bevy_time = { version = "0.18", default-features = false }
+wasm-bindgen = "=0.2.108"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }

@@ -408,6 +408,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "basic_game"
+version = "0.1.0"
+dependencies = [
+ "avian3d",
+ "bevy",
+ "bevy_ahoy",
+ "bevy_ecs",
+ "bevy_enhanced_input",
+ "bevy_fix_cursor_unlock_web",
+ "bevy_framepace",
+ "bevy_mod_mipmap_generator",
+ "bevy_time",
+ "getrandom",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "bevy"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
