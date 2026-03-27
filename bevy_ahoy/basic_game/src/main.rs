@@ -16,6 +16,7 @@ use bevy::{
     math::primitives::{
         Capsule3d, Cone, ConicalFrustum, Cuboid, Cylinder, Sphere, Tetrahedron, Torus,
     },
+    mesh::Indices,
     post_process::bloom::Bloom,
     prelude::*,
     render::render_resource::PrimitiveTopology,
@@ -42,6 +43,15 @@ const PLAYER_SPAWN_CLEARANCE: f32 = 2.4;
 const WALL_RUN_SPEED: f32 = 11.5;
 const WALL_RUN_STICK_SPEED: f32 = 2.0;
 const SURF_WEDGE_THICKNESS: f32 = 0.16;
+const SURF_COLLIDER_OVERLAP_MIN: f32 = 0.14;
+const SURF_COLLIDER_OVERLAP_MAX: f32 = 0.42;
+const SURF_TRIMESH_MARGIN: f32 = 0.015;
+const SURF_MAX_SEAM_TURN_RADIANS: f32 = 2.25_f32.to_radians();
+const SURF_MAX_SEGMENT_LENGTH: f32 = 3.8;
+const SURF_MAX_RENDER_SEGMENTS: usize = 224;
+const SURF_COLLIDER_SAMPLE_LENGTH: f32 = 0.85;
+const SURF_MAX_COLLIDER_SEGMENTS: usize = 640;
+const SURF_COLLIDER_COLUMNS: usize = 5;
 const WALL_RUN_FALL_SPEED: f32 = 2.25;
 const WALL_RUN_MIN_SPEED: f32 = 4.0;
 const WALL_RUN_DURATION: f32 = 0.95;
@@ -61,6 +71,7 @@ const CLOUD_PUFF_COUNT: usize = 18;
 const STREAM_BEHIND_ROOMS: usize = 2;
 const STREAM_AHEAD_ROOMS: usize = 12;
 const PHYSICS_SUBSTEPS: u32 = 12;
+const PLAYER_GRAVITY: f32 = 29.0;
 const PLAYER_STEP_SIZE: f32 = 1.0;
 const PLAYER_GROUND_DISTANCE: f32 = 0.05;
 const PLAYER_STEP_DOWN_DETECTION_DISTANCE: f32 = 0.2;
@@ -127,9 +138,6 @@ fn main() -> AppExit {
                 tick_run_timer,
                 queue_run_controls,
                 activate_checkpoints,
-                collect_treasures,
-                activate_shortcuts,
-                sync_shortcut_bridges,
                 detect_summit_completion,
                 detect_failures,
                 animate_sky_decor,
@@ -252,6 +260,7 @@ fn setup_scene(
                 air_acceleration_hz: 1000.0,
                 jump_height: 1.9,
                 max_speed: 3000.0,
+                gravity: PLAYER_GRAVITY,
                 step_size: PLAYER_STEP_SIZE,
                 mantle_height: 3.4,
                 crane_height: 4.1,
@@ -382,7 +391,6 @@ fn update_hud(
          Altitude: {height:.1}m -> {finish:.1}m | Descent {descended:.1}m / {total_descent:.1}m ({progress:.0}%)\n\
          Speed: {speed:.1} u/s\n\
          Time: {elapsed:.1}s | Deaths: {deaths}\n\
-         Treasures: {treasures}/{treasure_total} | Shortcuts: {shortcuts}\n\
          Gen: attempts {attempts}, repairs {repairs}, overlaps {overlaps}, clearance {clearance}, reach {reach}",
         seed = run.seed,
         floors = run.floors,
@@ -396,9 +404,6 @@ fn update_hud(
         speed = speed,
         elapsed = elapsed,
         deaths = run.deaths,
-        treasures = run.collected_treasures.len(),
-        treasure_total = run.total_treasures,
-        shortcuts = run.unlocked_shortcuts.len(),
         attempts = run.stats.attempts,
         repairs = run.stats.repairs,
         overlaps = run.stats.overlap_issues,
@@ -1692,7 +1697,13 @@ enum SolidBody {
     StaticSurfWedge {
         #[cfg_attr(not(test), allow(dead_code))]
         wall_side: f32,
-        local_points: Vec<Vec3>,
+        render_points: Vec<Vec3>,
+    },
+    StaticSurfStrip {
+        #[cfg_attr(not(test), allow(dead_code))]
+        wall_side: f32,
+        collider_strip_points: Vec<Vec3>,
+        columns: usize,
     },
     Decoration,
     DynamicProp,
@@ -1952,12 +1963,6 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
             checkpoint_slot: Some(index),
         });
 
-        let shortcut_id = if template.shortcut_eligible && difficulty > 0.45 && rng.chance(0.45) {
-            Some(seed ^ (index as u64 + 1).wrapping_mul(0xA5A5_5A5A_1234_5678))
-        } else {
-            None
-        };
-
         segments.push(SegmentPlan {
             index: index - 1,
             from: index - 1,
@@ -1965,7 +1970,7 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
             kind: template.kind,
             difficulty,
             seed: rng.next_u64(),
-            shortcut_id,
+            shortcut_id: None,
             exit_socket: template.exit,
         });
         current_socket = template.exit;
@@ -2139,26 +2144,8 @@ fn generate_side_branches(
                 continue;
             }
 
-            let incoming = segments.get(room.index.saturating_sub(1));
-            let linked_shortcut = incoming.and_then(|segment| segment.shortcut_id);
-            let kind = if let Some(shortcut_id) = linked_shortcut {
-                if !branches
-                    .iter()
-                    .any(|branch: &BranchPlan| branch.shortcut_id == Some(shortcut_id))
-                    && rng.chance(0.58)
-                {
-                    BranchKind::ShortcutLever
-                } else if difficulty > 0.55 && rng.chance(0.45) {
-                    BranchKind::RiskDetour
-                } else if rng.chance(0.5) {
-                    BranchKind::TreasureAlcove
-                } else {
-                    BranchKind::PropCache
-                }
-            } else if difficulty > 0.55 && rng.chance(0.45) {
+            let kind = if difficulty > 0.55 && rng.chance(0.45) {
                 BranchKind::RiskDetour
-            } else if rng.chance(0.55) {
-                BranchKind::TreasureAlcove
             } else {
                 BranchKind::PropCache
             };
@@ -2166,12 +2153,6 @@ fn generate_side_branches(
             let branch_top =
                 room.top + dir * (CELL_SIZE * 0.68) + Vec3::Y * rng.range_f32(0.2, 1.8);
             let size = Vec2::new(rng.range_f32(5.0, 6.8), rng.range_f32(5.0, 6.8));
-            let treasure_id = matches!(kind, BranchKind::TreasureAlcove | BranchKind::RiskDetour)
-                .then_some(seed ^ rng.next_u64());
-            let shortcut_id = matches!(kind, BranchKind::ShortcutLever).then_some(
-                linked_shortcut.unwrap_or_else(|| seed ^ ((room.index as u64 + 1) << 9)),
-            );
-
             occupied_branches.insert(branch_cell);
             branches.push(BranchPlan {
                 room_index: room.index,
@@ -2181,8 +2162,8 @@ fn generate_side_branches(
                 theme: room.theme,
                 kind,
                 seed: rng.next_u64(),
-                treasure_id,
-                shortcut_id,
+                treasure_id: None,
+                shortcut_id: None,
             });
             break;
         }
@@ -2280,9 +2261,27 @@ impl SolidSpec {
             SolidBody::Static | SolidBody::Crumbling { .. } | SolidBody::ShortcutBridge { .. } => {
                 self.size
             }
-            SolidBody::StaticSurfWedge { local_points, .. } => {
+            SolidBody::StaticSurfWedge { render_points, .. } => {
+                if render_points.is_empty() {
+                    return None;
+                }
                 let (min, max) =
-                    transformed_point_bounds(self.center, Quat::IDENTITY, local_points);
+                    transformed_point_bounds(self.center, Quat::IDENTITY, render_points);
+                return Some(AabbVolume {
+                    owner: self.owner,
+                    center: (min + max) * 0.5,
+                    size: max - min,
+                });
+            }
+            SolidBody::StaticSurfStrip {
+                collider_strip_points,
+                ..
+            } => {
+                if collider_strip_points.is_empty() {
+                    return None;
+                }
+                let (min, max) =
+                    transformed_point_bounds(self.center, Quat::IDENTITY, collider_strip_points);
                 return Some(AabbVolume {
                     owner: self.owner,
                     center: (min + max) * 0.5,
@@ -2648,11 +2647,7 @@ fn build_run_snapshot(
             .filter(|room| room.checkpoint_slot.is_some())
             .map(|room| room.top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0))
             .collect(),
-        total_treasures: blueprint
-            .branches
-            .iter()
-            .filter(|branch| branch.treasure_id.is_some())
-            .count(),
+        total_treasures: 0,
         active_chunks,
     }
 }
@@ -4155,6 +4150,8 @@ fn spawn_layout(
         if is_batchable_static_render(solid) {
             append_static_render_geometry(&mut render_batches, solid);
             spawn_box_collider_spec(solid, commands, chunk);
+        } else if is_collider_only_static(solid) {
+            spawn_box_collider_spec(solid, commands, chunk);
         } else {
             spawn_box_spec(
                 solid,
@@ -4254,6 +4251,10 @@ fn spawn_box_spec(
     materials: &mut Assets<StandardMaterial>,
     asset_cache: &mut WorldAssetCache,
 ) {
+    if matches!(&spec.body, SolidBody::StaticSurfStrip { .. }) {
+        return;
+    }
+
     if let Err(reason) = validate_solid_spec(spec) {
         eprintln!("Skipping invalid solid '{}': {}", spec.label, reason);
         return;
@@ -4266,8 +4267,8 @@ fn spawn_box_spec(
     }
 
     let mesh = match &spec.body {
-        SolidBody::StaticSurfWedge { local_points, .. } => meshes.add(build_surf_wedge_mesh(
-            local_points,
+        SolidBody::StaticSurfWedge { render_points, .. } => meshes.add(build_surf_wedge_mesh(
+            render_points,
             paint_base_color(
                 spec.paint,
                 matches!(&spec.body, SolidBody::ShortcutBridge { active: false, .. }),
@@ -4308,11 +4309,20 @@ fn spawn_box_spec(
                 CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
             ));
         }
-        SolidBody::StaticSurfWedge { local_points, .. } => {
-            if let Some(collider) = Collider::convex_hull(local_points.clone()) {
+        SolidBody::StaticSurfWedge { .. } => {}
+        SolidBody::StaticSurfStrip {
+            collider_strip_points,
+            ..
+        } => {
+            if let Some(mesh) =
+                build_surf_strip_collider_mesh(collider_strip_points, SURF_COLLIDER_COLUMNS)
+                && let Some(collider) =
+                    Collider::trimesh_from_mesh_with_config(&mesh, TrimeshFlags::FIX_INTERNAL_EDGES)
+            {
                 entity.insert((
                     RigidBody::Static,
                     collider,
+                    CollisionMargin(SURF_TRIMESH_MARGIN),
                     SurfRampSurface,
                     CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
                 ));
@@ -4481,6 +4491,10 @@ fn is_batchable_static_render(spec: &SolidSpec) -> bool {
         )
 }
 
+fn is_collider_only_static(spec: &SolidSpec) -> bool {
+    matches!(spec.extra, ExtraKind::None) && matches!(&spec.body, SolidBody::StaticSurfStrip { .. })
+}
+
 fn append_static_render_geometry(
     batches: &mut HashMap<GameMaterialKey, ColoredMeshBuilder>,
     spec: &SolidSpec,
@@ -4498,11 +4512,11 @@ fn append_static_render_geometry(
         SolidBody::Static => {
             append_box_render_geometry(builder, spec.center, spec.size, base_color)
         }
-        SolidBody::StaticSurfWedge { local_points, .. } => {
+        SolidBody::StaticSurfWedge { render_points, .. } if !render_points.is_empty() => {
             append_surf_wedge_render_geometry(
                 builder,
                 spec.center,
-                local_points,
+                render_points,
                 base_color,
                 paint_stripe_color(spec.paint),
             );
@@ -4790,6 +4804,18 @@ fn spawn_box_collider_spec(
     commands: &mut Commands,
     chunk: Option<WorldChunkKey>,
 ) {
+    let should_spawn = match &spec.body {
+        SolidBody::Static => true,
+        SolidBody::StaticSurfStrip {
+            collider_strip_points,
+            ..
+        } => !collider_strip_points.is_empty(),
+        _ => false,
+    };
+    if !should_spawn {
+        return;
+    }
+
     let mut entity = commands.spawn((
         GeneratedWorld,
         Name::new(spec.label.clone()),
@@ -4808,11 +4834,19 @@ fn spawn_box_collider_spec(
                 CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
             ));
         }
-        SolidBody::StaticSurfWedge { local_points, .. } => {
-            if let Some(collider) = Collider::convex_hull(local_points.clone()) {
+        SolidBody::StaticSurfStrip {
+            collider_strip_points,
+            ..
+        } => {
+            if let Some(mesh) =
+                build_surf_strip_collider_mesh(collider_strip_points, SURF_COLLIDER_COLUMNS)
+                && let Some(collider) =
+                    Collider::trimesh_from_mesh_with_config(&mesh, TrimeshFlags::FIX_INTERNAL_EDGES)
+            {
                 entity.insert((
                     RigidBody::Static,
                     collider,
+                    CollisionMargin(SURF_TRIMESH_MARGIN),
                     SurfRampSurface,
                     CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
                 ));
@@ -4856,17 +4890,17 @@ fn cached_game_material(
     if key.surf {
         material.cull_mode = None;
         material.perceptual_roughness = 0.04;
-        material.reflectance = 0.96;
+        material.reflectance = 0.72;
         material.clearcoat = 1.0;
         material.clearcoat_perceptual_roughness = 0.02;
         material.metallic = 0.0;
         material.specular_tint = paint_stripe_color(key.paint);
         material.emissive = LinearRgba::BLACK;
-        material.alpha_mode = AlphaMode::Blend;
-        material.specular_transmission = 0.82;
-        material.diffuse_transmission = 0.28;
-        material.thickness = 0.72;
-        material.ior = 1.18;
+        material.alpha_mode = AlphaMode::Opaque;
+        material.specular_transmission = 0.0;
+        material.diffuse_transmission = 0.0;
+        material.thickness = 0.0;
+        material.ior = 1.0;
     }
 
     let handle = materials.add(material);
@@ -4895,17 +4929,24 @@ fn validate_solid_spec(spec: &SolidSpec) -> Result<(), String> {
         return Err(format!("non-finite mover end {:?}", end));
     }
 
-    let needs_collider = !matches!(&spec.body, SolidBody::Decoration);
+    let needs_collider = !matches!(
+        &spec.body,
+        SolidBody::Decoration | SolidBody::StaticSurfWedge { .. }
+    );
     if !needs_collider {
         return Ok(());
     }
 
     let aabb = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &spec.body {
-        SolidBody::StaticSurfWedge { local_points, .. } => {
-            Collider::convex_hull(local_points.clone())
-                .unwrap()
-                .aabb(spec.center, Quat::IDENTITY)
-        }
+        SolidBody::StaticSurfStrip {
+            collider_strip_points,
+            ..
+        } => build_surf_strip_collider_mesh(collider_strip_points, SURF_COLLIDER_COLUMNS)
+            .and_then(|mesh| {
+                Collider::trimesh_from_mesh_with_config(&mesh, TrimeshFlags::FIX_INTERNAL_EDGES)
+            })
+            .unwrap()
+            .aabb(spec.center, Quat::IDENTITY),
         _ => Collider::cuboid(spec.size.x, spec.size.y, spec.size.z)
             .aabb(spec.center, Quat::IDENTITY),
     }))
@@ -5041,7 +5082,7 @@ fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
 fn build_segment_layout(
     segment: &SegmentPlan,
     rooms: &[RoomPlan],
-    unlocked_shortcuts: &HashSet<u64>,
+    _unlocked_shortcuts: &HashSet<u64>,
 ) -> ModuleLayout {
     let mut layout = ModuleLayout::default();
     let owner = OwnerTag::Segment(segment.index);
@@ -5347,24 +5388,6 @@ fn build_segment_layout(
         }
     }
 
-    if let Some(id) = segment.shortcut_id {
-        let mid = start.lerp(end, 0.5);
-        let bridge_top = Vec3::new(mid.x, from.top.y + rise * 0.45 + 0.55, mid.z);
-        layout.solids.push(SolidSpec {
-            owner,
-            label: "Shortcut Bridge".into(),
-            center: top_to_center(bridge_top, 0.5),
-            size: axis_box_size(along_x, (end - start).xz().length() - 1.6, 0.5, 2.6),
-            paint: PaintStyle::Shortcut,
-            body: SolidBody::ShortcutBridge {
-                id,
-                active: unlocked_shortcuts.contains(&id),
-            },
-            friction: None,
-            extra: ExtraKind::None,
-        });
-    }
-
     layout.clearances.push(ClearanceProbe {
         owner,
         center: start.lerp(end, 0.5) + Vec3::Y * (rise * 0.5 + 2.5),
@@ -5399,11 +5422,6 @@ fn append_css_surf_sequence(
     let surf_start = start + forward * entry_margin + Vec3::Y * 0.4;
     let surf_end = end - forward * exit_margin + Vec3::Y * 0.18;
     let total_distance = surf_start.distance(surf_end).max(12.0);
-    let segment_count = if intense {
-        ((total_distance / 7.5).round() as usize).clamp(34, 96)
-    } else {
-        ((total_distance / 8.2).round() as usize).clamp(28, 72)
-    };
     let curve_cycles = if intense {
         rng.range_f32(1.0, 1.6)
     } else {
@@ -5431,69 +5449,87 @@ fn append_css_surf_sequence(
         rng.range_f32(2.6, 4.2)
     };
 
-    let mut centerline = Vec::with_capacity(segment_count + 1);
-    for sample in 0..=segment_count {
-        let t = sample as f32 / segment_count as f32;
+    let centerline_point = |t: f32| {
         let envelope = (t * PI).sin().max(0.0).powf(0.85);
         let weave = (t * curve_cycles * TAU + curve_phase).sin();
         let offset = right * weave * curve_amplitude * envelope;
         let lift = Vec3::Y * ridge_lift * envelope;
-        centerline.push(surf_start.lerp(surf_end, t) + offset + lift);
+        surf_start.lerp(surf_end, t) + offset + lift
+    };
+    let base_segment_count = if intense {
+        ((total_distance / 4.6).ceil() as usize).clamp(44, 132)
+    } else {
+        ((total_distance / 5.2).ceil() as usize).clamp(36, 116)
+    };
+    let mut segment_count = base_segment_count;
+    let mut centerline = Vec::new();
+    let fallback_tangent = (surf_end - surf_start).normalize_or_zero();
+    let fallback_tangent = if fallback_tangent == Vec3::ZERO {
+        forward
+    } else {
+        fallback_tangent
+    };
+
+    loop {
+        centerline.clear();
+        centerline.reserve(segment_count + 1);
+        for sample in 0..=segment_count {
+            let t = sample as f32 / segment_count as f32;
+            centerline.push(centerline_point(t));
+        }
+        let seam_tangents = sample_curve_tangents(&centerline, fallback_tangent);
+
+        let mut max_segment_length: f32 = 0.0;
+        let mut max_turn: f32 = 0.0;
+        for index in 0..segment_count {
+            max_segment_length =
+                max_segment_length.max(centerline[index].distance(centerline[index + 1]));
+            max_turn = max_turn.max(seam_tangents[index].angle_between(seam_tangents[index + 1]));
+        }
+
+        if (max_segment_length <= SURF_MAX_SEGMENT_LENGTH && max_turn <= SURF_MAX_SEAM_TURN_RADIANS)
+            || segment_count >= SURF_MAX_RENDER_SEGMENTS
+        {
+            break;
+        }
+
+        let length_scale = (max_segment_length / SURF_MAX_SEGMENT_LENGTH).ceil() as usize;
+        let turn_scale = (max_turn / SURF_MAX_SEAM_TURN_RADIANS).ceil() as usize;
+        let scale = length_scale.max(turn_scale).clamp(2, 4);
+        segment_count = (segment_count * scale).min(SURF_MAX_RENDER_SEGMENTS);
     }
 
-    let mut seam_rights = Vec::with_capacity(segment_count + 1);
-    for index in 0..=segment_count {
-        let prev = if index == 0 {
-            centerline[1] - centerline[0]
-        } else {
-            centerline[index] - centerline[index - 1]
-        };
-        let next = if index == segment_count {
-            centerline[index] - centerline[index - 1]
-        } else {
-            centerline[index + 1] - centerline[index]
-        };
-        let tangent = direction_from_delta(prev + next);
-        let tangent = if tangent == Vec3::ZERO {
-            forward
-        } else {
-            tangent
-        };
-        let mut seam_right = Vec3::new(-tangent.z, 0.0, tangent.x).normalize_or_zero();
-        if seam_right == Vec3::ZERO {
-            seam_right = right;
-        } else if seam_right.dot(right) < 0.0 {
-            seam_right = -seam_right;
-        }
-        seam_rights.push(seam_right);
-    }
+    let seam_tangents = sample_curve_tangents(&centerline, fallback_tangent);
+    let outward_hint = if right == Vec3::ZERO {
+        perpendicular_to(seam_tangents[0], Vec3::X)
+    } else {
+        right.normalize_or_zero()
+    };
+    let seam_outwards = sample_curve_outwards(&seam_tangents, outward_hint);
 
     for index in 0..segment_count {
         let section_start = centerline[index];
         let section_end = centerline[index + 1];
-        let section_delta = section_end - section_start;
-        let section_forward = direction_from_delta(section_delta);
-        if section_forward == Vec3::ZERO {
-            continue;
-        }
         for side in [-1.0_f32, 1.0] {
-            let (center, local_points, bounds) = surf_wedge_from_seams(
+            let wedge = surf_wedge_from_seams(
                 section_start,
                 section_end,
-                seam_rights[index] * side,
-                seam_rights[index + 1] * side,
+                seam_tangents[index],
+                seam_tangents[index + 1],
+                seam_outwards[index] * side,
+                seam_outwards[index + 1] * side,
                 ramp_span,
                 ramp_drop,
             );
             layout.solids.push(SolidSpec {
                 owner,
                 label: if intense {
-                    format!("Surf Wedge {} {}", index, side)
+                    format!("Surf Wedge Render {} {}", index, side)
                 } else {
-                    format!("Flow Wedge {} {}", index, side)
+                    format!("Flow Wedge Render {} {}", index, side)
                 },
-                center,
-                size: bounds,
+                center: wedge.center,
+                size: wedge.bounds,
                 paint: if side < 0.0 {
                     PaintStyle::ThemeAccent(theme)
                 } else {
@@ -5501,12 +5537,60 @@ fn append_css_surf_sequence(
                 },
                 body: SolidBody::StaticSurfWedge {
                     wall_side: side,
-                    local_points,
+                    render_points: wedge.render_points,
                 },
                 friction: Some(0.0),
                 extra: ExtraKind::None,
             });
         }
+    }
+
+    let collider_segment_count = if intense {
+        ((total_distance / SURF_COLLIDER_SAMPLE_LENGTH).ceil() as usize)
+            .clamp(segment_count, SURF_MAX_COLLIDER_SEGMENTS)
+    } else {
+        ((total_distance / (SURF_COLLIDER_SAMPLE_LENGTH * 1.12)).ceil() as usize)
+            .clamp(segment_count, SURF_MAX_COLLIDER_SEGMENTS)
+    };
+    let mut collider_centerline = Vec::with_capacity(collider_segment_count + 1);
+    for sample in 0..=collider_segment_count {
+        let t = sample as f32 / collider_segment_count as f32;
+        collider_centerline.push(centerline_point(t));
+    }
+    let collider_tangents = sample_curve_tangents(&collider_centerline, fallback_tangent);
+    let collider_outwards = sample_curve_outwards(&collider_tangents, outward_hint);
+
+    for side in [-1.0_f32, 1.0] {
+        let strip = surf_strip_from_path(
+            &collider_centerline,
+            &collider_tangents,
+            &collider_outwards,
+            side,
+            ramp_span,
+            ramp_drop,
+        );
+        layout.solids.push(SolidSpec {
+            owner,
+            label: if intense {
+                format!("Surf Strip Collider {}", side)
+            } else {
+                format!("Flow Strip Collider {}", side)
+            },
+            center: strip.center,
+            size: strip.bounds,
+            paint: if side < 0.0 {
+                PaintStyle::ThemeAccent(theme)
+            } else {
+                PaintStyle::ThemeFloor(theme)
+            },
+            body: SolidBody::StaticSurfStrip {
+                wall_side: side,
+                collider_strip_points: strip.collider_strip_points,
+                columns: SURF_COLLIDER_COLUMNS,
+            },
+            friction: Some(0.0),
+            extra: ExtraKind::None,
+        });
     }
 }
 
@@ -5612,21 +5696,7 @@ fn build_branch_layout(
     });
 
     match branch.kind {
-        BranchKind::TreasureAlcove => {
-            if let Some(id) = branch.treasure_id {
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Treasure".into(),
-                    center: top_to_center(platform_top + Vec3::Y * 0.68, 0.85),
-                    size: Vec3::splat(0.85),
-                    paint: PaintStyle::Treasure,
-                    body: SolidBody::Decoration,
-                    friction: None,
-                    extra: ExtraKind::Treasure { id },
-                });
-            }
-        }
-        BranchKind::PropCache => {
+        BranchKind::TreasureAlcove | BranchKind::PropCache | BranchKind::ShortcutLever => {
             let mut rng = RunRng::new(branch.seed);
             for prop_index in 0..2 {
                 let offset = Vec3::new(
@@ -5646,33 +5716,7 @@ fn build_branch_layout(
                 });
             }
         }
-        BranchKind::ShortcutLever => {
-            if let Some(id) = branch.shortcut_id {
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Shortcut Switch".into(),
-                    center: top_to_center(platform_top + Vec3::Y * 0.6, 1.0),
-                    size: Vec3::new(1.0, 1.0, 1.0),
-                    paint: PaintStyle::Shortcut,
-                    body: SolidBody::Decoration,
-                    friction: None,
-                    extra: ExtraKind::ShortcutTrigger { id },
-                });
-            }
-        }
         BranchKind::RiskDetour => {
-            if let Some(id) = branch.treasure_id {
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: "Risk Treasure".into(),
-                    center: top_to_center(platform_top + Vec3::Y * 0.75, 0.9),
-                    size: Vec3::splat(0.9),
-                    paint: PaintStyle::Treasure,
-                    body: SolidBody::Decoration,
-                    friction: None,
-                    extra: ExtraKind::Treasure { id },
-                });
-            }
             layout.features.push(FeatureSpec::WindZone {
                 center: start.lerp(platform_top, 0.5) + Vec3::Y * 1.5,
                 size: axis_box_size(along_x, CELL_SIZE * 0.48, 2.8, 5.0),
@@ -6097,8 +6141,11 @@ mod tests {
             .filter_map(|solid| match &solid.body {
                 SolidBody::StaticSurfWedge {
                     wall_side,
-                    local_points,
-                } if *wall_side > 0.0 => Some((solid.center, local_points)),
+                    render_points,
+                    ..
+                } if *wall_side > 0.0 && !render_points.is_empty() => {
+                    Some((solid.center, render_points))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -6124,6 +6171,177 @@ mod tests {
                 b_front_outer
             );
         }
+    }
+
+    #[test]
+    fn surf_collider_strip_extends_past_render_seams() {
+        let mut layout = ModuleLayout::default();
+        let mut rng = RunRng::new(0x5eed_cafe_u64);
+        append_css_surf_sequence(
+            &mut layout,
+            OwnerTag::Segment(0),
+            &mut rng,
+            Vec3::new(0.0, 40.0, 0.0),
+            Vec3::new(120.0, 18.0, 26.0),
+            Vec3::X,
+            Vec3::Z,
+            Theme::Frost,
+            true,
+        );
+
+        let render_wedges = layout
+            .solids
+            .iter()
+            .filter_map(|solid| match &solid.body {
+                SolidBody::StaticSurfWedge { wall_side, .. } if *wall_side > 0.0 => {
+                    match &solid.body {
+                        SolidBody::StaticSurfWedge { render_points, .. }
+                            if !render_points.is_empty() =>
+                        {
+                            Some((solid.center, render_points))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let render_start_ridge =
+            render_wedges.first().unwrap().0 + render_wedges.first().unwrap().1[0];
+        let render_end_ridge = render_wedges.last().unwrap().0 + render_wedges.last().unwrap().1[1];
+
+        let strips = layout
+            .solids
+            .iter()
+            .filter_map(|solid| match &solid.body {
+                SolidBody::StaticSurfStrip {
+                    wall_side,
+                    collider_strip_points,
+                    columns,
+                } if *wall_side > 0.0 && !collider_strip_points.is_empty() => {
+                    Some((solid.center, collider_strip_points, *columns))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            strips.len(),
+            1,
+            "expected one collider strip on the positive surf wall"
+        );
+        let (strip_center, strip_points, columns) = &strips[0];
+        let strip_start_ridge = *strip_center + strip_points[0];
+        let strip_end_ridge = *strip_center + strip_points[strip_points.len() - *columns];
+        let start_dir =
+            (render_wedges[0].0 + render_wedges[0].1[1] - render_start_ridge).normalize_or_zero();
+        let end_dir = (render_end_ridge
+            - (render_wedges[render_wedges.len() - 1].0
+                + render_wedges[render_wedges.len() - 1].1[0]))
+            .normalize_or_zero();
+
+        assert!(
+            (render_start_ridge - strip_start_ridge).dot(start_dir)
+                > SURF_COLLIDER_OVERLAP_MIN * 0.75,
+            "collider strip did not extend before the render start seam"
+        );
+        assert!(
+            (strip_end_ridge - render_end_ridge).dot(end_dir) > SURF_COLLIDER_OVERLAP_MIN * 0.75,
+            "collider strip did not extend past the render end seam"
+        );
+    }
+
+    #[test]
+    fn surf_uses_fewer_collider_segments_than_render_segments() {
+        let mut layout = ModuleLayout::default();
+        let mut rng = RunRng::new(0x5eed_cafe_u64);
+        append_css_surf_sequence(
+            &mut layout,
+            OwnerTag::Segment(0),
+            &mut rng,
+            Vec3::new(0.0, 40.0, 0.0),
+            Vec3::new(120.0, 18.0, 26.0),
+            Vec3::X,
+            Vec3::Z,
+            Theme::Frost,
+            true,
+        );
+
+        let render_count = layout
+            .solids
+            .iter()
+            .filter(|solid| {
+                matches!(
+                    &solid.body,
+                    SolidBody::StaticSurfWedge { render_points, .. } if !render_points.is_empty()
+                )
+            })
+            .count();
+        let collider_count = layout
+            .solids
+            .iter()
+            .filter(|solid| {
+                matches!(
+                    &solid.body,
+                    SolidBody::StaticSurfStrip { collider_strip_points, .. }
+                        if !collider_strip_points.is_empty()
+                )
+            })
+            .count();
+
+        assert!(
+            collider_count < render_count,
+            "expected fewer collider strips than render wedges, got {collider_count} vs {render_count}"
+        );
+    }
+
+    #[test]
+    fn surf_collider_strip_uses_denser_samples_than_render_wedges() {
+        let mut layout = ModuleLayout::default();
+        let mut rng = RunRng::new(0x5eed_cafe_u64);
+        append_css_surf_sequence(
+            &mut layout,
+            OwnerTag::Segment(0),
+            &mut rng,
+            Vec3::new(0.0, 40.0, 0.0),
+            Vec3::new(120.0, 18.0, 26.0),
+            Vec3::X,
+            Vec3::Z,
+            Theme::Frost,
+            true,
+        );
+
+        let render_wedge_count = layout
+            .solids
+            .iter()
+            .filter(|solid| {
+                matches!(
+                    &solid.body,
+                    SolidBody::StaticSurfWedge { wall_side, render_points }
+                        if *wall_side > 0.0 && !render_points.is_empty()
+                )
+            })
+            .count();
+        let strip_sample_count = layout
+            .solids
+            .iter()
+            .find_map(|solid| match &solid.body {
+                SolidBody::StaticSurfStrip {
+                    wall_side,
+                    collider_strip_points,
+                    columns,
+                } if *wall_side > 0.0 && !collider_strip_points.is_empty() => {
+                    Some(collider_strip_points.len() / *columns)
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        assert!(
+            strip_sample_count > render_wedge_count,
+            "expected collider strip samples to exceed render wedge seams, got {strip_sample_count} vs {render_wedge_count}"
+        );
     }
 
     #[test]
@@ -6230,47 +6448,300 @@ fn surf_wedge_surface_normal(size: Vec3, wall_side: f32) -> Vec3 {
     Vec3::new(0.0, size.z, wall_side * size.y).normalize_or_zero()
 }
 
-fn surf_wedge_from_seams(
+struct SurfWedgeGeometry {
+    center: Vec3,
+    render_points: Vec<Vec3>,
+    bounds: Vec3,
+}
+
+struct SurfStripGeometry {
+    center: Vec3,
+    collider_strip_points: Vec<Vec3>,
+    bounds: Vec3,
+}
+
+fn project_onto_plane(vector: Vec3, normal: Vec3) -> Vec3 {
+    vector - normal * vector.dot(normal)
+}
+
+fn sample_curve_tangents(points: &[Vec3], fallback_tangent: Vec3) -> Vec<Vec3> {
+    let mut tangents = Vec::with_capacity(points.len());
+    for index in 0..points.len() {
+        let prev = if index == 0 {
+            points[1] - points[0]
+        } else {
+            points[index] - points[index - 1]
+        };
+        let next = if index + 1 == points.len() {
+            points[index] - points[index - 1]
+        } else {
+            points[index + 1] - points[index]
+        };
+        let tangent = (prev + next).normalize_or_zero();
+        tangents.push(if tangent == Vec3::ZERO {
+            fallback_tangent
+        } else {
+            tangent
+        });
+    }
+    tangents
+}
+
+fn sample_curve_outwards(tangents: &[Vec3], outward_hint: Vec3) -> Vec<Vec3> {
+    let mut outwards = Vec::with_capacity(tangents.len());
+    let mut previous_outward = project_onto_plane(outward_hint, tangents[0]).normalize_or_zero();
+    if previous_outward == Vec3::ZERO {
+        previous_outward = perpendicular_to(tangents[0], outward_hint);
+    }
+    if previous_outward.dot(outward_hint) < 0.0 {
+        previous_outward = -previous_outward;
+    }
+    outwards.push(previous_outward);
+
+    for tangent in tangents.iter().skip(1) {
+        let hint = project_onto_plane(outward_hint, *tangent).normalize_or_zero();
+        let mut outward = project_onto_plane(previous_outward, *tangent).normalize_or_zero();
+        if outward == Vec3::ZERO {
+            outward = if hint != Vec3::ZERO {
+                hint
+            } else {
+                perpendicular_to(*tangent, outward_hint)
+            };
+        }
+        if hint != Vec3::ZERO {
+            let aligned_hint = if outward.dot(hint) < 0.0 { -hint } else { hint };
+            outward = outward.lerp(aligned_hint, 0.16).normalize_or_zero();
+        }
+        if outward == Vec3::ZERO {
+            outward = perpendicular_to(*tangent, outward_hint);
+        }
+        if outward.dot(outward_hint) < 0.0 {
+            outward = -outward;
+        }
+        outwards.push(outward);
+        previous_outward = outward;
+    }
+
+    outwards
+}
+
+fn perpendicular_to(normal: Vec3, hint: Vec3) -> Vec3 {
+    let mut perpendicular = project_onto_plane(hint, normal).normalize_or_zero();
+    if perpendicular == Vec3::ZERO {
+        perpendicular = if normal.y.abs() < 0.95 {
+            normal.cross(Vec3::Y).normalize_or_zero()
+        } else {
+            normal.cross(Vec3::X).normalize_or_zero()
+        };
+    }
+    if perpendicular == Vec3::ZERO {
+        Vec3::X
+    } else {
+        perpendicular
+    }
+}
+
+fn surf_face_offset(tangent: Vec3, outward_hint: Vec3, ramp_span: f32, ramp_drop: f32) -> Vec3 {
+    let tangent = tangent.normalize_or_zero();
+    let mut outward = project_onto_plane(outward_hint, tangent).normalize_or_zero();
+    if outward == Vec3::ZERO {
+        outward = perpendicular_to(tangent, outward_hint);
+    }
+    if outward.dot(outward_hint) < 0.0 {
+        outward = -outward;
+    }
+    let mut down = tangent.cross(outward).normalize_or_zero();
+    if down.y > 0.0 {
+        down = -down;
+    }
+    if down == Vec3::ZERO {
+        down = -Vec3::Y;
+    }
+
+    outward * ramp_span + down * ramp_drop
+}
+
+fn wedge_local_points(
     start_ridge: Vec3,
     end_ridge: Vec3,
-    start_outward: Vec3,
-    end_outward: Vec3,
-    ramp_span: f32,
-    ramp_drop: f32,
-) -> (Vec3, Vec<Vec3>, Vec3) {
-    let start_outer =
-        start_ridge + start_outward.normalize_or_zero() * ramp_span - Vec3::Y * ramp_drop;
-    let end_outer = end_ridge + end_outward.normalize_or_zero() * ramp_span - Vec3::Y * ramp_drop;
-    let world_points = [
+    start_outer: Vec3,
+    end_outer: Vec3,
+    thickness: f32,
+) -> [Vec3; 8] {
+    [
         start_ridge,
         end_ridge,
         start_outer,
         end_outer,
-        start_ridge - Vec3::Y * SURF_WEDGE_THICKNESS,
-        end_ridge - Vec3::Y * SURF_WEDGE_THICKNESS,
-        start_outer - Vec3::Y * SURF_WEDGE_THICKNESS,
-        end_outer - Vec3::Y * SURF_WEDGE_THICKNESS,
-    ];
+        start_ridge - Vec3::Y * thickness,
+        end_ridge - Vec3::Y * thickness,
+        start_outer - Vec3::Y * thickness,
+        end_outer - Vec3::Y * thickness,
+    ]
+}
+
+fn surf_wedge_from_seams(
+    start_ridge: Vec3,
+    end_ridge: Vec3,
+    start_tangent: Vec3,
+    end_tangent: Vec3,
+    start_outward: Vec3,
+    end_outward: Vec3,
+    ramp_span: f32,
+    ramp_drop: f32,
+) -> SurfWedgeGeometry {
+    let start_face = surf_face_offset(start_tangent, start_outward, ramp_span, ramp_drop);
+    let end_face = surf_face_offset(end_tangent, end_outward, ramp_span, ramp_drop);
+    let render_world_points = wedge_local_points(
+        start_ridge,
+        end_ridge,
+        start_ridge + start_face,
+        end_ridge + end_face,
+        SURF_WEDGE_THICKNESS,
+    );
+
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
     let mut center = Vec3::ZERO;
-    for point in world_points {
+    let point_count = render_world_points.len();
+    for point in render_world_points.iter().copied() {
         min = min.min(point);
         max = max.max(point);
         center += point;
     }
-    center /= world_points.len() as f32;
-    let local_points = world_points
-        .into_iter()
-        .map(|point| point - center)
-        .collect::<Vec<_>>();
-    (center, local_points, max - min)
+    center /= point_count as f32;
+
+    SurfWedgeGeometry {
+        center,
+        render_points: render_world_points
+            .into_iter()
+            .map(|point| point - center)
+            .collect(),
+        bounds: max - min,
+    }
+}
+
+fn surf_strip_from_path(
+    centerline: &[Vec3],
+    seam_tangents: &[Vec3],
+    seam_outwards: &[Vec3],
+    side: f32,
+    ramp_span: f32,
+    ramp_drop: f32,
+) -> SurfStripGeometry {
+    let mut collider_world_points = Vec::with_capacity(centerline.len() * SURF_COLLIDER_COLUMNS);
+    let start_overlap = if centerline.len() > 1 {
+        (centerline[0].distance(centerline[1]) * 0.08)
+            .clamp(SURF_COLLIDER_OVERLAP_MIN, SURF_COLLIDER_OVERLAP_MAX)
+    } else {
+        SURF_COLLIDER_OVERLAP_MIN
+    };
+    let end_overlap = if centerline.len() > 1 {
+        (centerline[centerline.len() - 2].distance(centerline[centerline.len() - 1]) * 0.08)
+            .clamp(SURF_COLLIDER_OVERLAP_MIN, SURF_COLLIDER_OVERLAP_MAX)
+    } else {
+        SURF_COLLIDER_OVERLAP_MIN
+    };
+
+    for index in 0..centerline.len() {
+        let mut ridge = centerline[index];
+        let tangent = seam_tangents[index].normalize_or_zero();
+        if index == 0 {
+            ridge -= tangent * start_overlap;
+        } else if index + 1 == centerline.len() {
+            ridge += tangent * end_overlap;
+        }
+        let face = surf_face_offset(
+            seam_tangents[index],
+            seam_outwards[index] * side,
+            ramp_span,
+            ramp_drop,
+        );
+        let outer = ridge + face;
+        for column in 0..SURF_COLLIDER_COLUMNS {
+            let t = column as f32 / (SURF_COLLIDER_COLUMNS - 1) as f32;
+            collider_world_points.push(ridge.lerp(outer, t));
+        }
+    }
+
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let mut center = Vec3::ZERO;
+    for point in collider_world_points.iter().copied() {
+        min = min.min(point);
+        max = max.max(point);
+        center += point;
+    }
+    center /= collider_world_points.len().max(1) as f32;
+
+    SurfStripGeometry {
+        center,
+        collider_strip_points: collider_world_points
+            .into_iter()
+            .map(|point| point - center)
+            .collect(),
+        bounds: max - min,
+    }
 }
 
 fn build_surf_wedge_mesh(points: &[Vec3], base_color: Color, stripe_color: Color) -> Mesh {
     let mut builder = ColoredMeshBuilder::default();
     append_surf_wedge_render_geometry(&mut builder, Vec3::ZERO, points, base_color, stripe_color);
     builder.build()
+}
+
+fn build_surf_strip_collider_mesh(points: &[Vec3], columns: usize) -> Option<Mesh> {
+    if columns < 2 || points.len() < columns * 2 || points.len() % columns != 0 {
+        return None;
+    }
+
+    let seam_count = points.len() / columns;
+    let mut indices = Vec::with_capacity((seam_count - 1) * (columns - 1) * 6);
+    for seam in 0..(seam_count - 1) {
+        for column in 0..(columns - 1) {
+            let a = (seam * columns + column) as u32;
+            let b = a + 1;
+            let c = ((seam + 1) * columns + column) as u32;
+            let d = c + 1;
+            let split_across = triangle_pair_alignment(
+                points[a as usize],
+                points[b as usize],
+                points[c as usize],
+                points[d as usize],
+            );
+            if split_across {
+                indices.extend_from_slice(&[a, b, d, a, d, c]);
+            } else {
+                indices.extend_from_slice(&[a, b, c, b, d, c]);
+            }
+        }
+    }
+
+    Some(
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        )
+        .with_inserted_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            points
+                .iter()
+                .map(|point| [point.x, point.y, point.z])
+                .collect::<Vec<_>>(),
+        )
+        .with_inserted_indices(Indices::U32(indices)),
+    )
+}
+
+fn triangle_pair_alignment(a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> bool {
+    let split_abdc_1 = (b - a).cross(d - a).normalize_or_zero();
+    let split_abdc_2 = (d - a).cross(c - a).normalize_or_zero();
+    let split_abcd_1 = (b - a).cross(c - a).normalize_or_zero();
+    let split_abcd_2 = (d - b).cross(c - b).normalize_or_zero();
+
+    let aligned_abdc = split_abdc_1.dot(split_abdc_2);
+    let aligned_abcd = split_abcd_1.dot(split_abcd_2);
+    aligned_abdc >= aligned_abcd
 }
 
 fn append_star_render_geometry(
