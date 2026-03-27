@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     f32::consts::{PI, TAU},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -22,7 +22,7 @@ use bevy_ecs::{lifecycle::HookContext, world::DeferredWorld};
 use bevy_enhanced_input::prelude::{Hold, Press, *};
 use bevy_time::Stopwatch;
 
-use crate::util::{ExampleUtilPlugin, StableGround};
+use crate::util::{ControlsOverlay, ExampleUtilPlugin, StableGround};
 
 mod util;
 
@@ -45,11 +45,24 @@ const CHECKPOINT_RADIUS: f32 = 2.8;
 const SUMMIT_RADIUS: f32 = 4.5;
 const SHORTCUT_TRIGGER_RADIUS: f32 = 2.0;
 const SKY_RADIUS: f32 = 950.0;
-const MAX_SECTION_TURN_RADIANS: f32 = 4.5_f32.to_radians();
+const MAX_SECTION_TURN_RADIANS: f32 = 4.9_f32.to_radians();
 const STAR_COUNT: usize = 720;
 const STAR_CLUSTER_COUNT: usize = 7;
 const COMET_COUNT: usize = 4;
-const CLOUD_PUFF_COUNT: usize = 20;
+const CLOUD_PUFF_COUNT: usize = 12;
+const STREAM_BEHIND_ROOMS: usize = 2;
+const STREAM_AHEAD_ROOMS: usize = 12;
+const PHYSICS_SUBSTEPS: u32 = 12;
+const PLAYER_STEP_SIZE: f32 = 1.0;
+const PLAYER_GROUND_DISTANCE: f32 = 0.05;
+const PLAYER_STEP_DOWN_DETECTION_DISTANCE: f32 = 0.2;
+const PLAYER_SKIN_WIDTH: f32 = 0.008;
+const SURF_STEP_SIZE: f32 = 0.0;
+const SURF_GROUND_DISTANCE: f32 = 0.012;
+const SURF_STEP_DOWN_DETECTION_DISTANCE: f32 = 0.03;
+const SURF_SKIN_WIDTH: f32 = 0.003;
+const PLAYER_MOVE_AND_SLIDE_ITERATIONS: usize = 8;
+const PLAYER_DEPENETRATION_ITERATIONS: usize = 8;
 
 type SocketMask = u32;
 const SOCKET_SAFE_REST: SocketMask = 1 << 0;
@@ -81,8 +94,18 @@ fn main() -> AppExit {
         .add_input_context::<PlayerInput>()
         .insert_resource(ClearColor(Color::srgb(0.005, 0.008, 0.022)))
         .insert_resource(RunDirector::default())
+        .insert_resource(WorldAssetCache::default())
+        .insert_resource(SubstepCount(PHYSICS_SUBSTEPS))
+        .insert_resource(NarrowPhaseConfig {
+            default_speculative_margin: 0.0,
+            contact_tolerance: 0.001,
+            match_contacts: true,
+        })
         .add_systems(Startup, (setup_scene, setup_hud).chain())
-        .add_systems(PostStartup, tune_player_camera)
+        .add_systems(
+            PostStartup,
+            (tune_player_camera, configure_controls_overlay).chain(),
+        )
         .add_systems(
             Update,
             (
@@ -90,7 +113,6 @@ fn main() -> AppExit {
                 release_cursor.run_if(input_just_pressed(KeyCode::Escape)),
                 tick_run_timer,
                 queue_run_controls,
-                handle_reset_seed_button,
                 activate_checkpoints,
                 collect_treasures,
                 activate_shortcuts,
@@ -98,6 +120,7 @@ fn main() -> AppExit {
                 detect_summit_completion,
                 detect_failures,
                 animate_sky_decor,
+                stream_world_chunks,
                 update_hud,
                 process_run_request,
             ),
@@ -120,6 +143,7 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut asset_cache: ResMut<WorldAssetCache>,
 ) {
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.16, 0.22, 0.38),
@@ -128,13 +152,16 @@ fn setup_scene(
     });
 
     let blueprint = build_run_blueprint(current_run_seed());
+    let initial_look = respawn_look_for_checkpoint(&blueprint, 0);
     let snapshot = spawn_run_world(
         &blueprint,
         &HashSet::default(),
         &HashSet::default(),
+        0,
         &mut commands,
         &mut meshes,
         &mut materials,
+        &mut asset_cache,
     );
 
     commands.insert_resource(RunState::new(&blueprint, snapshot));
@@ -142,7 +169,7 @@ fn setup_scene(
     commands.spawn((
         Name::new("Spawn Point"),
         SpawnPlayer,
-        Transform::from_translation(blueprint.spawn),
+        Transform::from_translation(blueprint.spawn).with_rotation(initial_look.to_quat()),
         GlobalTransform::default(),
     ));
 
@@ -156,14 +183,16 @@ fn setup_scene(
             CharacterController {
                 speed: 9.8,
                 air_speed: 4.2,
-                air_acceleration_hz: 42.0,
+                air_acceleration_hz: 1000.0,
                 jump_height: 1.9,
                 max_speed: 3000.0,
-                step_size: 1.0,
+                step_size: PLAYER_STEP_SIZE,
                 mantle_height: 3.4,
                 crane_height: 4.1,
                 mantle_speed: 2.2,
                 crane_speed: 3.5,
+                ground_distance: PLAYER_GROUND_DISTANCE,
+                step_down_detection_distance: PLAYER_STEP_DOWN_DETECTION_DISTANCE,
                 min_mantle_ledge_space: 0.28,
                 min_crane_ledge_space: 0.22,
                 min_ledge_grab_space: Cuboid::new(0.18, 0.08, 0.22),
@@ -171,6 +200,12 @@ fn setup_scene(
                 climb_pull_up_height: 0.48,
                 min_mantle_cos: 24.0_f32.to_radians().cos(),
                 min_crane_cos: 18.0_f32.to_radians().cos(),
+                move_and_slide: MoveAndSlideConfig {
+                    skin_width: PLAYER_SKIN_WIDTH,
+                    move_and_slide_iterations: PLAYER_MOVE_AND_SLIDE_ITERATIONS,
+                    depenetration_iterations: PLAYER_DEPENETRATION_ITERATIONS,
+                    ..default()
+                },
                 ..default()
             },
             RigidBody::Kinematic,
@@ -180,7 +215,7 @@ fn setup_scene(
             StableGround::default(),
             Transform::from_translation(blueprint.spawn),
             Position(blueprint.spawn),
-            CharacterLook::default(),
+            initial_look.clone(),
         ))
         .id();
 
@@ -188,6 +223,7 @@ fn setup_scene(
         Name::new("Player Camera"),
         Camera3d::default(),
         CharacterControllerCameraOf::new(player),
+        Transform::from_rotation(initial_look.to_quat()),
         PickupConfig {
             prop_filter: SpatialQueryFilter::from_mask(CollisionLayer::Prop),
             actor_filter: SpatialQueryFilter::from_mask(CollisionLayer::Player),
@@ -220,35 +256,34 @@ fn setup_hud(mut commands: Commands) {
         BackgroundColor(Color::BLACK.with_alpha(0.44)),
         RunHud,
     ));
+}
 
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                top: px(12.0),
-                right: px(12.0),
-                padding: UiRect::axes(px(16.0), px(10.0)),
-                ..default()
-            },
-            Button,
-            BackgroundColor(Color::srgba(0.09, 0.16, 0.28, 0.88)),
-            ResetSeedButton,
-        ))
-        .with_children(|parent| {
-            parent.spawn((Text::new("New Seed"),));
-        });
+fn configure_controls_overlay(mut overlay: Single<&mut Text, With<ControlsOverlay>>) {
+    overlay.0 = "Controls:\n\
+WASD: move\n\
+Space (hold): bhop / jump / climb / ledge pull-up\n\
+Ctrl: crouch / climbdown\n\
+RMB: pull / drop props\n\
+LMB: throw props\n\
+F5: rerun seed\n\
+N: new seed\n\
+Esc: free mouse\n\
+R: reset position\n\
+Backtick: toggle debug menu"
+        .into();
 }
 
 fn update_hud(
     run: Res<RunState>,
-    players: Query<&Transform, With<Player>>,
+    players: Query<(&Transform, &LinearVelocity), With<Player>>,
     mut hud: Single<&mut Text, With<RunHud>>,
 ) {
-    let Ok(player) = players.single() else {
+    let Ok((player, velocity)) = players.single() else {
         return;
     };
 
     let current_height = player.translation.y;
+    let speed = velocity.length();
     let start_height = run
         .checkpoints
         .first()
@@ -259,23 +294,16 @@ fn update_hud(
     let descended = (start_height - current_height).clamp(0.0, total_descent);
     let progress = (descended / total_descent).clamp(0.0, 1.0) * 100.0;
     let elapsed = run.timer.elapsed_secs();
-    let objective = if run.finished {
-        "Finish reached. F5 reruns this seed, F6 or the button rolls a new downhill run."
-    } else {
-        "Goal: ride the course down to the beacon. Falling respawns at the furthest section you've reached."
-    };
 
     hud.0 = format!(
         "Chronoclimb\n\
          Seed: {seed:016x}\n\
          Floors: {floors} | Checkpoint: {checkpoint}/{checkpoint_total}\n\
          Altitude: {height:.1}m -> {finish:.1}m | Descent {descended:.1}m / {total_descent:.1}m ({progress:.0}%)\n\
+         Speed: {speed:.1} u/s\n\
          Time: {elapsed:.1}s | Deaths: {deaths}\n\
          Treasures: {treasures}/{treasure_total} | Shortcuts: {shortcuts}\n\
-         Gen: attempts {attempts}, repairs {repairs}, overlaps {overlaps}, clearance {clearance}, reach {reach}\n\
-         {objective}\n\
-         Controls: WASD move | hold Space bhop/jump/climb | Ctrl crouch/climbdown | Esc releases cursor\n\
-         Hold Space on ledges to pull up and in narrow shafts to climb between walls | RMB pull/drop props | LMB throw",
+         Gen: attempts {attempts}, repairs {repairs}, overlaps {overlaps}, clearance {clearance}, reach {reach}",
         seed = run.seed,
         floors = run.floors,
         checkpoint = run.current_checkpoint + 1,
@@ -285,6 +313,7 @@ fn update_hud(
         descended = descended,
         total_descent = total_descent,
         progress = progress,
+        speed = speed,
         elapsed = elapsed,
         deaths = run.deaths,
         treasures = run.collected_treasures.len(),
@@ -295,7 +324,6 @@ fn update_hud(
         overlaps = run.stats.overlap_issues,
         clearance = run.stats.clearance_issues,
         reach = run.stats.reachability_issues,
-        objective = objective,
     );
 }
 
@@ -319,39 +347,11 @@ fn queue_run_controls(
             kind: RunRequestKind::RestartSameSeed,
             seed: run.seed,
         });
-    } else if keys.just_pressed(KeyCode::F6) {
+    } else if keys.just_pressed(KeyCode::KeyN) {
         director.pending = Some(RunRequest {
             kind: RunRequestKind::RestartNewSeed,
             seed: current_run_seed(),
         });
-    }
-}
-
-fn handle_reset_seed_button(
-    mut buttons: Query<
-        (&Interaction, &mut BackgroundColor),
-        (Changed<Interaction>, With<ResetSeedButton>),
-    >,
-    mut director: ResMut<RunDirector>,
-) {
-    for (interaction, mut background) in &mut buttons {
-        match interaction {
-            Interaction::Pressed => {
-                background.0 = Color::srgba(0.18, 0.34, 0.58, 0.96);
-                if director.pending.is_none() {
-                    director.pending = Some(RunRequest {
-                        kind: RunRequestKind::RestartNewSeed,
-                        seed: current_run_seed(),
-                    });
-                }
-            }
-            Interaction::Hovered => {
-                background.0 = Color::srgba(0.13, 0.24, 0.42, 0.92);
-            }
-            Interaction::None => {
-                background.0 = Color::srgba(0.09, 0.16, 0.28, 0.88);
-            }
-        }
     }
 }
 
@@ -375,6 +375,8 @@ fn activate_checkpoints(
                 run.current_checkpoint = checkpoint.index;
                 if let Some(spawn) = run.checkpoints.get(checkpoint.index).copied() {
                     spawn_marker.translation = spawn;
+                    spawn_marker.rotation =
+                        respawn_look_for_checkpoint(&run.blueprint, checkpoint.index).to_quat();
                 }
             }
         }
@@ -492,11 +494,60 @@ fn detect_failures(
     }
 }
 
+fn stream_world_chunks(
+    mut commands: Commands,
+    director: Res<RunDirector>,
+    mut run: ResMut<RunState>,
+    players: Query<&Transform, With<Player>>,
+    generated_chunks: Query<(Entity, &ChunkMember), With<GeneratedWorld>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut asset_cache: ResMut<WorldAssetCache>,
+) {
+    if director.pending.is_some() {
+        return;
+    }
+
+    let focus_room = players
+        .single()
+        .map(|player| stream_focus_room(&run.blueprint, run.current_checkpoint, player.translation))
+        .unwrap_or(run.current_checkpoint);
+    let desired_order = desired_chunk_window(&run.blueprint, focus_room);
+    let desired_chunks = desired_order.iter().copied().collect::<HashSet<_>>();
+    if desired_chunks == run.spawned_chunks {
+        return;
+    }
+
+    for (entity, member) in &generated_chunks {
+        if !desired_chunks.contains(&member.0) {
+            commands.entity(entity).despawn();
+        }
+    }
+
+    for chunk in desired_order {
+        if !run.spawned_chunks.contains(&chunk) {
+            spawn_chunk(
+                chunk,
+                &run.blueprint,
+                &run.collected_treasures,
+                &run.unlocked_shortcuts,
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                &mut asset_cache,
+            );
+        }
+    }
+
+    run.spawned_chunks = desired_chunks;
+}
+
 fn process_run_request(
     mut commands: Commands,
     mut director: ResMut<RunDirector>,
     mut run: ResMut<RunState>,
     generated: Query<Entity, With<GeneratedWorld>>,
+    generated_chunks: Query<Entity, (With<GeneratedWorld>, With<ChunkMember>)>,
     mut players: Query<
         (
             &mut Position,
@@ -514,53 +565,68 @@ fn process_run_request(
     >,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut asset_cache: ResMut<WorldAssetCache>,
 ) {
     let Some(request) = director.pending.take() else {
         return;
     };
 
-    for entity in &generated {
-        commands.entity(entity).despawn();
+    match request.kind {
+        RunRequestKind::Respawn => {
+            run.deaths += 1;
+            run.finished = false;
+            for entity in &generated_chunks {
+                commands.entity(entity).despawn();
+            }
+            let snapshot = respawn_active_chunks(
+                &run.blueprint,
+                &run.collected_treasures,
+                &run.unlocked_shortcuts,
+                run.current_checkpoint,
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                &mut asset_cache,
+            );
+            run.spawned_chunks = snapshot.active_chunks;
+        }
+        RunRequestKind::RestartSameSeed | RunRequestKind::RestartNewSeed => {
+            for entity in &generated {
+                commands.entity(entity).despawn();
+            }
+
+            let blueprint = build_run_blueprint(request.seed);
+            run.seed = request.seed;
+            run.timer = Stopwatch::new();
+            run.finished = false;
+            run.deaths = 0;
+            run.current_checkpoint = 0;
+            run.collected_treasures.clear();
+            run.unlocked_shortcuts.clear();
+
+            let snapshot = spawn_run_world(
+                &blueprint,
+                &run.collected_treasures,
+                &run.unlocked_shortcuts,
+                0,
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                &mut asset_cache,
+            );
+
+            run.apply_blueprint(&blueprint, snapshot);
+        }
     }
-
-    let (seed, reset_progress) = match request.kind {
-        RunRequestKind::Respawn => (request.seed, false),
-        RunRequestKind::RestartSameSeed => (request.seed, true),
-        RunRequestKind::RestartNewSeed => (request.seed, true),
-    };
-
-    let blueprint = build_run_blueprint(seed);
-
-    if reset_progress {
-        run.seed = seed;
-        run.timer = Stopwatch::new();
-        run.finished = false;
-        run.deaths = 0;
-        run.current_checkpoint = 0;
-        run.collected_treasures.clear();
-        run.unlocked_shortcuts.clear();
-    } else {
-        run.deaths += 1;
-        run.finished = false;
-    }
-
-    let snapshot = spawn_run_world(
-        &blueprint,
-        &run.collected_treasures,
-        &run.unlocked_shortcuts,
-        &mut commands,
-        &mut meshes,
-        &mut materials,
-    );
-
-    run.apply_blueprint(&blueprint, snapshot);
 
     let spawn = run
         .checkpoints
         .get(run.current_checkpoint)
         .copied()
-        .unwrap_or(blueprint.spawn);
+        .unwrap_or(run.blueprint.spawn);
+    let respawn_look = respawn_look_for_checkpoint(&run.blueprint, run.current_checkpoint);
     spawn_marker.translation = spawn;
+    spawn_marker.rotation = respawn_look.to_quat();
 
     if let Ok((mut position, mut transform, mut velocity, mut look, mut wall_run)) =
         players.single_mut()
@@ -568,12 +634,37 @@ fn process_run_request(
         position.0 = spawn;
         transform.translation = spawn;
         velocity.0 = Vec3::ZERO;
-        *look = CharacterLook::default();
+        *look = respawn_look.clone();
         *wall_run = WallRunState::default();
     }
 
     if let Ok(mut camera_transform) = camera.single_mut() {
-        camera_transform.rotation = Quat::IDENTITY;
+        camera_transform.rotation = respawn_look.to_quat();
+    }
+}
+
+fn respawn_look_for_checkpoint(blueprint: &RunBlueprint, checkpoint_index: usize) -> CharacterLook {
+    let fallback = CharacterLook::default();
+    let room_count = blueprint.rooms.len();
+    if room_count < 2 {
+        return fallback;
+    }
+
+    let current = checkpoint_index.min(room_count - 1);
+    let mut facing = if current + 1 < room_count {
+        blueprint.rooms[current + 1].top - blueprint.rooms[current].top
+    } else {
+        blueprint.rooms[current].top - blueprint.rooms[current.saturating_sub(1)].top
+    };
+    facing.y = 0.0;
+    let facing = facing.normalize_or_zero();
+    if facing == Vec3::ZERO {
+        return fallback;
+    }
+
+    CharacterLook {
+        yaw: facing.x.atan2(facing.z),
+        pitch: 0.0,
     }
 }
 
@@ -615,10 +706,10 @@ struct Player;
 struct RunHud;
 
 #[derive(Component)]
-struct ResetSeedButton;
-
-#[derive(Component)]
 struct GeneratedWorld;
+
+#[derive(Component, Clone, Copy, PartialEq, Eq, Hash)]
+struct ChunkMember(WorldChunkKey);
 
 #[derive(Component)]
 struct SurfRampSurface;
@@ -704,9 +795,49 @@ enum RunRequestKind {
     RestartNewSeed,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum WorldChunkKey {
+    Room(usize),
+    Segment(usize),
+    Branch(usize),
+    Summit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct MeshSizeKey {
+    x: u32,
+    y: u32,
+    z: u32,
+}
+
+impl MeshSizeKey {
+    fn from_size(size: Vec3) -> Self {
+        Self {
+            x: size.x.to_bits(),
+            y: size.y.to_bits(),
+            z: size.z.to_bits(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GameMaterialKey {
+    paint: PaintStyle,
+    ghost: bool,
+    surf: bool,
+    vertex_colored: bool,
+}
+
+#[derive(Resource, Default)]
+struct WorldAssetCache {
+    cuboid_meshes: HashMap<MeshSizeKey, Handle<Mesh>>,
+    gameplay_materials: HashMap<GameMaterialKey, Handle<StandardMaterial>>,
+}
+
 #[derive(Resource)]
 struct RunState {
     seed: u64,
+    blueprint: RunBlueprint,
     floors: usize,
     summit: Vec3,
     death_plane: f32,
@@ -718,6 +849,7 @@ struct RunState {
     total_treasures: usize,
     collected_treasures: HashSet<u64>,
     unlocked_shortcuts: HashSet<u64>,
+    spawned_chunks: HashSet<WorldChunkKey>,
     stats: GenerationStats,
 }
 
@@ -725,6 +857,7 @@ impl RunState {
     fn new(blueprint: &RunBlueprint, snapshot: RunSnapshot) -> Self {
         let mut state = Self {
             seed: blueprint.seed,
+            blueprint: blueprint.clone(),
             floors: blueprint.floors,
             summit: blueprint.summit,
             death_plane: blueprint.death_plane,
@@ -736,6 +869,7 @@ impl RunState {
             total_treasures: snapshot.total_treasures,
             collected_treasures: HashSet::default(),
             unlocked_shortcuts: HashSet::default(),
+            spawned_chunks: snapshot.active_chunks,
             stats: blueprint.stats.clone(),
         };
         if state.checkpoints.is_empty() {
@@ -746,11 +880,13 @@ impl RunState {
 
     fn apply_blueprint(&mut self, blueprint: &RunBlueprint, snapshot: RunSnapshot) {
         self.seed = blueprint.seed;
+        self.blueprint = blueprint.clone();
         self.floors = blueprint.floors;
         self.summit = blueprint.summit;
         self.death_plane = blueprint.death_plane;
         self.checkpoints = snapshot.checkpoints;
         self.total_treasures = snapshot.total_treasures;
+        self.spawned_chunks = snapshot.active_chunks;
         self.stats = blueprint.stats.clone();
         if self.current_checkpoint >= self.checkpoints.len() {
             self.current_checkpoint = self.checkpoints.len().saturating_sub(1);
@@ -951,6 +1087,7 @@ fn normalize_surfing_motion(
     mut players: Query<
         (
             &CharacterControllerOutput,
+            &mut CharacterController,
             &mut AccumulatedInput,
             &mut SurfMovementState,
         ),
@@ -958,7 +1095,7 @@ fn normalize_surfing_motion(
     >,
 ) {
     let dt = time.delta_secs();
-    for (output, mut input, mut surf_state) in &mut players {
+    for (output, mut controller, mut input, mut surf_state) in &mut players {
         let touching_surf = output
             .touching_entities
             .iter()
@@ -975,6 +1112,18 @@ fn normalize_surfing_motion(
             input.tac = None;
             input.craned = None;
             input.mantled = None;
+        }
+
+        if touching_surf || surf_state.jump_lock > 0.0 {
+            controller.step_size = SURF_STEP_SIZE;
+            controller.ground_distance = SURF_GROUND_DISTANCE;
+            controller.step_down_detection_distance = SURF_STEP_DOWN_DETECTION_DISTANCE;
+            controller.move_and_slide.skin_width = SURF_SKIN_WIDTH;
+        } else {
+            controller.step_size = PLAYER_STEP_SIZE;
+            controller.ground_distance = PLAYER_GROUND_DISTANCE;
+            controller.step_down_detection_distance = PLAYER_STEP_DOWN_DETECTION_DISTANCE;
+            controller.move_and_slide.skin_width = PLAYER_SKIN_WIDTH;
         }
     }
 }
@@ -1206,7 +1355,7 @@ enum RoomSectionKind {
     CornerPerches,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Theme {
     Stone,
     Overgrown,
@@ -1253,6 +1402,7 @@ struct SolidSpec {
 enum SolidBody {
     Static,
     StaticSurfWedge {
+        #[cfg_attr(not(test), allow(dead_code))]
         wall_side: f32,
         local_points: Vec<Vec3>,
     },
@@ -1302,7 +1452,7 @@ enum FeatureSpec {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum PaintStyle {
     ThemeFloor(Theme),
     ThemeAccent(Theme),
@@ -1334,6 +1484,7 @@ struct ModuleLayout {
 struct RunSnapshot {
     checkpoints: Vec<Vec3>,
     total_treasures: usize,
+    active_chunks: HashSet<WorldChunkKey>,
 }
 
 #[derive(Clone, Copy)]
@@ -1414,8 +1565,9 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
     let mut current_height = 420.0;
     let mut current_top = Vec3::new(0.0, current_height, 0.0);
     let heading_phase = rng.range_f32(0.0, TAU);
-    let heading_frequency = rng.range_f32(0.34, 0.58);
-    let heading_bias = if rng.chance(0.5) { 1.0 } else { -1.0 };
+    let heading_frequency = rng.range_f32(0.42, 0.74);
+    let spiral_direction = if rng.chance(0.5) { 1.0 } else { -1.0 };
+    let spiral_turn = rng.range_f32(3.2_f32.to_radians(), 4.75_f32.to_radians()) * spiral_direction;
     let mut heading_angle = rng.range_f32(0.0, TAU);
 
     let cell = room_grid_cell(current_top);
@@ -1434,12 +1586,11 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
     for index in 1..floors {
         let difficulty = index as f32 / (floors.saturating_sub(1).max(1)) as f32;
         let room_size = Vec2::splat(lerp(13.2, 9.8, difficulty)).max(Vec2::splat(9.2));
-        let turn_wave = ((index as f32 * heading_frequency + heading_phase).sin() * 0.82
-            + heading_bias * 0.18)
-            * MAX_SECTION_TURN_RADIANS;
-        let turn_jitter = rng.range_f32(-0.7_f32.to_radians(), 0.7_f32.to_radians());
-        heading_angle +=
-            (turn_wave + turn_jitter).clamp(-MAX_SECTION_TURN_RADIANS, MAX_SECTION_TURN_RADIANS);
+        let turn_wave =
+            (index as f32 * heading_frequency + heading_phase).sin() * 0.72_f32.to_radians();
+        let turn_jitter = rng.range_f32(-0.25_f32.to_radians(), 0.25_f32.to_radians());
+        heading_angle += (spiral_turn + turn_wave + turn_jitter)
+            .clamp(-MAX_SECTION_TURN_RADIANS, MAX_SECTION_TURN_RADIANS);
         let heading = Vec3::new(heading_angle.cos(), 0.0, heading_angle.sin()).normalize_or_zero();
         let mut step_distance = rng.range_f32(CELL_SIZE * 5.8, CELL_SIZE * 8.4);
         let projected_gap = projected_gap(step_distance, rooms.last().unwrap().size, room_size);
@@ -1455,7 +1606,9 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
                 rng.range_f32(CELL_SIZE * 5.0, CELL_SIZE * 8.0)
             }
         };
-        let descent = rng.range_f32(template.min_rise, template.max_rise) + 1.2 + difficulty * 1.1;
+        let descent = rng.range_f32(template.min_rise, template.max_rise)
+            + lerp(8.5, 15.0, difficulty)
+            + difficulty * 4.8;
         current_height -= descent;
         let right = Vec3::new(-heading.z, 0.0, heading.x);
         let bend_scale = if matches!(template.kind, ModuleKind::SurfRamp | ModuleKind::StairRun) {
@@ -1468,7 +1621,7 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
         } else {
             0.16 + difficulty * 0.14
         };
-        let bend = right * rng.range_f32(-0.8, 0.8) * bend_scale;
+        let bend = right * rng.range_f32(-1.0, 1.0) * bend_scale * 1.25;
         let mut top = Vec3::new(current_top.x, current_height, current_top.z)
             + heading * step_distance
             + bend;
@@ -2017,8 +2170,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.0,
             max_difficulty: 1.0,
             weight: 5,
-            min_rise: 12.0,
-            max_rise: 42.0,
+            min_rise: 20.0,
+            max_rise: 58.0,
             min_gap: 26.0,
             max_gap: 320.0,
             shortcut_eligible: false,
@@ -2030,8 +2183,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.12,
             max_difficulty: 1.0,
             weight: 7,
-            min_rise: 24.0,
-            max_rise: 110.0,
+            min_rise: 38.0,
+            max_rise: 150.0,
             min_gap: 40.0,
             max_gap: 520.0,
             shortcut_eligible: false,
@@ -2043,8 +2196,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.15,
             max_difficulty: 0.42,
             weight: 2,
-            min_rise: 8.0,
-            max_rise: 20.0,
+            min_rise: 14.0,
+            max_rise: 30.0,
             min_gap: 18.0,
             max_gap: 64.0,
             shortcut_eligible: false,
@@ -2056,8 +2209,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.28,
             max_difficulty: 0.9,
             weight: 4,
-            min_rise: 10.0,
-            max_rise: 28.0,
+            min_rise: 16.0,
+            max_rise: 40.0,
             min_gap: 20.0,
             max_gap: 90.0,
             shortcut_eligible: true,
@@ -2069,8 +2222,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.22,
             max_difficulty: 0.45,
             weight: 1,
-            min_rise: 10.0,
-            max_rise: 22.0,
+            min_rise: 14.0,
+            max_rise: 32.0,
             min_gap: 20.0,
             max_gap: 70.0,
             shortcut_eligible: true,
@@ -2082,8 +2235,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.34,
             max_difficulty: 0.95,
             weight: 4,
-            min_rise: 10.0,
-            max_rise: 28.0,
+            min_rise: 16.0,
+            max_rise: 40.0,
             min_gap: 18.0,
             max_gap: 96.0,
             shortcut_eligible: true,
@@ -2095,8 +2248,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.35,
             max_difficulty: 1.0,
             weight: 5,
-            min_rise: 12.0,
-            max_rise: 32.0,
+            min_rise: 18.0,
+            max_rise: 46.0,
             min_gap: 22.0,
             max_gap: 110.0,
             shortcut_eligible: true,
@@ -2108,8 +2261,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.28,
             max_difficulty: 1.0,
             weight: 5,
-            min_rise: 10.0,
-            max_rise: 30.0,
+            min_rise: 16.0,
+            max_rise: 42.0,
             min_gap: 20.0,
             max_gap: 120.0,
             shortcut_eligible: false,
@@ -2121,8 +2274,8 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             min_difficulty: 0.18,
             max_difficulty: 0.32,
             weight: 1,
-            min_rise: 8.0,
-            max_rise: 18.0,
+            min_rise: 12.0,
+            max_rise: 26.0,
             min_gap: 18.0,
             max_gap: 52.0,
             shortcut_eligible: false,
@@ -2142,68 +2295,223 @@ fn spawn_run_world(
     blueprint: &RunBlueprint,
     collected_treasures: &HashSet<u64>,
     unlocked_shortcuts: &HashSet<u64>,
+    checkpoint_index: usize,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    asset_cache: &mut WorldAssetCache,
 ) -> RunSnapshot {
     spawn_sky_backdrop(blueprint, commands, meshes, materials);
     spawn_floating_spheres(blueprint, commands, meshes, materials);
 
-    let mut checkpoints = Vec::new();
-    let mut total_treasures = 0;
-
-    for room in &blueprint.rooms {
-        let layout = build_room_layout(room);
-        total_treasures += spawn_layout(
-            &layout,
+    let chunk_order = desired_chunk_window(blueprint, checkpoint_index);
+    for chunk in &chunk_order {
+        spawn_chunk(
+            *chunk,
+            blueprint,
             collected_treasures,
             unlocked_shortcuts,
             commands,
             meshes,
             materials,
+            asset_cache,
         );
-        if room.checkpoint_slot.is_some() {
-            checkpoints.push(room.top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0));
+    }
+
+    build_run_snapshot(blueprint, chunk_order.into_iter().collect())
+}
+
+fn respawn_active_chunks(
+    blueprint: &RunBlueprint,
+    collected_treasures: &HashSet<u64>,
+    unlocked_shortcuts: &HashSet<u64>,
+    checkpoint_index: usize,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    asset_cache: &mut WorldAssetCache,
+) -> RunSnapshot {
+    let chunk_order = desired_chunk_window(blueprint, checkpoint_index);
+    for chunk in &chunk_order {
+        spawn_chunk(
+            *chunk,
+            blueprint,
+            collected_treasures,
+            unlocked_shortcuts,
+            commands,
+            meshes,
+            materials,
+            asset_cache,
+        );
+    }
+
+    build_run_snapshot(blueprint, chunk_order.into_iter().collect())
+}
+
+fn build_run_snapshot(
+    blueprint: &RunBlueprint,
+    active_chunks: HashSet<WorldChunkKey>,
+) -> RunSnapshot {
+    RunSnapshot {
+        checkpoints: blueprint
+            .rooms
+            .iter()
+            .filter(|room| room.checkpoint_slot.is_some())
+            .map(|room| room.top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0))
+            .collect(),
+        total_treasures: blueprint
+            .branches
+            .iter()
+            .filter(|branch| branch.treasure_id.is_some())
+            .count(),
+        active_chunks,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StreamWindow {
+    start_room: usize,
+    frontier_room: usize,
+}
+
+fn stream_focus_room(
+    blueprint: &RunBlueprint,
+    checkpoint_index: usize,
+    player_position: Vec3,
+) -> usize {
+    let last_room = blueprint.rooms.len().saturating_sub(1);
+    let checkpoint_index = checkpoint_index.min(last_room);
+    let search_start = checkpoint_index.saturating_sub(1);
+    let search_end = (checkpoint_index + STREAM_AHEAD_ROOMS + 4).min(last_room);
+    let mut best_room = checkpoint_index;
+    let mut best_score = f32::INFINITY;
+
+    for room in &blueprint.rooms[search_start..=search_end] {
+        let offset = room.top - player_position;
+        let horizontal = offset.xz().length();
+        let vertical = offset.y.abs() * 0.3;
+        let progression_bias = (room.index.saturating_sub(checkpoint_index)) as f32 * 1.8;
+        let score = horizontal + vertical + progression_bias;
+        if score < best_score {
+            best_score = score;
+            best_room = room.index;
         }
     }
 
+    best_room.max(checkpoint_index)
+}
+
+fn stream_window(blueprint: &RunBlueprint, focus_room: usize) -> StreamWindow {
+    let last_room = blueprint.rooms.len().saturating_sub(1);
+    let focus_room = focus_room.min(last_room);
+    let start_room = focus_room.saturating_sub(STREAM_BEHIND_ROOMS);
+    let end_room = (focus_room + STREAM_AHEAD_ROOMS).min(last_room);
+    let frontier_room = (end_room + 1).min(last_room);
+
+    StreamWindow {
+        start_room,
+        frontier_room,
+    }
+}
+
+fn desired_chunk_window(blueprint: &RunBlueprint, focus_room: usize) -> Vec<WorldChunkKey> {
+    let window = stream_window(blueprint, focus_room);
+    let mut chunks = Vec::new();
+
+    for room_index in window.start_room..=window.frontier_room {
+        chunks.push(WorldChunkKey::Room(room_index));
+    }
     for segment in &blueprint.segments {
-        let layout = build_segment_layout(segment, &blueprint.rooms, unlocked_shortcuts);
-        total_treasures += spawn_layout(
-            &layout,
-            collected_treasures,
-            unlocked_shortcuts,
-            commands,
-            meshes,
-            materials,
-        );
+        if segment.from >= window.start_room.saturating_sub(1)
+            && segment.from <= window.frontier_room
+        {
+            chunks.push(WorldChunkKey::Segment(segment.index));
+        }
+    }
+    for (branch_index, branch) in blueprint.branches.iter().enumerate() {
+        if (window.start_room..=window.frontier_room).contains(&branch.room_index) {
+            chunks.push(WorldChunkKey::Branch(branch_index));
+        }
+    }
+    if window.frontier_room + 1 == blueprint.rooms.len() {
+        chunks.push(WorldChunkKey::Summit);
     }
 
-    for (index, branch) in blueprint.branches.iter().enumerate() {
-        let layout = build_branch_layout(index, branch, &blueprint.rooms, unlocked_shortcuts);
-        total_treasures += spawn_layout(
-            &layout,
-            collected_treasures,
-            unlocked_shortcuts,
-            commands,
-            meshes,
-            materials,
-        );
-    }
+    chunks
+}
 
-    let summit_layout = build_summit_layout(blueprint.rooms.last().unwrap(), blueprint.summit);
-    total_treasures += spawn_layout(
-        &summit_layout,
-        collected_treasures,
-        unlocked_shortcuts,
-        commands,
-        meshes,
-        materials,
-    );
-
-    RunSnapshot {
-        checkpoints,
-        total_treasures,
+fn spawn_chunk(
+    chunk: WorldChunkKey,
+    blueprint: &RunBlueprint,
+    collected_treasures: &HashSet<u64>,
+    unlocked_shortcuts: &HashSet<u64>,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    asset_cache: &mut WorldAssetCache,
+) {
+    match chunk {
+        WorldChunkKey::Room(index) => {
+            if let Some(room) = blueprint.rooms.get(index) {
+                let layout = build_room_layout(room);
+                let _ = spawn_layout(
+                    &layout,
+                    collected_treasures,
+                    unlocked_shortcuts,
+                    Some(chunk),
+                    commands,
+                    meshes,
+                    materials,
+                    asset_cache,
+                );
+            }
+        }
+        WorldChunkKey::Segment(index) => {
+            if let Some(segment) = blueprint.segments.get(index) {
+                let layout = build_segment_layout(segment, &blueprint.rooms, unlocked_shortcuts);
+                let _ = spawn_layout(
+                    &layout,
+                    collected_treasures,
+                    unlocked_shortcuts,
+                    Some(chunk),
+                    commands,
+                    meshes,
+                    materials,
+                    asset_cache,
+                );
+            }
+        }
+        WorldChunkKey::Branch(index) => {
+            if let Some(branch) = blueprint.branches.get(index) {
+                let layout =
+                    build_branch_layout(index, branch, &blueprint.rooms, unlocked_shortcuts);
+                let _ = spawn_layout(
+                    &layout,
+                    collected_treasures,
+                    unlocked_shortcuts,
+                    Some(chunk),
+                    commands,
+                    meshes,
+                    materials,
+                    asset_cache,
+                );
+            }
+        }
+        WorldChunkKey::Summit => {
+            if let Some(room) = blueprint.rooms.last() {
+                let layout = build_summit_layout(room, blueprint.summit);
+                let _ = spawn_layout(
+                    &layout,
+                    collected_treasures,
+                    unlocked_shortcuts,
+                    Some(chunk),
+                    commands,
+                    meshes,
+                    materials,
+                    asset_cache,
+                );
+            }
+        }
     }
 }
 
@@ -2248,7 +2556,7 @@ fn spawn_sky_backdrop(
         ..default()
     });
     let cloud_deck_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.1, 0.12, 0.18, 0.18),
+        base_color: Color::srgba(0.1, 0.12, 0.18, 0.12),
         emissive: LinearRgba::rgb(0.012, 0.016, 0.03),
         unlit: true,
         cull_mode: None,
@@ -2256,7 +2564,7 @@ fn spawn_sky_backdrop(
         ..default()
     });
     let cloud_puff_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.16, 0.18, 0.28, 0.14),
+        base_color: Color::srgba(0.16, 0.18, 0.28, 0.08),
         emissive: LinearRgba::rgb(0.02, 0.024, 0.05),
         unlit: true,
         cull_mode: None,
@@ -2267,6 +2575,12 @@ fn spawn_sky_backdrop(
     let dome_mesh = meshes.add(Sphere::new(1.0).mesh().ico(6).unwrap());
     let cloud_mesh = meshes.add(Sphere::new(1.0).mesh().ico(4).unwrap());
     let comet_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let star_material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        emissive: LinearRgba::rgb(0.28, 0.3, 0.36),
+        unlit: true,
+        ..default()
+    });
 
     commands.spawn((
         GeneratedWorld,
@@ -2362,6 +2676,7 @@ fn spawn_sky_backdrop(
         ));
     }
 
+    let mut starfield = ColoredMeshBuilder::default();
     for star_index in 0..STAR_COUNT {
         let f = star_index as f32 / STAR_COUNT as f32;
         let theta = TAU * f * 21.0;
@@ -2377,20 +2692,15 @@ fn spawn_sky_backdrop(
         } else {
             Color::srgb(0.96, 0.98, 1.0)
         };
-        let star_material = materials.add(StandardMaterial {
-            base_color: tint,
-            emissive: LinearRgba::from(tint) * (1.3 + size * 1.25),
-            unlit: true,
-            ..default()
-        });
-        commands.spawn((
-            GeneratedWorld,
-            Name::new("Star"),
-            Mesh3d(star_mesh.clone()),
-            MeshMaterial3d(star_material),
-            Transform::from_translation(position).with_scale(Vec3::splat(size)),
-        ));
+        append_star_render_geometry(&mut starfield, position, direction, size, tint);
     }
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Starfield"),
+        Mesh3d(meshes.add(starfield.build())),
+        MeshMaterial3d(star_material.clone()),
+        Transform::default(),
+    ));
 
     for cluster_index in 0..STAR_CLUSTER_COUNT {
         let angle = TAU * (cluster_index as f32 / STAR_CLUSTER_COUNT as f32)
@@ -2405,51 +2715,41 @@ fn spawn_sky_backdrop(
         } else {
             Color::srgb(0.96, 0.92, 1.0)
         };
-        let cluster_material = materials.add(StandardMaterial {
-            base_color: cluster_tint,
-            emissive: LinearRgba::from(cluster_tint) * 1.6,
-            unlit: true,
-            ..default()
-        });
-        let mut stars = Vec::new();
+        let mut cluster_mesh = ColoredMeshBuilder::default();
         for _ in 0..sky_rng.range_usize(5, 9) {
-            stars.push((
-                Vec3::new(
-                    sky_rng.range_f32(-18.0, 18.0),
-                    sky_rng.range_f32(-7.0, 7.0),
-                    sky_rng.range_f32(-18.0, 18.0),
-                ),
+            let offset = Vec3::new(
+                sky_rng.range_f32(-18.0, 18.0),
+                sky_rng.range_f32(-7.0, 7.0),
+                sky_rng.range_f32(-18.0, 18.0),
+            );
+            let direction = (offset + Vec3::Y * 2.0).normalize_or_zero();
+            append_star_render_geometry(
+                &mut cluster_mesh,
+                offset,
+                direction,
                 sky_rng.range_f32(0.28, 0.9),
-            ));
+                cluster_tint,
+            );
         }
-        commands
-            .spawn((
-                GeneratedWorld,
-                Name::new("Star Cluster"),
-                Transform::from_translation(anchor),
-                SkyDrift {
-                    anchor,
-                    primary_axis: tangent,
-                    secondary_axis: radial,
-                    primary_amplitude: sky_rng.range_f32(6.0, 20.0),
-                    secondary_amplitude: sky_rng.range_f32(3.0, 8.0),
-                    vertical_amplitude: sky_rng.range_f32(1.2, 4.0),
-                    speed: sky_rng.range_f32(0.03, 0.08),
-                    rotation_speed: sky_rng.range_f32(-0.012, 0.012),
-                    phase: sky_rng.range_f32(0.0, TAU),
-                    base_rotation: Quat::from_rotation_y(sky_rng.range_f32(0.0, TAU)),
-                },
-            ))
-            .with_children(|parent| {
-                for (offset, size) in stars {
-                    parent.spawn((
-                        Name::new("Cluster Star"),
-                        Mesh3d(star_mesh.clone()),
-                        MeshMaterial3d(cluster_material.clone()),
-                        Transform::from_translation(offset).with_scale(Vec3::splat(size)),
-                    ));
-                }
-            });
+        commands.spawn((
+            GeneratedWorld,
+            Name::new("Star Cluster"),
+            Mesh3d(meshes.add(cluster_mesh.build())),
+            MeshMaterial3d(star_material.clone()),
+            Transform::from_translation(anchor),
+            SkyDrift {
+                anchor,
+                primary_axis: tangent,
+                secondary_axis: radial,
+                primary_amplitude: sky_rng.range_f32(6.0, 20.0),
+                secondary_amplitude: sky_rng.range_f32(3.0, 8.0),
+                vertical_amplitude: sky_rng.range_f32(1.2, 4.0),
+                speed: sky_rng.range_f32(0.03, 0.08),
+                rotation_speed: sky_rng.range_f32(-0.012, 0.012),
+                phase: sky_rng.range_f32(0.0, TAU),
+                base_rotation: Quat::from_rotation_y(sky_rng.range_f32(0.0, TAU)),
+            },
+        ));
     }
 
     for comet_index in 0..COMET_COUNT {
@@ -2466,7 +2766,7 @@ fn spawn_sky_backdrop(
             Color::srgb(0.9, 0.86, 1.0)
         };
         let tail_material = materials.add(StandardMaterial {
-            base_color: comet_tint.with_alpha(0.16),
+            base_color: comet_tint.with_alpha(0.08),
             emissive: LinearRgba::from(comet_tint) * 0.34,
             unlit: true,
             alpha_mode: AlphaMode::Blend,
@@ -2889,23 +3189,49 @@ fn spawn_layout(
     layout: &ModuleLayout,
     collected_treasures: &HashSet<u64>,
     unlocked_shortcuts: &HashSet<u64>,
+    chunk: Option<WorldChunkKey>,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    asset_cache: &mut WorldAssetCache,
 ) -> usize {
     let mut treasure_count = 0;
+    let mut render_batches = HashMap::<GameMaterialKey, ColoredMeshBuilder>::default();
     for solid in &layout.solids {
         if matches!(solid.extra, ExtraKind::Treasure { .. }) {
             treasure_count += 1;
         }
-        spawn_box_spec(
-            solid,
-            collected_treasures,
-            unlocked_shortcuts,
-            commands,
-            meshes,
-            materials,
-        );
+        if is_batchable_static_render(solid) {
+            append_static_render_geometry(&mut render_batches, solid);
+            spawn_box_collider_spec(solid, commands, chunk);
+        } else {
+            spawn_box_spec(
+                solid,
+                collected_treasures,
+                unlocked_shortcuts,
+                chunk,
+                commands,
+                meshes,
+                materials,
+                asset_cache,
+            );
+        }
+    }
+
+    for (material_key, builder) in render_batches {
+        if builder.is_empty() {
+            continue;
+        }
+        let mut entity = commands.spawn((
+            GeneratedWorld,
+            Name::new("Static Render Batch"),
+            Mesh3d(meshes.add(builder.build())),
+            MeshMaterial3d(cached_game_material(asset_cache, materials, material_key)),
+            Transform::default(),
+        ));
+        if let Some(chunk) = chunk {
+            entity.insert(ChunkMember(chunk));
+        }
     }
 
     for feature in &layout.features {
@@ -2917,10 +3243,10 @@ fn spawn_layout(
                 strength,
                 gust,
             } => {
-                commands.spawn((
+                let mut entity = commands.spawn((
                     GeneratedWorld,
                     Name::new("Wind Zone"),
-                    Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+                    Mesh3d(cached_cuboid_mesh(asset_cache, meshes, *size)),
                     MeshMaterial3d(materials.add(StandardMaterial {
                         base_color: Color::srgba(0.4, 0.75, 1.0, 0.14),
                         alpha_mode: AlphaMode::Blend,
@@ -2935,6 +3261,9 @@ fn spawn_layout(
                         gust: *gust,
                     },
                 ));
+                if let Some(chunk) = chunk {
+                    entity.insert(ChunkMember(chunk));
+                }
             }
             FeatureSpec::PointLight {
                 center,
@@ -2942,18 +3271,21 @@ fn spawn_layout(
                 range,
                 color,
             } => {
-                commands.spawn((
+                let mut entity = commands.spawn((
                     GeneratedWorld,
                     Name::new("Beacon Light"),
                     PointLight {
                         intensity: *intensity,
                         range: *range,
                         color: *color,
-                        shadows_enabled: true,
+                        shadows_enabled: false,
                         ..default()
                     },
                     Transform::from_translation(*center),
                 ));
+                if let Some(chunk) = chunk {
+                    entity.insert(ChunkMember(chunk));
+                }
             }
         }
     }
@@ -2965,9 +3297,11 @@ fn spawn_box_spec(
     spec: &SolidSpec,
     collected_treasures: &HashSet<u64>,
     unlocked_shortcuts: &HashSet<u64>,
+    chunk: Option<WorldChunkKey>,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    asset_cache: &mut WorldAssetCache,
 ) {
     if let Err(reason) = validate_solid_spec(spec) {
         eprintln!("Skipping invalid solid '{}': {}", spec.label, reason);
@@ -2981,23 +3315,26 @@ fn spawn_box_spec(
     }
 
     let mesh = match &spec.body {
-        SolidBody::StaticSurfWedge { local_points, .. } => {
-            meshes.add(build_surf_wedge_mesh(local_points))
-        }
-        _ => meshes.add(Cuboid::new(spec.size.x, spec.size.y, spec.size.z)),
+        SolidBody::StaticSurfWedge { local_points, .. } => meshes.add(build_surf_wedge_mesh(
+            local_points,
+            paint_base_color(
+                spec.paint,
+                matches!(&spec.body, SolidBody::ShortcutBridge { active: false, .. }),
+            ),
+            paint_stripe_color(spec.paint),
+        )),
+        _ => cached_cuboid_mesh(asset_cache, meshes, spec.size),
     };
-    let mut material_spec = material_for_paint(
-        spec.paint,
-        matches!(&spec.body, SolidBody::ShortcutBridge { active: false, .. }),
+    let material = cached_game_material(
+        asset_cache,
+        materials,
+        GameMaterialKey {
+            paint: spec.paint,
+            ghost: matches!(&spec.body, SolidBody::ShortcutBridge { active: false, .. }),
+            surf: matches!(&spec.body, SolidBody::StaticSurfWedge { .. }),
+            vertex_colored: matches!(&spec.body, SolidBody::StaticSurfWedge { .. }),
+        },
     );
-    if matches!(&spec.body, SolidBody::StaticSurfWedge { .. }) {
-        material_spec.cull_mode = None;
-        material_spec.perceptual_roughness = 0.12;
-        material_spec.reflectance = 0.82;
-        material_spec.metallic = 0.06;
-        material_spec.emissive += LinearRgba::rgb(0.02, 0.03, 0.02);
-    }
-    let material = materials.add(material_spec);
 
     let transform = Transform::from_translation(spec.center);
 
@@ -3008,6 +3345,9 @@ fn spawn_box_spec(
         MeshMaterial3d(material),
         transform,
     ));
+    if let Some(chunk) = chunk {
+        entity.insert(ChunkMember(chunk));
+    }
 
     match &spec.body {
         SolidBody::Static => {
@@ -3017,10 +3357,7 @@ fn spawn_box_spec(
                 CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
             ));
         }
-        SolidBody::StaticSurfWedge {
-            wall_side,
-            local_points,
-        } => {
+        SolidBody::StaticSurfWedge { local_points, .. } => {
             if let Some(collider) = Collider::convex_hull(local_points.clone()) {
                 entity.insert((
                     RigidBody::Static,
@@ -3029,14 +3366,6 @@ fn spawn_box_spec(
                     CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
                 ));
             }
-            spawn_surf_lane_stripes(
-                &mut entity,
-                local_points,
-                *wall_side,
-                spec.paint,
-                meshes,
-                materials,
-            );
         }
         SolidBody::Decoration => {}
         SolidBody::DynamicProp => {
@@ -3126,6 +3455,274 @@ fn spawn_box_spec(
             entity.insert(ShortcutTrigger { id });
         }
     }
+}
+
+#[derive(Default)]
+struct ColoredMeshBuilder {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
+}
+
+impl ColoredMeshBuilder {
+    fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    fn push_triangle(&mut self, a: Vec3, b: Vec3, c: Vec3, color: Color) {
+        let normal = (b - a).cross(c - a).normalize_or_zero();
+        let normal = if normal == Vec3::ZERO {
+            Vec3::Y
+        } else {
+            normal
+        };
+        let color = LinearRgba::from(color).to_f32_array();
+        for point in [a, b, c] {
+            self.positions.push([point.x, point.y, point.z]);
+            self.normals.push([normal.x, normal.y, normal.z]);
+            self.colors.push(color);
+        }
+    }
+
+    fn push_quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: Color) {
+        self.push_triangle(a, b, c, color);
+        self.push_triangle(a, c, d, color);
+    }
+
+    fn build(self) -> Mesh {
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+    }
+}
+
+fn is_batchable_static_render(spec: &SolidSpec) -> bool {
+    matches!(spec.extra, ExtraKind::None)
+        && matches!(
+            &spec.body,
+            SolidBody::Static | SolidBody::StaticSurfWedge { .. }
+        )
+}
+
+fn append_static_render_geometry(
+    batches: &mut HashMap<GameMaterialKey, ColoredMeshBuilder>,
+    spec: &SolidSpec,
+) {
+    let material_key = GameMaterialKey {
+        paint: spec.paint,
+        ghost: false,
+        surf: matches!(&spec.body, SolidBody::StaticSurfWedge { .. }),
+        vertex_colored: true,
+    };
+    let builder = batches.entry(material_key).or_default();
+    let base_color = paint_base_color(spec.paint, false);
+
+    match &spec.body {
+        SolidBody::Static => {
+            append_box_render_geometry(builder, spec.center, spec.size, base_color)
+        }
+        SolidBody::StaticSurfWedge { local_points, .. } => {
+            append_surf_wedge_render_geometry(
+                builder,
+                spec.center,
+                local_points,
+                base_color,
+                paint_stripe_color(spec.paint),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn append_box_render_geometry(
+    builder: &mut ColoredMeshBuilder,
+    center: Vec3,
+    size: Vec3,
+    color: Color,
+) {
+    let half = size * 0.5;
+    let nbl = center + Vec3::new(-half.x, -half.y, -half.z);
+    let nbr = center + Vec3::new(half.x, -half.y, -half.z);
+    let nfr = center + Vec3::new(half.x, -half.y, half.z);
+    let nfl = center + Vec3::new(-half.x, -half.y, half.z);
+    let tbl = center + Vec3::new(-half.x, half.y, -half.z);
+    let tbr = center + Vec3::new(half.x, half.y, -half.z);
+    let tfr = center + Vec3::new(half.x, half.y, half.z);
+    let tfl = center + Vec3::new(-half.x, half.y, half.z);
+
+    builder.push_quad(tfl, tfr, tbr, tbl, color);
+    builder.push_quad(nbl, nbr, nfr, nfl, color);
+    builder.push_quad(nfl, nfr, tfr, tfl, color);
+    builder.push_quad(nbr, nbl, tbl, tbr, color);
+    builder.push_quad(nbl, nfl, tfl, tbl, color);
+    builder.push_quad(nfr, nbr, tbr, tfr, color);
+}
+
+fn append_surf_wedge_render_geometry(
+    builder: &mut ColoredMeshBuilder,
+    center: Vec3,
+    local_points: &[Vec3],
+    base_color: Color,
+    stripe_color: Color,
+) {
+    if local_points.len() < 8 {
+        return;
+    }
+
+    let points = local_points
+        .iter()
+        .map(|point| center + *point)
+        .collect::<Vec<_>>();
+    let a = points[0];
+    let b = points[1];
+    let c = points[2];
+    let d = points[3];
+    let e = points[4];
+    let f = points[5];
+    let g = points[6];
+    let h = points[7];
+
+    builder.push_quad(a, b, d, c, base_color);
+    builder.push_quad(e, g, h, f, base_color);
+    builder.push_quad(a, c, g, e, base_color);
+    builder.push_quad(b, f, h, d, base_color);
+    builder.push_quad(a, e, f, b, base_color);
+    builder.push_quad(c, d, h, g, base_color);
+
+    let front_ridge = a;
+    let back_ridge = b;
+    let front_outer = c;
+    let back_outer = d;
+    let mut surface_normal = (back_ridge - front_ridge)
+        .cross(front_outer - front_ridge)
+        .normalize_or_zero();
+    if surface_normal.y < 0.0 {
+        surface_normal = -surface_normal;
+    }
+
+    for &(t, stripe_width, glow_width, lift) in
+        &[(0.18, 0.16, 0.32, 0.022), (0.64, 0.11, 0.22, 0.018)]
+    {
+        let front_center = front_ridge.lerp(front_outer, t);
+        let back_center = back_ridge.lerp(back_outer, t);
+        let front_face_dir = (front_outer - front_ridge).normalize_or_zero();
+        let back_face_dir = (back_outer - back_ridge).normalize_or_zero();
+        let glow_quad = [
+            front_center - front_face_dir * (glow_width * 0.5) + surface_normal * lift,
+            back_center - back_face_dir * (glow_width * 0.5) + surface_normal * lift,
+            back_center + back_face_dir * (glow_width * 0.5) + surface_normal * lift,
+            front_center + front_face_dir * (glow_width * 0.5) + surface_normal * lift,
+        ];
+        let stripe_quad = [
+            front_center - front_face_dir * (stripe_width * 0.5) + surface_normal * (lift + 0.012),
+            back_center - back_face_dir * (stripe_width * 0.5) + surface_normal * (lift + 0.012),
+            back_center + back_face_dir * (stripe_width * 0.5) + surface_normal * (lift + 0.012),
+            front_center + front_face_dir * (stripe_width * 0.5) + surface_normal * (lift + 0.012),
+        ];
+        builder.push_quad(
+            glow_quad[0],
+            glow_quad[1],
+            glow_quad[2],
+            glow_quad[3],
+            stripe_color,
+        );
+        builder.push_quad(
+            stripe_quad[0],
+            stripe_quad[1],
+            stripe_quad[2],
+            stripe_quad[3],
+            stripe_color,
+        );
+    }
+}
+
+fn spawn_box_collider_spec(
+    spec: &SolidSpec,
+    commands: &mut Commands,
+    chunk: Option<WorldChunkKey>,
+) {
+    let mut entity = commands.spawn((
+        GeneratedWorld,
+        Name::new(spec.label.clone()),
+        Transform::from_translation(spec.center),
+        GlobalTransform::default(),
+    ));
+    if let Some(chunk) = chunk {
+        entity.insert(ChunkMember(chunk));
+    }
+
+    match &spec.body {
+        SolidBody::Static => {
+            entity.insert((
+                RigidBody::Static,
+                Collider::cuboid(spec.size.x, spec.size.y, spec.size.z),
+                CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
+            ));
+        }
+        SolidBody::StaticSurfWedge { local_points, .. } => {
+            if let Some(collider) = Collider::convex_hull(local_points.clone()) {
+                entity.insert((
+                    RigidBody::Static,
+                    collider,
+                    SurfRampSurface,
+                    CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(friction) = spec.friction {
+        entity.insert(Friction::new(friction));
+    }
+}
+
+fn cached_cuboid_mesh(
+    cache: &mut WorldAssetCache,
+    meshes: &mut Assets<Mesh>,
+    size: Vec3,
+) -> Handle<Mesh> {
+    let key = MeshSizeKey::from_size(size);
+    if let Some(mesh) = cache.cuboid_meshes.get(&key) {
+        return mesh.clone();
+    }
+    let mesh = meshes.add(Cuboid::new(size.x, size.y, size.z));
+    cache.cuboid_meshes.insert(key, mesh.clone());
+    mesh
+}
+
+fn cached_game_material(
+    cache: &mut WorldAssetCache,
+    materials: &mut Assets<StandardMaterial>,
+    key: GameMaterialKey,
+) -> Handle<StandardMaterial> {
+    if let Some(material) = cache.gameplay_materials.get(&key) {
+        return material.clone();
+    }
+
+    let mut material = material_for_paint(key.paint, key.ghost);
+    if key.vertex_colored {
+        material.base_color = Color::WHITE;
+    }
+    if key.surf {
+        material.cull_mode = None;
+        material.perceptual_roughness = 0.12;
+        material.reflectance = 0.82;
+        material.metallic = 0.06;
+        material.emissive += LinearRgba::rgb(0.02, 0.03, 0.02);
+    }
+
+    let handle = materials.add(material);
+    cache.gameplay_materials.insert(key, handle.clone());
+    handle
+}
+
+fn paint_base_color(paint: PaintStyle, ghost: bool) -> Color {
+    material_for_paint(paint, ghost).base_color
 }
 
 fn validate_solid_spec(spec: &SolidSpec) -> Result<(), String> {
@@ -3635,17 +4232,16 @@ fn append_css_surf_sequence(
     theme: Theme,
     intense: bool,
 ) {
-    let along_x = forward.x.abs() > 0.5;
     let direct_distance = start.distance(end).max(12.0);
     let entry_margin = if intense {
-        (direct_distance * 0.06).clamp(8.0, 18.0)
+        (direct_distance * 0.025).clamp(2.2, 6.0)
     } else {
-        (direct_distance * 0.05).clamp(6.0, 14.0)
+        (direct_distance * 0.02).clamp(1.8, 4.8)
     };
     let exit_margin = if intense {
-        (direct_distance * 0.04).clamp(6.0, 14.0)
+        (direct_distance * 0.02).clamp(1.8, 4.8)
     } else {
-        (direct_distance * 0.035).clamp(5.0, 11.0)
+        (direct_distance * 0.016).clamp(1.4, 4.0)
     };
     let surf_start = start + forward * entry_margin + Vec3::Y * 0.4;
     let surf_end = end - forward * exit_margin + Vec3::Y * 0.18;
@@ -3656,15 +4252,15 @@ fn append_css_surf_sequence(
         ((total_distance / 8.2).round() as usize).clamp(28, 72)
     };
     let curve_cycles = if intense {
-        rng.range_f32(0.7, 1.2)
+        rng.range_f32(1.0, 1.6)
     } else {
-        rng.range_f32(0.5, 0.95)
+        rng.range_f32(0.75, 1.25)
     };
     let curve_phase = rng.range_f32(0.0, TAU);
     let curve_amplitude = if intense {
-        rng.range_f32(0.45, 0.9)
+        rng.range_f32(0.62, 1.15)
     } else {
-        rng.range_f32(0.3, 0.7)
+        rng.range_f32(0.42, 0.88)
     };
     let ramp_span = if intense {
         rng.range_f32(9.6, 13.8)
@@ -3681,8 +4277,6 @@ fn append_css_surf_sequence(
     } else {
         rng.range_f32(2.6, 4.2)
     };
-    let start_deck_length = entry_margin + if intense { 4.2 } else { 3.8 };
-    let finish_deck_length = exit_margin + if intense { 3.8 } else { 3.2 };
 
     let mut centerline = Vec::with_capacity(segment_count + 1);
     for sample in 0..=segment_count {
@@ -3721,21 +4315,6 @@ fn append_css_surf_sequence(
         seam_rights.push(seam_right);
     }
 
-    layout.solids.push(SolidSpec {
-        owner,
-        label: if intense {
-            "Surf Start Deck".into()
-        } else {
-            "Flow Start Deck".into()
-        },
-        center: top_to_center(start.lerp(surf_start, 0.52) + Vec3::Y * 0.16, 0.28),
-        size: axis_box_size(along_x, start_deck_length, 0.28, 4.8),
-        paint: PaintStyle::ThemeFloor(theme),
-        body: SolidBody::Static,
-        friction: Some(0.035),
-        extra: ExtraKind::None,
-    });
-
     for index in 0..segment_count {
         let section_start = centerline[index];
         let section_end = centerline[index + 1];
@@ -3771,26 +4350,11 @@ fn append_css_surf_sequence(
                     wall_side: side,
                     local_points,
                 },
-                friction: Some(if intense { 0.018 } else { 0.024 }),
+                friction: Some(0.0),
                 extra: ExtraKind::None,
             });
         }
     }
-
-    layout.solids.push(SolidSpec {
-        owner,
-        label: if intense {
-            "Surf Finish Deck".into()
-        } else {
-            "Flow Finish Deck".into()
-        },
-        center: top_to_center(surf_end.lerp(end, 0.48) + Vec3::Y * 0.16, 0.28),
-        size: axis_box_size(along_x, finish_deck_length, 0.28, 4.4),
-        paint: PaintStyle::ThemeFloor(theme),
-        body: SolidBody::Static,
-        friction: Some(0.032),
-        extra: ExtraKind::None,
-    });
 }
 
 fn append_descending_pad_sequence(
@@ -3814,14 +4378,14 @@ fn append_descending_pad_sequence(
     let along_x = forward.x.abs() > 0.5;
     let distance = start.distance(end).max(12.0);
     let pad_count = ((distance / cadence).round() as usize).clamp(6, 28);
-    let weave_cycles = rng.range_f32(0.8, 1.8);
+    let weave_cycles = rng.range_f32(1.15, 2.35);
     let phase = rng.range_f32(0.0, TAU);
 
     for step in 0..pad_count {
         let t = (step + 1) as f32 / (pad_count + 1) as f32;
         let envelope = (t * PI).sin().max(0.0).powf(0.75);
         let weave = (t * weave_cycles * TAU + phase).sin();
-        let mut top = start.lerp(end, t) + right * weave * lateral_amplitude * envelope;
+        let mut top = start.lerp(end, t) + right * weave * lateral_amplitude * 1.18 * envelope;
         top.y += pad_height * 0.45;
         layout.solids.push(SolidSpec {
             owner,
@@ -4186,88 +4750,6 @@ fn paint_stripe_color(paint: PaintStyle) -> Color {
     }
 }
 
-fn spawn_surf_lane_stripes(
-    entity: &mut EntityCommands,
-    local_points: &[Vec3],
-    _wall_side: f32,
-    paint: PaintStyle,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-) {
-    if local_points.len() < 4 {
-        return;
-    }
-    let stripe_color = paint_stripe_color(paint);
-    let stripe_material = materials.add(StandardMaterial {
-        base_color: stripe_color.with_alpha(0.72),
-        emissive: LinearRgba::from(stripe_color) * 0.66,
-        unlit: true,
-        alpha_mode: AlphaMode::Blend,
-        cull_mode: None,
-        ..default()
-    });
-    let glow_material = materials.add(StandardMaterial {
-        base_color: stripe_color.with_alpha(0.22),
-        emissive: LinearRgba::from(stripe_color) * 0.3,
-        unlit: true,
-        alpha_mode: AlphaMode::Blend,
-        cull_mode: None,
-        ..default()
-    });
-    let front_ridge = local_points[0];
-    let back_ridge = local_points[1];
-    let front_outer = local_points[2];
-    let back_outer = local_points[3];
-    let mut surface_normal = (back_ridge - front_ridge)
-        .cross(front_outer - front_ridge)
-        .normalize_or_zero();
-    if surface_normal.y < 0.0 {
-        surface_normal = -surface_normal;
-    }
-
-    entity.with_children(|parent| {
-        for &(t, stripe_width, glow_width, lift) in
-            &[(0.18, 0.16, 0.3, 0.022), (0.64, 0.11, 0.22, 0.018)]
-        {
-            let front_center = front_ridge.lerp(front_outer, t);
-            let back_center = back_ridge.lerp(back_outer, t);
-            let front_face_dir = (front_outer - front_ridge).normalize_or_zero();
-            let back_face_dir = (back_outer - back_ridge).normalize_or_zero();
-            let glow_quad = [
-                front_center - front_face_dir * (glow_width * 0.5) + surface_normal * lift,
-                back_center - back_face_dir * (glow_width * 0.5) + surface_normal * lift,
-                back_center + back_face_dir * (glow_width * 0.5) + surface_normal * lift,
-                front_center + front_face_dir * (glow_width * 0.5) + surface_normal * lift,
-            ];
-            let stripe_quad = [
-                front_center - front_face_dir * (stripe_width * 0.5)
-                    + surface_normal * (lift + 0.012),
-                back_center - back_face_dir * (stripe_width * 0.5)
-                    + surface_normal * (lift + 0.012),
-                back_center
-                    + back_face_dir * (stripe_width * 0.5)
-                    + surface_normal * (lift + 0.012),
-                front_center
-                    + front_face_dir * (stripe_width * 0.5)
-                    + surface_normal * (lift + 0.012),
-            ];
-
-            parent.spawn((
-                Name::new("Surf Glow Stripe"),
-                Mesh3d(meshes.add(build_quad_mesh(glow_quad))),
-                MeshMaterial3d(glow_material.clone()),
-                Transform::default(),
-            ));
-            parent.spawn((
-                Name::new("Surf Neon Stripe"),
-                Mesh3d(meshes.add(build_quad_mesh(stripe_quad))),
-                MeshMaterial3d(stripe_material.clone()),
-                Transform::default(),
-            ));
-        }
-    });
-}
-
 fn projected_gap(step_distance: f32, from_size: Vec2, to_size: Vec2) -> f32 {
     step_distance - (from_size.max_element() + to_size.max_element()) * 0.5
 }
@@ -4498,6 +4980,54 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn chunk_window_keeps_frontier_connectors_loaded() {
+        let blueprint = build_run_blueprint(0x51eed_u64);
+        let focus_room = 8.min(blueprint.rooms.len().saturating_sub(2));
+        let window = stream_window(&blueprint, focus_room);
+        let chunks = desired_chunk_window(&blueprint, focus_room);
+
+        assert!(
+            chunks.contains(&WorldChunkKey::Room(window.frontier_room)),
+            "frontier room {} should be loaded",
+            window.frontier_room
+        );
+
+        if window.frontier_room > 0 {
+            assert!(
+                chunks.contains(&WorldChunkKey::Segment(window.frontier_room - 1)),
+                "connector segment {} -> {} should be loaded",
+                window.frontier_room - 1,
+                window.frontier_room
+            );
+        }
+
+        if window.frontier_room < blueprint.rooms.len() - 1 {
+            assert!(
+                chunks.contains(&WorldChunkKey::Segment(window.frontier_room)),
+                "frontier exit segment {} -> {} should be preloaded",
+                window.frontier_room,
+                window.frontier_room + 1
+            );
+        }
+    }
+
+    #[test]
+    fn stream_focus_advances_with_player_position() {
+        let blueprint = build_run_blueprint(0x5eaf_u64);
+        let checkpoint = 4.min(blueprint.rooms.len().saturating_sub(3));
+        let ahead_room = (checkpoint + 3).min(blueprint.rooms.len() - 1);
+        let player_position = blueprint.rooms[ahead_room].top + Vec3::new(0.0, 1.0, 0.0);
+        let focus = stream_focus_room(&blueprint, checkpoint, player_position);
+
+        assert!(
+            focus >= ahead_room.saturating_sub(1),
+            "focus room {} should advance toward the player's actual route position {}",
+            focus,
+            ahead_room
+        );
+    }
 }
 
 fn axis_box_size(along_x: bool, length: f32, height: f32, width: f32) -> Vec3 {
@@ -4554,71 +5084,45 @@ fn surf_wedge_from_seams(
     (center, local_points, max - min)
 }
 
-fn build_prism_mesh(points: &[Vec3]) -> Mesh {
-    let a = points[0];
-    let b = points[1];
-    let c = points[2];
-    let d = points[3];
-    let e = points[4];
-    let f = points[5];
-    let g = points[6];
-    let h = points[7];
-
-    let triangles = vec![
-        [a, b, d],
-        [a, d, c],
-        [e, g, h],
-        [e, h, f],
-        [a, c, g],
-        [a, g, e],
-        [b, f, h],
-        [b, h, d],
-        [a, e, f],
-        [a, f, b],
-        [c, d, h],
-        [c, h, g],
-    ];
-
-    let positions: Vec<[f32; 3]> = triangles
-        .into_iter()
-        .flatten()
-        .map(|point| [point.x, point.y, point.z])
-        .collect();
-
-    Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_computed_flat_normals()
+fn build_surf_wedge_mesh(points: &[Vec3], base_color: Color, stripe_color: Color) -> Mesh {
+    let mut builder = ColoredMeshBuilder::default();
+    append_surf_wedge_render_geometry(&mut builder, Vec3::ZERO, points, base_color, stripe_color);
+    builder.build()
 }
 
-fn build_surf_wedge_mesh(points: &[Vec3]) -> Mesh {
-    build_prism_mesh(points)
-}
+fn append_star_render_geometry(
+    builder: &mut ColoredMeshBuilder,
+    center: Vec3,
+    outward: Vec3,
+    size: f32,
+    color: Color,
+) {
+    let outward = if outward == Vec3::ZERO {
+        Vec3::Y
+    } else {
+        outward.normalize_or_zero()
+    };
+    let tangent = if outward.y.abs() < 0.95 {
+        outward.cross(Vec3::Y).normalize_or_zero()
+    } else {
+        outward.cross(Vec3::X).normalize_or_zero()
+    };
+    let bitangent = outward.cross(tangent).normalize_or_zero();
+    let top = center + bitangent * size;
+    let bottom = center - bitangent * size;
+    let left = center - tangent * size;
+    let right = center + tangent * size;
+    let front = center + outward * size * 0.55;
+    let back = center - outward * size * 0.55;
 
-fn build_quad_mesh(points: [Vec3; 4]) -> Mesh {
-    let positions = vec![
-        [points[0].x, points[0].y, points[0].z],
-        [points[1].x, points[1].y, points[1].z],
-        [points[2].x, points[2].y, points[2].z],
-        [points[0].x, points[0].y, points[0].z],
-        [points[2].x, points[2].y, points[2].z],
-        [points[3].x, points[3].y, points[3].z],
-        [points[0].x, points[0].y, points[0].z],
-        [points[2].x, points[2].y, points[2].z],
-        [points[1].x, points[1].y, points[1].z],
-        [points[0].x, points[0].y, points[0].z],
-        [points[3].x, points[3].y, points[3].z],
-        [points[2].x, points[2].y, points[2].z],
-    ];
-
-    Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_computed_flat_normals()
+    builder.push_triangle(top, right, front, color);
+    builder.push_triangle(top, front, left, color);
+    builder.push_triangle(top, left, back, color);
+    builder.push_triangle(top, back, right, color);
+    builder.push_triangle(bottom, front, right, color);
+    builder.push_triangle(bottom, left, front, color);
+    builder.push_triangle(bottom, back, left, color);
+    builder.push_triangle(bottom, right, back, color);
 }
 
 #[cfg(test)]

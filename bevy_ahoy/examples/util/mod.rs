@@ -129,6 +129,9 @@ fn update_debug_text(
 #[reflect(Component)]
 struct DebugText;
 
+#[derive(Component)]
+pub(super) struct ControlsOverlay;
+
 fn setup_ui(mut commands: Commands) {
     commands.spawn((
         Node::default(),
@@ -144,6 +147,7 @@ fn setup_ui(mut commands: Commands) {
             padding: UiRect::all(px(10.0)),
             ..default()
         },
+        ControlsOverlay,
         Text::new(
             "Controls:\nWASD: move\nSpace: jump\nCtrl: crouch\nEsc: free mouse\nR: reset position\nBacktick: Toggle Debug Menu",
         ),
@@ -226,7 +230,7 @@ fn reset_player_inner(
     let Ok(mut camera_transform) = camera.single_mut(world) else {
         return;
     };
-    camera_transform.rotation = Quat::IDENTITY;
+    camera_transform.rotation = spawner_transform.rotation;
 }
 
 fn tweak_camera(
