@@ -63,13 +63,22 @@ const CHECKPOINT_RADIUS: f32 = 2.8;
 const SUMMIT_RADIUS: f32 = 4.5;
 const SHORTCUT_TRIGGER_RADIUS: f32 = 2.0;
 const SKY_RADIUS: f32 = 950.0;
-const MAX_SECTION_TURN_RADIANS: f32 = 4.9_f32.to_radians();
+const STAR_SIZE_MULTIPLIER: f32 = 12.0;
+const STAR_CLUSTER_SIZE_MULTIPLIER: f32 = 12.0;
+const COMET_SIZE_MULTIPLIER: f32 = 12.0;
+const MANUAL_MOON_SIZE_MULTIPLIER: f32 = 28.0;
+const MAJOR_CELESTIAL_RADIUS_MULTIPLIER: f32 = 70.0;
+const MOON_CELESTIAL_RADIUS_MULTIPLIER: f32 = 60.0;
+const DECOR_CELESTIAL_RADIUS_MULTIPLIER: f32 = 50.0;
+const MAX_SECTION_TURN_RADIANS: f32 = 22.0_f32.to_radians();
 const STAR_COUNT: usize = 1100;
-const STAR_CLUSTER_COUNT: usize = 10;
-const COMET_COUNT: usize = 6;
-const CLOUD_PUFF_COUNT: usize = 18;
+const STAR_CLUSTER_COUNT: usize = 6;
+const COMET_COUNT: usize = 4;
+const CLOUD_PUFF_COUNT: usize = 8;
 const STREAM_BEHIND_ROOMS: usize = 2;
 const STREAM_AHEAD_ROOMS: usize = 12;
+const INFINITE_APPEND_TRIGGER_ROOMS: usize = 5;
+const INFINITE_APPEND_BATCH_ROOMS: usize = 16;
 const PHYSICS_SUBSTEPS: u32 = 12;
 const PLAYER_GRAVITY: f32 = 29.0;
 const PLAYER_STEP_SIZE: f32 = 1.0;
@@ -80,8 +89,22 @@ const SURF_STEP_SIZE: f32 = 0.0;
 const SURF_GROUND_DISTANCE: f32 = 0.012;
 const SURF_STEP_DOWN_DETECTION_DISTANCE: f32 = 0.03;
 const SURF_SKIN_WIDTH: f32 = 0.003;
+const BHOP_OBJECT_SCALE: f32 = 5.0;
+const BHOP_CADENCE_SCALE: f32 = 4.1;
 const PLAYER_MOVE_AND_SLIDE_ITERATIONS: usize = 8;
 const PLAYER_DEPENETRATION_ITERATIONS: usize = 8;
+const CHECKPOINT_DEATH_MARGIN: f32 = 180.0;
+const ATMOSPHERE_PROGRESS_DEPTH: f32 = 1800.0;
+const ROUTE_LINE_LATERAL_SPAN: f32 = 7.6;
+const ROUTE_LINE_TRICK_VERTICAL_BIAS: f32 = 1.1;
+const ROUTE_LINE_SAFE_WIDTH_SCALE: f32 = 1.18;
+const ROUTE_LINE_SPEED_WIDTH_SCALE: f32 = 1.0;
+const ROUTE_LINE_TRICK_WIDTH_SCALE: f32 = 0.9;
+const ROUTE_LINE_MIN_CORRIDOR_GAP: f32 = 4.2;
+const ROUTE_LINE_EDGE_TAPER: f32 = 0.92;
+const ENABLE_PARALLEL_ROUTE_GEOMETRY: bool = false;
+const LANDMARK_OFFSET_RADIUS: f32 = 168.0;
+const LANDMARK_VERTICAL_OFFSET: f32 = 78.0;
 
 type SocketMask = u32;
 const SOCKET_SAFE_REST: SocketMask = 1 << 0;
@@ -176,12 +199,12 @@ fn basic_game_asset_path() -> String {
 
 fn night_bloom() -> Bloom {
     let mut bloom = Bloom::NATURAL;
-    bloom.intensity = 0.44;
-    bloom.low_frequency_boost = 0.88;
+    bloom.intensity = 0.3;
+    bloom.low_frequency_boost = 0.68;
     bloom.low_frequency_boost_curvature = 0.8;
-    bloom.high_pass_frequency = 0.58;
-    bloom.prefilter.threshold = 0.32;
-    bloom.prefilter.threshold_softness = 0.28;
+    bloom.high_pass_frequency = 0.64;
+    bloom.prefilter.threshold = 0.46;
+    bloom.prefilter.threshold_softness = 0.2;
     bloom
 }
 
@@ -378,17 +401,14 @@ fn update_hud(
         .first()
         .map(|checkpoint| checkpoint.y)
         .unwrap_or(current_height);
-    let finish_height = run.summit.y;
-    let total_descent = (start_height - finish_height).max(1.0);
-    let descended = (start_height - current_height).clamp(0.0, total_descent);
-    let progress = (descended / total_descent).clamp(0.0, 1.0) * 100.0;
+    let descended = (start_height - current_height).max(0.0);
     let elapsed = run.timer.elapsed_secs();
 
     hud.0 = format!(
         "Chronoclimb\n\
          Seed: {seed:016x}\n\
-         Floors: {floors} | Checkpoint: {checkpoint}/{checkpoint_total}\n\
-         Altitude: {height:.1}m -> {finish:.1}m | Descent {descended:.1}m / {total_descent:.1}m ({progress:.0}%)\n\
+         Sections Generated: {floors} | Checkpoint: {checkpoint}/{checkpoint_total}\n\
+         Altitude: {height:.1}m | Total Descent {descended:.1}m\n\
          Speed: {speed:.1} u/s\n\
          Time: {elapsed:.1}s | Deaths: {deaths}\n\
          Gen: attempts {attempts}, repairs {repairs}, overlaps {overlaps}, clearance {clearance}, reach {reach}",
@@ -397,10 +417,7 @@ fn update_hud(
         checkpoint = run.current_checkpoint + 1,
         checkpoint_total = run.checkpoints.len(),
         height = current_height,
-        finish = finish_height,
         descended = descended,
-        total_descent = total_descent,
-        progress = progress,
         speed = speed,
         elapsed = elapsed,
         deaths = run.deaths,
@@ -413,14 +430,11 @@ fn update_hud(
 }
 
 fn run_descent_progress(run: &RunState, current_height: f32) -> f32 {
-    let start_height = run.blueprint.rooms.first().map_or(0.0, |room| room.top.y);
-    let finish_height = run
-        .blueprint
-        .rooms
-        .last()
-        .map_or(run.summit.y, |room| room.top.y);
-    let total_descent = (start_height - finish_height).max(1.0);
-    ((start_height - current_height) / total_descent).clamp(0.0, 1.0)
+    let start_height = run
+        .checkpoints
+        .first()
+        .map_or(current_height, |checkpoint| checkpoint.y);
+    ((start_height - current_height) / ATMOSPHERE_PROGRESS_DEPTH).clamp(0.0, 1.0)
 }
 
 fn smoothstep01(t: f32) -> f32 {
@@ -486,10 +500,10 @@ fn evolve_atmosphere_with_progress(
         );
         grading.global.exposure = lerp(0.7, 0.58, progress);
         grading.global.post_saturation = lerp(1.02, 1.12, progress);
-        bloom.intensity = lerp(0.28, 0.4, progress);
-        bloom.low_frequency_boost = lerp(0.7, 0.92, progress);
-        bloom.prefilter.threshold = lerp(0.42, 0.3, progress);
-        bloom.prefilter.threshold_softness = lerp(0.22, 0.3, progress);
+        bloom.intensity = lerp(0.2, 0.28, progress);
+        bloom.low_frequency_boost = lerp(0.52, 0.72, progress);
+        bloom.prefilter.threshold = lerp(0.52, 0.4, progress);
+        bloom.prefilter.threshold_softness = lerp(0.16, 0.22, progress);
     }
 
     for (kind, mut light) in &mut lights {
@@ -567,6 +581,18 @@ fn evolve_atmosphere_with_progress(
                     progress,
                 )) * 0.92;
             }
+            AtmosphereMaterialKind::NebulaRibbon => {
+                material.base_color = mix_color(
+                    Color::srgba(0.24, 0.16, 0.3, 0.07),
+                    Color::srgba(0.28, 0.18, 0.36, 0.08),
+                    progress,
+                );
+                material.emissive = LinearRgba::from(mix_color(
+                    Color::srgb(0.3, 0.18, 0.38),
+                    Color::srgb(0.44, 0.24, 0.46),
+                    progress,
+                )) * 0.74;
+            }
             AtmosphereMaterialKind::Aurora => {
                 material.emissive = LinearRgba::from(mix_color(
                     Color::srgb(0.16, 0.72, 0.82),
@@ -585,6 +611,30 @@ fn evolve_atmosphere_with_progress(
                     Color::srgb(0.12, 0.08, 0.14),
                     progress,
                 )) * 0.8;
+            }
+            AtmosphereMaterialKind::LightShaft => {
+                material.base_color = mix_color(
+                    Color::srgba(0.44, 0.56, 0.88, 0.04),
+                    Color::srgba(0.58, 0.44, 0.86, 0.045),
+                    progress,
+                );
+                material.emissive = LinearRgba::from(mix_color(
+                    Color::srgb(0.16, 0.24, 0.36),
+                    Color::srgb(0.28, 0.2, 0.42),
+                    progress,
+                )) * 0.82;
+            }
+            AtmosphereMaterialKind::DustField => {
+                material.base_color = mix_color(
+                    Color::srgba(0.28, 0.32, 0.42, 0.025),
+                    Color::srgba(0.34, 0.24, 0.4, 0.03),
+                    progress,
+                );
+                material.emissive = LinearRgba::from(mix_color(
+                    Color::srgb(0.06, 0.08, 0.14),
+                    Color::srgb(0.12, 0.08, 0.16),
+                    progress,
+                )) * 0.52;
             }
             AtmosphereMaterialKind::Celestial => {
                 material.emissive = LinearRgba::from(material.base_color.with_alpha(1.0))
@@ -649,6 +699,12 @@ fn activate_checkpoints(
                     spawn_marker.rotation =
                         respawn_look_for_checkpoint(&run.blueprint, checkpoint.index).to_quat();
                 }
+                run.death_plane = checkpoint_death_plane(
+                    &run.blueprint,
+                    &run.checkpoints,
+                    checkpoint.index,
+                    checkpoint.index,
+                );
             }
         }
     }
@@ -765,6 +821,33 @@ fn detect_failures(
     }
 }
 
+fn checkpoint_death_plane(
+    blueprint: &RunBlueprint,
+    checkpoints: &[Vec3],
+    checkpoint_index: usize,
+    focus_room: usize,
+) -> f32 {
+    let Some(last_room) = blueprint.rooms.len().checked_sub(1) else {
+        return checkpoints
+            .get(checkpoint_index)
+            .or_else(|| checkpoints.last())
+            .map(|checkpoint| checkpoint.y - CHECKPOINT_DEATH_MARGIN)
+            .unwrap_or(-CHECKPOINT_DEATH_MARGIN);
+    };
+
+    let checkpoint_room = checkpoint_index.min(last_room);
+    let end_room = focus_room
+        .max(checkpoint_room)
+        .saturating_add(STREAM_AHEAD_ROOMS + 2)
+        .min(last_room);
+    let min_room_y = blueprint.rooms[checkpoint_room..=end_room]
+        .iter()
+        .map(|room| room.top.y)
+        .fold(f32::INFINITY, f32::min);
+
+    min_room_y - CHECKPOINT_DEATH_MARGIN
+}
+
 fn stream_world_chunks(
     mut commands: Commands,
     director: Res<RunDirector>,
@@ -783,6 +866,13 @@ fn stream_world_chunks(
         .single()
         .map(|player| stream_focus_room(&run.blueprint, run.current_checkpoint, player.translation))
         .unwrap_or(run.current_checkpoint);
+    ensure_blueprint_ahead(&mut run, focus_room);
+    run.death_plane = checkpoint_death_plane(
+        &run.blueprint,
+        &run.checkpoints,
+        run.current_checkpoint,
+        focus_room,
+    );
     let desired_order = desired_chunk_window(&run.blueprint, focus_room);
     let desired_chunks = desired_order.iter().copied().collect::<HashSet<_>>();
     if desired_chunks == run.spawned_chunks {
@@ -811,6 +901,23 @@ fn stream_world_chunks(
     }
 
     run.spawned_chunks = desired_chunks;
+}
+
+fn ensure_blueprint_ahead(run: &mut RunState, focus_room: usize) {
+    let generated_rooms = run.blueprint.rooms.len();
+    let target_room_count = focus_room
+        .saturating_add(STREAM_AHEAD_ROOMS)
+        .saturating_add(INFINITE_APPEND_TRIGGER_ROOMS)
+        .saturating_add(3);
+    if generated_rooms >= target_room_count {
+        return;
+    }
+
+    let append_rooms = target_room_count
+        .saturating_add(INFINITE_APPEND_BATCH_ROOMS)
+        .saturating_sub(generated_rooms);
+    append_run_blueprint(&mut run.blueprint, append_rooms);
+    run.sync_generated_geometry();
 }
 
 fn process_run_request(
@@ -989,8 +1096,11 @@ enum AtmosphereMaterialKind {
     UpperHaze,
     HorizonGlow,
     Nebula,
+    NebulaRibbon,
     Aurora,
     CloudDeck,
+    LightShaft,
+    DustField,
     Celestial,
     Megastructure,
 }
@@ -1151,9 +1261,9 @@ impl RunState {
         let mut state = Self {
             seed: blueprint.seed,
             blueprint: blueprint.clone(),
-            floors: blueprint.floors,
+            floors: blueprint.rooms.len(),
             summit: blueprint.summit,
-            death_plane: blueprint.death_plane,
+            death_plane: checkpoint_death_plane(blueprint, &snapshot.checkpoints, 0, 0),
             checkpoints: snapshot.checkpoints,
             current_checkpoint: 0,
             deaths: 0,
@@ -1167,6 +1277,7 @@ impl RunState {
         };
         if state.checkpoints.is_empty() {
             state.checkpoints.push(blueprint.spawn);
+            state.death_plane = checkpoint_death_plane(blueprint, &state.checkpoints, 0, 0);
         }
         state
     }
@@ -1174,9 +1285,8 @@ impl RunState {
     fn apply_blueprint(&mut self, blueprint: &RunBlueprint, snapshot: RunSnapshot) {
         self.seed = blueprint.seed;
         self.blueprint = blueprint.clone();
-        self.floors = blueprint.floors;
+        self.floors = blueprint.rooms.len();
         self.summit = blueprint.summit;
-        self.death_plane = blueprint.death_plane;
         self.checkpoints = snapshot.checkpoints;
         self.total_treasures = snapshot.total_treasures;
         self.spawned_chunks = snapshot.active_chunks;
@@ -1184,6 +1294,36 @@ impl RunState {
         if self.current_checkpoint >= self.checkpoints.len() {
             self.current_checkpoint = self.checkpoints.len().saturating_sub(1);
         }
+        self.death_plane = checkpoint_death_plane(
+            &self.blueprint,
+            &self.checkpoints,
+            self.current_checkpoint,
+            self.current_checkpoint,
+        );
+    }
+
+    fn sync_generated_geometry(&mut self) {
+        self.floors = self.blueprint.rooms.len();
+        self.summit = self.blueprint.summit;
+        self.checkpoints = self
+            .blueprint
+            .rooms
+            .iter()
+            .filter(|room| room.checkpoint_slot.is_some())
+            .map(|room| room.top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0))
+            .collect();
+        if self.checkpoints.is_empty() {
+            self.checkpoints.push(self.blueprint.spawn);
+        }
+        self.current_checkpoint = self
+            .current_checkpoint
+            .min(self.checkpoints.len().saturating_sub(1));
+        self.death_plane = checkpoint_death_plane(
+            &self.blueprint,
+            &self.checkpoints,
+            self.current_checkpoint,
+            self.current_checkpoint,
+        );
     }
 }
 
@@ -1565,6 +1705,8 @@ struct RunBlueprint {
     rooms: Vec<RoomPlan>,
     segments: Vec<SegmentPlan>,
     branches: Vec<BranchPlan>,
+    zones: Vec<ZonePlan>,
+    zone_edges: Vec<ZoneEdge>,
     spawn: Vec3,
     summit: Vec3,
     death_plane: f32,
@@ -1578,8 +1720,11 @@ struct RoomPlan {
     top: Vec3,
     size: Vec2,
     theme: Theme,
+    biome: BiomeStyle,
     seed: u64,
     section: RoomSectionKind,
+    zone_index: usize,
+    layer_index: i32,
     checkpoint_slot: Option<usize>,
 }
 
@@ -1591,6 +1736,14 @@ struct SegmentPlan {
     kind: ModuleKind,
     difficulty: f32,
     seed: u64,
+    zone_index: usize,
+    zone_role: ZoneRole,
+    zone_signature: ZoneSignature,
+    biome: BiomeStyle,
+    connector: ConnectorKind,
+    flow: FlowFieldProfile,
+    route_lines: Vec<RouteLine>,
+    zone_local_t: f32,
     shortcut_id: Option<u64>,
     exit_socket: SocketMask,
 }
@@ -1623,6 +1776,12 @@ struct GenerationStats {
 enum ModuleKind {
     StairRun,
     SurfRamp,
+    WindowHop,
+    PillarAirstrafe,
+    HeadcheckRun,
+    SpeedcheckRun,
+    MovingPlatformRun,
+    ShapeGauntlet,
     MantleStack,
     WallRunHall,
     LiftChasm,
@@ -1656,6 +1815,50 @@ enum Theme {
     Ember,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BiomeStyle {
+    NeonCyber,
+    AbstractGeometry,
+    GlassNebula,
+    OrbitalIndustrial,
+    AuroraMonolith,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZoneRole {
+    Accelerator,
+    Technical,
+    Recovery,
+    Spectacle,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZoneSignature {
+    BowlCollector,
+    GiantCorkscrew,
+    BraidLanes,
+    WaveRamps,
+    SplitTransfer,
+    PillarForest,
+    ShapeGarden,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+enum RouteLine {
+    Safe,
+    Speed,
+    Trick,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LandmarkKind {
+    BrokenRing,
+    ImpossibleBridge,
+    CorkscrewTower,
+    FloatingMonolithCluster,
+    MovingMegastructure,
+}
+
 #[derive(Clone, Copy)]
 struct ModuleTemplate {
     kind: ModuleKind,
@@ -1669,6 +1872,93 @@ struct ModuleTemplate {
     min_gap: f32,
     max_gap: f32,
     shortcut_eligible: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RouteCurveArchetype {
+    Straight,
+    Carve,
+    Switchback,
+    Slalom,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PathLateralStyle {
+    Straight,
+    Serpentine,
+    Switchback,
+    Arc,
+    OneSidedArc,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZoneKind {
+    Accelerator,
+    BranchBraid,
+    LayeredLoop,
+    SpiralCorkscrew,
+    WaveField,
+    BasinCollector,
+    TransferWeb,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConnectorKind {
+    Funnel,
+    Booster,
+    Transfer,
+    Collector,
+    Splitter,
+    Crossover,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FlowFieldProfile {
+    route_curve: RouteCurveArchetype,
+    path_style: PathLateralStyle,
+    curvature: f32,
+    weave_cycles: f32,
+    lateral_amplitude: f32,
+    vertical_wave: f32,
+    noise_amplitude: f32,
+    noise_frequency: f32,
+    width_scale: f32,
+    layered_offset: f32,
+    branch_bias: f32,
+    dynamic_bias: f32,
+    drift_sign: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FlowFieldSample {
+    lateral: f32,
+    vertical: f32,
+    width_scale: f32,
+}
+
+#[derive(Clone)]
+struct ZonePlan {
+    index: usize,
+    kind: ZoneKind,
+    role: ZoneRole,
+    signature: ZoneSignature,
+    biome: BiomeStyle,
+    start_segment: usize,
+    end_segment: usize,
+    flow: FlowFieldProfile,
+    entry_connector: ConnectorKind,
+    exit_connector: ConnectorKind,
+    landmark: LandmarkKind,
+    route_lines: Vec<RouteLine>,
+    branch_targets: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct ZoneEdge {
+    from: usize,
+    to: usize,
+    connector: ConnectorKind,
+    branching: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1694,6 +1984,11 @@ struct SolidSpec {
 #[derive(Clone)]
 enum SolidBody {
     Static,
+    StaticSphere,
+    StaticCylinder,
+    StaticTrapezoid {
+        top_scale: f32,
+    },
     StaticSurfWedge {
         #[cfg_attr(not(test), allow(dead_code))]
         wall_side: f32,
@@ -1803,6 +2098,1160 @@ struct ValidationOutcome {
     first_unreachable_segment: Option<usize>,
 }
 
+fn is_primary_speed_section(kind: ModuleKind) -> bool {
+    matches!(
+        kind,
+        ModuleKind::StairRun
+            | ModuleKind::SurfRamp
+            | ModuleKind::WindowHop
+            | ModuleKind::PillarAirstrafe
+            | ModuleKind::HeadcheckRun
+            | ModuleKind::SpeedcheckRun
+            | ModuleKind::MovingPlatformRun
+            | ModuleKind::ShapeGauntlet
+    )
+}
+
+fn speed_room_size(kind: ModuleKind) -> f32 {
+    match kind {
+        ModuleKind::SurfRamp => 15.4,
+        ModuleKind::ShapeGauntlet => 15.0,
+        ModuleKind::PillarAirstrafe | ModuleKind::MovingPlatformRun => 14.8,
+        _ if is_primary_speed_section(kind) => 14.6,
+        _ => 13.2,
+    }
+}
+
+fn biome_theme(biome: BiomeStyle, fallback_index: usize, total: usize, offset: usize) -> Theme {
+    match biome {
+        BiomeStyle::NeonCyber => Theme::Frost,
+        BiomeStyle::AbstractGeometry => Theme::Stone,
+        BiomeStyle::GlassNebula => Theme::Overgrown,
+        BiomeStyle::OrbitalIndustrial => Theme::Stone,
+        BiomeStyle::AuroraMonolith => {
+            let band = (fallback_index * 4 / total.max(1) + offset) % 4;
+            [Theme::Ember, Theme::Frost, Theme::Stone, Theme::Overgrown][band]
+        }
+    }
+}
+
+fn choose_zone_role(rng: &mut RunRng, zone_index: usize, previous: Option<ZoneRole>) -> ZoneRole {
+    if zone_index == 0 {
+        return ZoneRole::Accelerator;
+    }
+
+    let cycle = [
+        ZoneRole::Accelerator,
+        ZoneRole::Technical,
+        ZoneRole::Recovery,
+        ZoneRole::Spectacle,
+    ];
+    let base = cycle[zone_index % cycle.len()];
+    let alternatives = match base {
+        ZoneRole::Accelerator => vec![
+            (ZoneRole::Accelerator, 8_u32),
+            (ZoneRole::Spectacle, 2),
+            (ZoneRole::Technical, 1),
+        ],
+        ZoneRole::Technical => vec![
+            (ZoneRole::Technical, 8_u32),
+            (ZoneRole::Accelerator, 2),
+            (ZoneRole::Recovery, 2),
+        ],
+        ZoneRole::Recovery => vec![
+            (ZoneRole::Recovery, 8_u32),
+            (ZoneRole::Spectacle, 2),
+            (ZoneRole::Accelerator, 1),
+        ],
+        ZoneRole::Spectacle => vec![
+            (ZoneRole::Spectacle, 8_u32),
+            (ZoneRole::Accelerator, 2),
+            (ZoneRole::Recovery, 1),
+        ],
+    };
+    let mut role = rng.weighted_choice(&alternatives);
+    if previous == Some(role) && rng.chance(0.45) {
+        role = base;
+    }
+    role
+}
+
+fn choose_zone_signature(
+    rng: &mut RunRng,
+    role: ZoneRole,
+    difficulty: f32,
+    previous: Option<ZoneSignature>,
+) -> ZoneSignature {
+    let mut weighted = match role {
+        ZoneRole::Accelerator => vec![
+            (ZoneSignature::WaveRamps, 5_u32),
+            (ZoneSignature::GiantCorkscrew, 4),
+            (ZoneSignature::BraidLanes, 3),
+            (ZoneSignature::SplitTransfer, 2),
+        ],
+        ZoneRole::Technical => vec![
+            (ZoneSignature::PillarForest, 5_u32),
+            (ZoneSignature::ShapeGarden, 5),
+            (ZoneSignature::SplitTransfer, 4),
+            (ZoneSignature::BraidLanes, 4),
+        ],
+        ZoneRole::Recovery => vec![
+            (ZoneSignature::BowlCollector, 6_u32),
+            (ZoneSignature::WaveRamps, 4),
+            (ZoneSignature::GiantCorkscrew, 2),
+        ],
+        ZoneRole::Spectacle => vec![
+            (ZoneSignature::GiantCorkscrew, 5_u32),
+            (ZoneSignature::BowlCollector, 4),
+            (ZoneSignature::ShapeGarden, 4),
+            (ZoneSignature::BraidLanes, 3),
+            (ZoneSignature::SplitTransfer, 2),
+        ],
+    };
+
+    if difficulty > 0.35 {
+        weighted.push((ZoneSignature::SplitTransfer, 2));
+        weighted.push((ZoneSignature::BraidLanes, 2));
+    }
+    if difficulty > 0.5 {
+        weighted.push((ZoneSignature::GiantCorkscrew, 2));
+        weighted.push((ZoneSignature::ShapeGarden, 2));
+    }
+    if difficulty > 0.65 {
+        weighted.push((ZoneSignature::PillarForest, 2));
+    }
+
+    let mut signature = rng.weighted_choice(&weighted);
+    if previous == Some(signature) && rng.chance(0.5) {
+        signature = rng.weighted_choice(&weighted);
+    }
+    signature
+}
+
+fn legacy_zone_kind(signature: ZoneSignature, role: ZoneRole) -> ZoneKind {
+    match signature {
+        ZoneSignature::BowlCollector => ZoneKind::BasinCollector,
+        ZoneSignature::GiantCorkscrew => ZoneKind::SpiralCorkscrew,
+        ZoneSignature::BraidLanes => ZoneKind::BranchBraid,
+        ZoneSignature::WaveRamps => {
+            if matches!(role, ZoneRole::Accelerator) {
+                ZoneKind::Accelerator
+            } else {
+                ZoneKind::WaveField
+            }
+        }
+        ZoneSignature::SplitTransfer => ZoneKind::TransferWeb,
+        ZoneSignature::PillarForest | ZoneSignature::ShapeGarden => ZoneKind::LayeredLoop,
+    }
+}
+
+fn choose_landmark_kind(
+    rng: &mut RunRng,
+    role: ZoneRole,
+    signature: ZoneSignature,
+) -> LandmarkKind {
+    match signature {
+        ZoneSignature::BowlCollector => rng.weighted_choice(&[
+            (LandmarkKind::BrokenRing, 4_u32),
+            (LandmarkKind::MovingMegastructure, 3),
+        ]),
+        ZoneSignature::GiantCorkscrew => LandmarkKind::CorkscrewTower,
+        ZoneSignature::BraidLanes => rng.weighted_choice(&[
+            (LandmarkKind::BrokenRing, 3_u32),
+            (LandmarkKind::ImpossibleBridge, 4),
+        ]),
+        ZoneSignature::WaveRamps => rng.weighted_choice(&[
+            (LandmarkKind::BrokenRing, 3_u32),
+            (LandmarkKind::MovingMegastructure, 4),
+        ]),
+        ZoneSignature::SplitTransfer => LandmarkKind::ImpossibleBridge,
+        ZoneSignature::PillarForest => LandmarkKind::FloatingMonolithCluster,
+        ZoneSignature::ShapeGarden => rng.weighted_choice(&[
+            (LandmarkKind::FloatingMonolithCluster, 4_u32),
+            (
+                LandmarkKind::MovingMegastructure,
+                if matches!(role, ZoneRole::Spectacle) {
+                    4
+                } else {
+                    2
+                },
+            ),
+        ]),
+    }
+}
+
+fn major_zone_route_lines(role: ZoneRole, signature: ZoneSignature) -> Vec<RouteLine> {
+    let mut lines = vec![RouteLine::Speed];
+    if !matches!(role, ZoneRole::Accelerator)
+        || matches!(
+            signature,
+            ZoneSignature::BraidLanes
+                | ZoneSignature::SplitTransfer
+                | ZoneSignature::ShapeGarden
+                | ZoneSignature::PillarForest
+        )
+    {
+        lines.insert(0, RouteLine::Safe);
+    }
+    if !matches!(role, ZoneRole::Recovery) || !matches!(signature, ZoneSignature::BowlCollector) {
+        lines.push(RouteLine::Trick);
+    } else {
+        lines.push(RouteLine::Trick);
+    }
+    lines
+}
+
+fn choose_biome_style(
+    rng: &mut RunRng,
+    difficulty: f32,
+    role: ZoneRole,
+    signature: ZoneSignature,
+    previous: Option<BiomeStyle>,
+) -> BiomeStyle {
+    let mut weighted = vec![
+        (BiomeStyle::NeonCyber, 3_u32),
+        (BiomeStyle::AbstractGeometry, 3),
+        (BiomeStyle::GlassNebula, 3),
+        (BiomeStyle::OrbitalIndustrial, 3),
+        (
+            BiomeStyle::AuroraMonolith,
+            if difficulty > 0.45 { 4 } else { 2 },
+        ),
+    ];
+
+    match role {
+        ZoneRole::Accelerator => {
+            weighted.push((BiomeStyle::NeonCyber, 4));
+            weighted.push((BiomeStyle::GlassNebula, 3));
+        }
+        ZoneRole::Technical => {
+            weighted.push((BiomeStyle::AbstractGeometry, 4));
+            weighted.push((BiomeStyle::OrbitalIndustrial, 3));
+        }
+        ZoneRole::Recovery => {
+            weighted.push((BiomeStyle::GlassNebula, 4));
+            weighted.push((BiomeStyle::AuroraMonolith, 3));
+        }
+        ZoneRole::Spectacle => {
+            weighted.push((BiomeStyle::OrbitalIndustrial, 4));
+            weighted.push((BiomeStyle::AuroraMonolith, 3));
+        }
+    }
+
+    match signature {
+        ZoneSignature::ShapeGarden | ZoneSignature::PillarForest => {
+            weighted.push((BiomeStyle::AbstractGeometry, 3));
+        }
+        ZoneSignature::GiantCorkscrew | ZoneSignature::SplitTransfer => {
+            weighted.push((BiomeStyle::OrbitalIndustrial, 3));
+        }
+        ZoneSignature::WaveRamps | ZoneSignature::BowlCollector => {
+            weighted.push((BiomeStyle::GlassNebula, 3));
+        }
+        ZoneSignature::BraidLanes => weighted.push((BiomeStyle::NeonCyber, 3)),
+    }
+
+    let mut biome = rng.weighted_choice(&weighted);
+    if previous == Some(biome) && rng.chance(0.35) {
+        biome = rng.weighted_choice(&weighted);
+    }
+    biome
+}
+
+fn zone_segment_span(rng: &mut RunRng, role: ZoneRole, signature: ZoneSignature) -> usize {
+    match (role, signature) {
+        (ZoneRole::Accelerator, ZoneSignature::WaveRamps) => rng.range_usize(4, 7),
+        (ZoneRole::Accelerator, ZoneSignature::GiantCorkscrew) => rng.range_usize(4, 6),
+        (ZoneRole::Technical, ZoneSignature::PillarForest | ZoneSignature::ShapeGarden) => {
+            rng.range_usize(4, 6)
+        }
+        (ZoneRole::Recovery, ZoneSignature::BowlCollector) => rng.range_usize(3, 5),
+        (ZoneRole::Spectacle, _) => rng.range_usize(5, 7),
+        (_, ZoneSignature::SplitTransfer | ZoneSignature::BraidLanes) => rng.range_usize(4, 6),
+        _ => rng.range_usize(3, 6),
+    }
+}
+
+fn choose_zone_entry_connector(
+    rng: &mut RunRng,
+    role: ZoneRole,
+    signature: ZoneSignature,
+    previous: Option<ZoneRole>,
+) -> ConnectorKind {
+    if previous.is_none() {
+        return ConnectorKind::Funnel;
+    }
+
+    match (role, signature) {
+        (ZoneRole::Accelerator, _) => rng.weighted_choice(&[
+            (ConnectorKind::Funnel, 4),
+            (ConnectorKind::Booster, 5),
+            (ConnectorKind::Transfer, 2),
+        ]),
+        (_, ZoneSignature::BraidLanes) => rng.weighted_choice(&[
+            (ConnectorKind::Splitter, 5),
+            (ConnectorKind::Crossover, 3),
+            (ConnectorKind::Transfer, 2),
+        ]),
+        (_, ZoneSignature::SplitTransfer) => rng.weighted_choice(&[
+            (ConnectorKind::Splitter, 6),
+            (ConnectorKind::Transfer, 3),
+            (ConnectorKind::Crossover, 3),
+        ]),
+        (_, ZoneSignature::PillarForest | ZoneSignature::ShapeGarden) => rng.weighted_choice(&[
+            (ConnectorKind::Crossover, 5),
+            (ConnectorKind::Transfer, 4),
+            (ConnectorKind::Collector, 2),
+        ]),
+        (_, ZoneSignature::GiantCorkscrew) => rng.weighted_choice(&[
+            (ConnectorKind::Funnel, 3),
+            (ConnectorKind::Transfer, 4),
+            (ConnectorKind::Booster, 2),
+        ]),
+        (_, ZoneSignature::WaveRamps) => rng.weighted_choice(&[
+            (ConnectorKind::Funnel, 4),
+            (ConnectorKind::Collector, 3),
+            (ConnectorKind::Transfer, 2),
+        ]),
+        (_, ZoneSignature::BowlCollector) => rng.weighted_choice(&[
+            (ConnectorKind::Collector, 5),
+            (ConnectorKind::Funnel, 2),
+            (ConnectorKind::Transfer, 2),
+        ]),
+    }
+}
+
+fn choose_zone_exit_connector(
+    rng: &mut RunRng,
+    role: ZoneRole,
+    signature: ZoneSignature,
+) -> ConnectorKind {
+    match (role, signature) {
+        (ZoneRole::Accelerator, _) => rng.weighted_choice(&[
+            (ConnectorKind::Collector, 4),
+            (ConnectorKind::Transfer, 4),
+            (ConnectorKind::Booster, 2),
+        ]),
+        (_, ZoneSignature::BraidLanes) => rng.weighted_choice(&[
+            (ConnectorKind::Crossover, 5),
+            (ConnectorKind::Collector, 3),
+            (ConnectorKind::Splitter, 2),
+        ]),
+        (_, ZoneSignature::SplitTransfer) => rng.weighted_choice(&[
+            (ConnectorKind::Collector, 5),
+            (ConnectorKind::Crossover, 4),
+            (ConnectorKind::Transfer, 2),
+        ]),
+        (_, ZoneSignature::PillarForest | ZoneSignature::ShapeGarden) => rng.weighted_choice(&[
+            (ConnectorKind::Crossover, 4),
+            (ConnectorKind::Collector, 4),
+            (ConnectorKind::Transfer, 2),
+        ]),
+        (_, ZoneSignature::GiantCorkscrew) => rng.weighted_choice(&[
+            (ConnectorKind::Transfer, 4),
+            (ConnectorKind::Collector, 3),
+            (ConnectorKind::Booster, 2),
+        ]),
+        (_, ZoneSignature::WaveRamps) => rng.weighted_choice(&[
+            (ConnectorKind::Collector, 4),
+            (ConnectorKind::Transfer, 3),
+            (ConnectorKind::Funnel, 2),
+        ]),
+        (_, ZoneSignature::BowlCollector) => rng.weighted_choice(&[
+            (ConnectorKind::Collector, 6),
+            (ConnectorKind::Transfer, 2),
+            (ConnectorKind::Booster, 1),
+        ]),
+    }
+}
+
+fn default_flow_profile() -> FlowFieldProfile {
+    FlowFieldProfile {
+        route_curve: RouteCurveArchetype::Straight,
+        path_style: PathLateralStyle::Straight,
+        curvature: 0.8,
+        weave_cycles: 1.0,
+        lateral_amplitude: 0.5,
+        vertical_wave: 0.1,
+        noise_amplitude: 0.12,
+        noise_frequency: 0.9,
+        width_scale: 1.0,
+        layered_offset: 0.0,
+        branch_bias: 0.0,
+        dynamic_bias: 0.0,
+        drift_sign: 1.0,
+    }
+}
+
+fn zone_flow_profile(
+    rng: &mut RunRng,
+    role: ZoneRole,
+    signature: ZoneSignature,
+    difficulty: f32,
+) -> FlowFieldProfile {
+    let mut profile = default_flow_profile();
+    match signature {
+        ZoneSignature::BowlCollector => {
+            profile.route_curve = rng.weighted_choice(&[
+                (RouteCurveArchetype::Carve, 4),
+                (RouteCurveArchetype::Straight, 2),
+                (RouteCurveArchetype::Slalom, 2),
+            ]);
+            profile.path_style = rng.weighted_choice(&[
+                (PathLateralStyle::Arc, 5),
+                (PathLateralStyle::OneSidedArc, 3),
+                (PathLateralStyle::Straight, 2),
+            ]);
+            profile.curvature = rng.range_f32(0.86, 1.08);
+            profile.weave_cycles = rng.range_f32(0.9, 1.6);
+            profile.lateral_amplitude = rng.range_f32(0.55, 1.0);
+            profile.vertical_wave = rng.range_f32(0.08, 0.22);
+            profile.width_scale = rng.range_f32(1.1, 1.32);
+        }
+        ZoneSignature::GiantCorkscrew => {
+            profile.route_curve = RouteCurveArchetype::Carve;
+            profile.path_style = PathLateralStyle::OneSidedArc;
+            profile.curvature = rng.range_f32(1.06, 1.34);
+            profile.weave_cycles = rng.range_f32(0.72, 1.2);
+            profile.lateral_amplitude = rng.range_f32(1.15, 1.92);
+            profile.vertical_wave = rng.range_f32(0.1, 0.22);
+            profile.layered_offset = rng.range_f32(0.18, 0.56);
+            profile.width_scale = rng.range_f32(0.94, 1.12);
+        }
+        ZoneSignature::BraidLanes => {
+            profile.route_curve = rng.weighted_choice(&[
+                (RouteCurveArchetype::Switchback, 4),
+                (RouteCurveArchetype::Slalom, 4),
+                (RouteCurveArchetype::Carve, 2),
+            ]);
+            profile.path_style = rng.weighted_choice(&[
+                (PathLateralStyle::Switchback, 5),
+                (PathLateralStyle::Serpentine, 4),
+                (PathLateralStyle::Arc, 2),
+            ]);
+            profile.curvature = rng.range_f32(1.02, 1.3);
+            profile.weave_cycles = rng.range_f32(2.2, 3.5);
+            profile.lateral_amplitude = rng.range_f32(1.15, 2.0);
+            profile.vertical_wave = rng.range_f32(0.08, 0.2);
+            profile.branch_bias = rng.range_f32(0.4, 0.8);
+        }
+        ZoneSignature::WaveRamps => {
+            profile.route_curve = rng.weighted_choice(&[
+                (RouteCurveArchetype::Slalom, 5),
+                (RouteCurveArchetype::Carve, 3),
+                (RouteCurveArchetype::Straight, 2),
+            ]);
+            profile.path_style = rng.weighted_choice(&[
+                (PathLateralStyle::Serpentine, 4),
+                (PathLateralStyle::Arc, 3),
+                (PathLateralStyle::OneSidedArc, 3),
+            ]);
+            profile.curvature = rng.range_f32(0.94, 1.18);
+            profile.weave_cycles = rng.range_f32(1.8, 3.8);
+            profile.lateral_amplitude = rng.range_f32(0.92, 1.72);
+            profile.vertical_wave = rng.range_f32(0.14, 0.32);
+            profile.noise_amplitude = rng.range_f32(0.16, 0.28);
+            profile.noise_frequency = rng.range_f32(1.1, 1.65);
+        }
+        ZoneSignature::SplitTransfer => {
+            profile.route_curve = rng.weighted_choice(&[
+                (RouteCurveArchetype::Switchback, 4),
+                (RouteCurveArchetype::Carve, 3),
+                (RouteCurveArchetype::Slalom, 3),
+            ]);
+            profile.path_style = rng.weighted_choice(&[
+                (PathLateralStyle::Switchback, 4),
+                (PathLateralStyle::Arc, 3),
+                (PathLateralStyle::Serpentine, 3),
+            ]);
+            profile.curvature = rng.range_f32(1.02, 1.28);
+            profile.weave_cycles = rng.range_f32(1.5, 2.8);
+            profile.lateral_amplitude = rng.range_f32(1.02, 1.82);
+            profile.vertical_wave = rng.range_f32(0.08, 0.2);
+            profile.branch_bias = rng.range_f32(0.3, 0.64);
+        }
+        ZoneSignature::PillarForest => {
+            profile.route_curve = rng.weighted_choice(&[
+                (RouteCurveArchetype::Switchback, 4),
+                (RouteCurveArchetype::Slalom, 3),
+                (RouteCurveArchetype::Carve, 2),
+            ]);
+            profile.path_style = rng.weighted_choice(&[
+                (PathLateralStyle::Switchback, 4),
+                (PathLateralStyle::Serpentine, 3),
+                (PathLateralStyle::Arc, 3),
+            ]);
+            profile.curvature = rng.range_f32(0.96, 1.24);
+            profile.weave_cycles = rng.range_f32(1.8, 3.2);
+            profile.lateral_amplitude = rng.range_f32(1.0, 1.88);
+            profile.vertical_wave = rng.range_f32(0.12, 0.26);
+            profile.layered_offset = rng.range_f32(0.18, 0.62);
+        }
+        ZoneSignature::ShapeGarden => {
+            profile.route_curve = rng.weighted_choice(&[
+                (RouteCurveArchetype::Switchback, 4),
+                (RouteCurveArchetype::Slalom, 4),
+                (RouteCurveArchetype::Carve, 2),
+            ]);
+            profile.path_style = rng.weighted_choice(&[
+                (PathLateralStyle::Switchback, 4),
+                (PathLateralStyle::Serpentine, 4),
+                (PathLateralStyle::Arc, 2),
+            ]);
+            profile.curvature = rng.range_f32(1.0, 1.28);
+            profile.weave_cycles = rng.range_f32(1.7, 3.0);
+            profile.lateral_amplitude = rng.range_f32(1.08, 1.92);
+            profile.vertical_wave = rng.range_f32(0.1, 0.22);
+            profile.layered_offset = rng.range_f32(0.16, 0.48);
+        }
+    }
+
+    match role {
+        ZoneRole::Accelerator => {
+            profile.width_scale += 0.08;
+            profile.dynamic_bias += rng.range_f32(0.18, 0.32);
+        }
+        ZoneRole::Technical => {
+            profile.curvature += 0.06;
+            profile.noise_amplitude += 0.04;
+            profile.branch_bias += 0.08;
+        }
+        ZoneRole::Recovery => {
+            profile.width_scale += 0.12;
+            profile.curvature *= 0.92;
+            profile.lateral_amplitude *= 0.88;
+        }
+        ZoneRole::Spectacle => {
+            profile.width_scale += 0.16;
+            profile.layered_offset += 0.08;
+            profile.vertical_wave += 0.04;
+        }
+    }
+
+    profile.curvature += difficulty * 0.16;
+    profile.noise_amplitude += difficulty * 0.08;
+    profile.drift_sign = if rng.chance(0.5) { 1.0 } else { -1.0 };
+    profile
+}
+
+fn should_branch_zone(
+    role: ZoneRole,
+    signature: ZoneSignature,
+    flow: FlowFieldProfile,
+    difficulty: f32,
+    rng: &mut RunRng,
+) -> bool {
+    let base = match signature {
+        ZoneSignature::BraidLanes | ZoneSignature::SplitTransfer => 0.85,
+        ZoneSignature::PillarForest | ZoneSignature::ShapeGarden => 0.52,
+        ZoneSignature::WaveRamps | ZoneSignature::BowlCollector => 0.28,
+        ZoneSignature::GiantCorkscrew => 0.22,
+    } + match role {
+        ZoneRole::Technical => 0.08,
+        ZoneRole::Spectacle => 0.04,
+        ZoneRole::Accelerator | ZoneRole::Recovery => 0.0,
+    };
+    rng.chance((base + flow.branch_bias * 0.2 + difficulty * 0.08).clamp(0.0, 0.95))
+}
+
+fn zone_layer_index(
+    signature: ZoneSignature,
+    flow: FlowFieldProfile,
+    seed: u64,
+    local_t: f32,
+) -> i32 {
+    let sample = sample_flow_field(flow, seed, local_t, 1.0);
+    let layers = match signature {
+        ZoneSignature::PillarForest | ZoneSignature::ShapeGarden => {
+            sample.vertical * 3.2 + sample.lateral * 0.52
+        }
+        ZoneSignature::GiantCorkscrew => {
+            (local_t * TAU * (1.0 + flow.curvature * 0.12) + flow.drift_sign).sin() * 2.4
+                + sample.vertical * 1.2
+        }
+        ZoneSignature::WaveRamps => sample.vertical * 2.6,
+        ZoneSignature::BraidLanes | ZoneSignature::SplitTransfer => sample.lateral * 1.8,
+        ZoneSignature::BowlCollector => sample.vertical * 1.4 - 0.4,
+    };
+    layers.round() as i32
+}
+
+fn flow_noise_1d(seed: u64, x: f32) -> f32 {
+    let x0 = x.floor() as i32;
+    let x1 = x0 + 1;
+    let t = smoothstep01(x.fract());
+    let v0 = hash_noise(seed, x0);
+    let v1 = hash_noise(seed, x1);
+    lerp(v0, v1, t) * 2.0 - 1.0
+}
+
+fn hash_noise(seed: u64, x: i32) -> f32 {
+    let mut z = seed ^ (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    let bits = (z ^ (z >> 31)) >> 40;
+    bits as f32 / ((1_u64 << 24) - 1) as f32
+}
+
+fn sample_flow_field(
+    profile: FlowFieldProfile,
+    seed: u64,
+    t: f32,
+    envelope: f32,
+) -> FlowFieldSample {
+    let base_lateral = path_lateral_offset(
+        profile.path_style,
+        t,
+        envelope,
+        seed as f32 * 0.000_000_13,
+        profile.weave_cycles,
+        profile.lateral_amplitude,
+    );
+    let noise_phase = t * profile.noise_frequency * 6.0;
+    let noise =
+        flow_noise_1d(seed ^ 0xA11C_E_u64, noise_phase) * profile.noise_amplitude * envelope;
+    let layered_wave = (t * TAU * (1.0 + profile.layered_offset) + profile.drift_sign).sin()
+        * profile.vertical_wave
+        * envelope;
+
+    FlowFieldSample {
+        lateral: (base_lateral + noise) * profile.curvature,
+        vertical: layered_wave
+            + flow_noise_1d(seed ^ 0x51DE_C0DE_u64, noise_phase + 3.7)
+                * profile.vertical_wave
+                * 0.35
+                * envelope,
+        width_scale: (profile.width_scale
+            + flow_noise_1d(seed ^ 0xBEEF_1000_u64, noise_phase + 1.7) * 0.08)
+            .clamp(0.74, 1.42),
+    }
+}
+
+fn segment_local_progress(zone: &ZonePlan, segment_index: usize) -> f32 {
+    let span = zone.end_segment.saturating_sub(zone.start_segment).max(1);
+    (segment_index.saturating_sub(zone.start_segment)) as f32 / span as f32
+}
+
+fn push_zone_plan(
+    rng: &mut RunRng,
+    zones: &mut Vec<ZonePlan>,
+    zone_edges: &mut Vec<ZoneEdge>,
+    start_segment: usize,
+    difficulty: f32,
+    force_role: Option<ZoneRole>,
+) -> usize {
+    let zone_index = zones.len();
+    let previous_role = zones.last().map(|zone| zone.role);
+    let previous_signature = zones.last().map(|zone| zone.signature);
+    let previous_biome = zones.last().map(|zone| zone.biome);
+    let role = force_role.unwrap_or_else(|| choose_zone_role(rng, zone_index, previous_role));
+    let signature = choose_zone_signature(rng, role, difficulty, previous_signature);
+    let kind = legacy_zone_kind(signature, role);
+    let biome = choose_biome_style(rng, difficulty, role, signature, previous_biome);
+    let flow = zone_flow_profile(rng, role, signature, difficulty);
+    let index = zone_index;
+    let entry_connector = choose_zone_entry_connector(rng, role, signature, previous_role);
+    let exit_connector = choose_zone_exit_connector(rng, role, signature);
+    let end_segment = start_segment + zone_segment_span(rng, role, signature).saturating_sub(1);
+    if let Some(previous) = zones.last() {
+        zone_edges.push(ZoneEdge {
+            from: previous.index,
+            to: index,
+            connector: entry_connector,
+            branching: should_branch_zone(role, signature, flow, difficulty, rng),
+        });
+    }
+    zones.push(ZonePlan {
+        index,
+        kind,
+        role,
+        signature,
+        biome,
+        start_segment,
+        end_segment,
+        flow,
+        entry_connector,
+        exit_connector,
+        landmark: choose_landmark_kind(rng, role, signature),
+        route_lines: major_zone_route_lines(role, signature),
+        branch_targets: Vec::new(),
+    });
+    index
+}
+
+fn finalize_zone_ranges(zones: &mut [ZonePlan], segment_len: usize) {
+    let Some(last_segment) = segment_len.checked_sub(1) else {
+        return;
+    };
+    for zone in zones {
+        zone.end_segment = zone.end_segment.min(last_segment);
+    }
+}
+
+fn populate_zone_branch_targets(
+    zones: &mut [ZonePlan],
+    rooms: &[RoomPlan],
+    branches: &[BranchPlan],
+) {
+    for zone in zones.iter_mut() {
+        zone.branch_targets.clear();
+    }
+    for branch in branches {
+        let Some(room) = rooms.get(branch.room_index) else {
+            continue;
+        };
+        if let Some(zone) = zones.get_mut(room.zone_index) {
+            zone.branch_targets.push(branch.room_index);
+        }
+    }
+}
+
+fn zone_module_weight_bonus(
+    kind: ModuleKind,
+    zone_role: ZoneRole,
+    zone_signature: ZoneSignature,
+    connector: ConnectorKind,
+    flow: FlowFieldProfile,
+) -> u32 {
+    let mut bonus = match zone_signature {
+        ZoneSignature::WaveRamps => match kind {
+            ModuleKind::SurfRamp => 9,
+            ModuleKind::SpeedcheckRun => 7,
+            ModuleKind::WindTunnel | ModuleKind::IceSpine => 5,
+            ModuleKind::MovingPlatformRun => 3,
+            ModuleKind::StairRun => 2,
+            _ => 0,
+        },
+        ZoneSignature::BraidLanes => match kind {
+            ModuleKind::StairRun => 7,
+            ModuleKind::WindowHop => 6,
+            ModuleKind::PillarAirstrafe => 5,
+            ModuleKind::ShapeGauntlet => 4,
+            ModuleKind::MovingPlatformRun => 2,
+            _ => 0,
+        },
+        ZoneSignature::PillarForest => match kind {
+            ModuleKind::PillarAirstrafe => 9,
+            ModuleKind::MovingPlatformRun => 5,
+            ModuleKind::StairRun => 4,
+            ModuleKind::ShapeGauntlet => 4,
+            _ => 0,
+        },
+        ZoneSignature::ShapeGarden => match kind {
+            ModuleKind::ShapeGauntlet => 9,
+            ModuleKind::StairRun => 5,
+            ModuleKind::SpeedcheckRun => 4,
+            ModuleKind::WindowHop => 3,
+            _ => 0,
+        },
+        ZoneSignature::GiantCorkscrew => match kind {
+            ModuleKind::SurfRamp => 8,
+            ModuleKind::MovingPlatformRun => 4,
+            ModuleKind::ShapeGauntlet => 4,
+            ModuleKind::WallRunHall => 3,
+            ModuleKind::LiftChasm => 3,
+            _ => 0,
+        },
+        ZoneSignature::BowlCollector => match kind {
+            ModuleKind::SurfRamp => 7,
+            ModuleKind::StairRun => 5,
+            ModuleKind::WaterGarden => 5,
+            ModuleKind::MovingPlatformRun => 4,
+            ModuleKind::CrumbleBridge => 3,
+            _ => 0,
+        },
+        ZoneSignature::SplitTransfer => match kind {
+            ModuleKind::WindowHop => 4,
+            ModuleKind::PillarAirstrafe => 5,
+            ModuleKind::SpeedcheckRun => 5,
+            ModuleKind::MovingPlatformRun => 4,
+            ModuleKind::ShapeGauntlet => 3,
+            ModuleKind::SurfRamp => 3,
+            _ => 0,
+        },
+    };
+
+    bonus += match zone_role {
+        ZoneRole::Accelerator => match kind {
+            ModuleKind::SurfRamp | ModuleKind::SpeedcheckRun => 3,
+            _ => 0,
+        },
+        ZoneRole::Technical => match kind {
+            ModuleKind::WindowHop
+            | ModuleKind::PillarAirstrafe
+            | ModuleKind::HeadcheckRun
+            | ModuleKind::ShapeGauntlet => 3,
+            _ => 0,
+        },
+        ZoneRole::Recovery => match kind {
+            ModuleKind::SurfRamp | ModuleKind::WaterGarden | ModuleKind::MovingPlatformRun => 2,
+            _ => 0,
+        },
+        ZoneRole::Spectacle => match kind {
+            ModuleKind::SurfRamp | ModuleKind::ShapeGauntlet | ModuleKind::MovingPlatformRun => 2,
+            _ => 0,
+        },
+    };
+
+    bonus += match connector {
+        ConnectorKind::Funnel => match kind {
+            ModuleKind::SurfRamp | ModuleKind::StairRun | ModuleKind::WaterGarden => 2,
+            _ => 0,
+        },
+        ConnectorKind::Booster => match kind {
+            ModuleKind::SurfRamp | ModuleKind::SpeedcheckRun | ModuleKind::WindTunnel => 3,
+            _ => 0,
+        },
+        ConnectorKind::Transfer => match kind {
+            ModuleKind::MovingPlatformRun | ModuleKind::SurfRamp | ModuleKind::SpeedcheckRun => 2,
+            _ => 0,
+        },
+        ConnectorKind::Collector => match kind {
+            ModuleKind::SurfRamp | ModuleKind::StairRun | ModuleKind::WaterGarden => 2,
+            _ => 0,
+        },
+        ConnectorKind::Splitter | ConnectorKind::Crossover => match kind {
+            ModuleKind::WindowHop
+            | ModuleKind::PillarAirstrafe
+            | ModuleKind::ShapeGauntlet
+            | ModuleKind::MovingPlatformRun => 2,
+            _ => 0,
+        },
+    };
+
+    if flow.dynamic_bias > 0.22
+        && matches!(
+            kind,
+            ModuleKind::MovingPlatformRun | ModuleKind::LiftChasm | ModuleKind::WindTunnel
+        )
+    {
+        bonus += 2;
+    }
+    if flow.width_scale > 1.08 && matches!(kind, ModuleKind::SurfRamp | ModuleKind::ShapeGauntlet) {
+        bonus += 1;
+    }
+    bonus
+}
+
+fn choose_zone_module_template(
+    rng: &mut RunRng,
+    current_socket: SocketMask,
+    difficulty: f32,
+    projected_gap: f32,
+    zone: &ZonePlan,
+) -> ModuleTemplate {
+    let mut weighted = Vec::new();
+
+    for template in all_templates() {
+        if template.entry & current_socket == 0 {
+            continue;
+        }
+        if difficulty < template.min_difficulty || difficulty > template.max_difficulty {
+            continue;
+        }
+        if projected_gap < template.min_gap - 1.5 || projected_gap > template.max_gap + 1.5 {
+            continue;
+        }
+
+        let mut weight = template.weight;
+        if difficulty > 0.55
+            && matches!(
+                template.kind,
+                ModuleKind::SurfRamp
+                    | ModuleKind::StairRun
+                    | ModuleKind::WindowHop
+                    | ModuleKind::PillarAirstrafe
+                    | ModuleKind::HeadcheckRun
+                    | ModuleKind::SpeedcheckRun
+                    | ModuleKind::MovingPlatformRun
+                    | ModuleKind::ShapeGauntlet
+                    | ModuleKind::CrumbleBridge
+                    | ModuleKind::WindTunnel
+                    | ModuleKind::IceSpine
+                    | ModuleKind::WallRunHall
+            )
+        {
+            weight += 5;
+        }
+        if difficulty > 0.2 && matches!(template.kind, ModuleKind::SurfRamp) {
+            weight += 3;
+        }
+        if difficulty > 0.35
+            && matches!(template.kind, ModuleKind::StairRun | ModuleKind::WindowHop)
+        {
+            weight += 4;
+        }
+        if difficulty > 0.32
+            && matches!(
+                template.kind,
+                ModuleKind::PillarAirstrafe
+                    | ModuleKind::HeadcheckRun
+                    | ModuleKind::SpeedcheckRun
+                    | ModuleKind::MovingPlatformRun
+                    | ModuleKind::ShapeGauntlet
+            )
+        {
+            weight += 3;
+        }
+        if difficulty < 0.35
+            && matches!(
+                template.kind,
+                ModuleKind::SurfRamp
+                    | ModuleKind::StairRun
+                    | ModuleKind::WindowHop
+                    | ModuleKind::MantleStack
+                    | ModuleKind::WaterGarden
+            )
+        {
+            weight += 3;
+        }
+        if difficulty > 0.45
+            && matches!(
+                template.kind,
+                ModuleKind::MantleStack | ModuleKind::LiftChasm | ModuleKind::WaterGarden
+            )
+        {
+            weight = weight.saturating_sub(3).max(1);
+        }
+        weight += zone_module_weight_bonus(
+            template.kind,
+            zone.role,
+            zone.signature,
+            zone.entry_connector,
+            zone.flow,
+        );
+        weighted.push((template, weight.max(1)));
+    }
+
+    if weighted.is_empty() {
+        return module_template(safe_fallback_kind(difficulty));
+    }
+
+    rng.weighted_choice(&weighted)
+}
+
+fn route_turn_limit(kind: ModuleKind, difficulty: f32) -> f32 {
+    let base = match kind {
+        ModuleKind::SurfRamp => 15.5_f32.to_radians(),
+        ModuleKind::StairRun | ModuleKind::ShapeGauntlet => 18.5_f32.to_radians(),
+        ModuleKind::WindowHop | ModuleKind::PillarAirstrafe => 17.0_f32.to_radians(),
+        ModuleKind::HeadcheckRun | ModuleKind::SpeedcheckRun => 15.0_f32.to_radians(),
+        ModuleKind::MovingPlatformRun => 16.2_f32.to_radians(),
+        ModuleKind::MantleStack | ModuleKind::WallRunHall => 11.2_f32.to_radians(),
+        _ => 12.6_f32.to_radians(),
+    };
+    (base + difficulty * 3.6_f32.to_radians()).clamp(3.4_f32.to_radians(), MAX_SECTION_TURN_RADIANS)
+}
+
+fn choose_route_curve_archetype(
+    rng: &mut RunRng,
+    difficulty: f32,
+    kind: ModuleKind,
+) -> RouteCurveArchetype {
+    let straight_weight = if matches!(kind, ModuleKind::SpeedcheckRun) {
+        3
+    } else {
+        1
+    };
+    let carve_weight = if matches!(kind, ModuleKind::SurfRamp | ModuleKind::MovingPlatformRun) {
+        7
+    } else {
+        4
+    };
+    let switch_weight = if matches!(
+        kind,
+        ModuleKind::StairRun
+            | ModuleKind::WindowHop
+            | ModuleKind::ShapeGauntlet
+            | ModuleKind::PillarAirstrafe
+    ) {
+        7
+    } else {
+        3
+    };
+    let slalom_weight = if difficulty > 0.32 { 6 } else { 3 };
+    rng.weighted_choice(&[
+        (RouteCurveArchetype::Straight, straight_weight),
+        (RouteCurveArchetype::Carve, carve_weight),
+        (RouteCurveArchetype::Switchback, switch_weight),
+        (RouteCurveArchetype::Slalom, slalom_weight),
+    ])
+}
+
+fn route_turn_delta(
+    rng: &mut RunRng,
+    archetype: RouteCurveArchetype,
+    index: usize,
+    direction: f32,
+    strength: f32,
+    difficulty: f32,
+    kind: ModuleKind,
+) -> f32 {
+    let style_bias = match kind {
+        ModuleKind::SurfRamp => 1.08,
+        ModuleKind::StairRun | ModuleKind::ShapeGauntlet => 1.28,
+        ModuleKind::WindowHop | ModuleKind::PillarAirstrafe => 1.18,
+        ModuleKind::MovingPlatformRun => 1.12,
+        _ => 0.96,
+    };
+    let phase = index as f32 * (0.82 + difficulty * 0.48) + rng.range_f32(-0.15, 0.15);
+    let amplitude = route_turn_limit(kind, difficulty) * strength * style_bias;
+    let jitter = rng.range_f32(-1.3_f32.to_radians(), 1.3_f32.to_radians());
+
+    match archetype {
+        RouteCurveArchetype::Straight => {
+            let drift = direction * amplitude * 0.12;
+            let pulse = (phase * 0.45).sin() * amplitude * 0.16;
+            drift + pulse + jitter * 0.4
+        }
+        RouteCurveArchetype::Carve => {
+            let carve = direction * amplitude * rng.range_f32(0.84, 1.16);
+            let pulse = (phase * 0.6).sin() * amplitude * 0.24;
+            carve + pulse + jitter
+        }
+        RouteCurveArchetype::Switchback => {
+            let sign = if index % 2 == 0 {
+                direction
+            } else {
+                -direction
+            };
+            let shoulder = (phase * 0.55).sin() * amplitude * 0.22;
+            sign * amplitude * rng.range_f32(0.88, 1.18) + shoulder + jitter
+        }
+        RouteCurveArchetype::Slalom => {
+            let wave = (phase * 1.18).sin();
+            let shaped = wave.signum() * wave.abs().powf(0.45);
+            shaped * amplitude * 1.08 + jitter * 0.72
+        }
+    }
+}
+
+fn section_spacing_padding(kind: ModuleKind, difficulty: f32) -> f32 {
+    let base = match kind {
+        ModuleKind::SurfRamp => 56.0,
+        ModuleKind::StairRun => 36.0,
+        ModuleKind::ShapeGauntlet => 48.0,
+        ModuleKind::PillarAirstrafe => 34.0,
+        ModuleKind::WindowHop | ModuleKind::HeadcheckRun | ModuleKind::SpeedcheckRun => 28.0,
+        ModuleKind::MovingPlatformRun => 32.0,
+        ModuleKind::WallRunHall => 24.0,
+        _ => 18.0,
+    };
+    base + difficulty * 16.0
+}
+
+fn room_generation_radius(size: Vec2, kind: ModuleKind, difficulty: f32) -> f32 {
+    size.max_element() * 0.62 + section_spacing_padding(kind, difficulty)
+}
+
+fn candidate_room_clearance(
+    candidate: Vec3,
+    size: Vec2,
+    kind: ModuleKind,
+    difficulty: f32,
+    rooms: &[RoomPlan],
+) -> f32 {
+    let candidate_radius = room_generation_radius(size, kind, difficulty);
+    rooms
+        .iter()
+        .map(|room| {
+            let existing_radius = room.size.max_element() * 0.58 + 14.0;
+            Vec2::new(candidate.x - room.top.x, candidate.z - room.top.z).length()
+                - (candidate_radius + existing_radius)
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn choose_room_candidate(
+    rng: &mut RunRng,
+    current_top: Vec3,
+    current_height: f32,
+    desired_heading_angle: f32,
+    step_distance: f32,
+    room_size: Vec2,
+    kind: ModuleKind,
+    difficulty: f32,
+    rooms: &[RoomPlan],
+    occupied_rooms: &HashSet<IVec2>,
+) -> (Vec3, IVec2, f32) {
+    let turn_limit = route_turn_limit(kind, difficulty);
+    let bend_strength = match kind {
+        ModuleKind::SurfRamp => 0.12 + difficulty * 0.08,
+        ModuleKind::StairRun | ModuleKind::ShapeGauntlet => 0.18 + difficulty * 0.1,
+        ModuleKind::WindowHop | ModuleKind::PillarAirstrafe => 0.14 + difficulty * 0.09,
+        ModuleKind::HeadcheckRun | ModuleKind::SpeedcheckRun | ModuleKind::MovingPlatformRun => {
+            0.16 + difficulty * 0.1
+        }
+        _ => 0.1 + difficulty * 0.06,
+    };
+    let turn_offsets = [0.0, 0.18, -0.18, 0.35, -0.35, 0.55, -0.55, 0.78, -0.78];
+    let distance_pushes = [0.0, CELL_SIZE * 0.55, CELL_SIZE * 1.05, CELL_SIZE * 1.6];
+    let bend_offsets = [0.0, 0.45, -0.45, 0.95, -0.95];
+    let mut best = (
+        current_top
+            + Vec3::new(
+                desired_heading_angle.cos(),
+                0.0,
+                desired_heading_angle.sin(),
+            ) * step_distance,
+        room_grid_cell(current_top),
+        desired_heading_angle,
+    );
+    let mut best_score = f32::NEG_INFINITY;
+
+    for turn_offset in turn_offsets {
+        let heading_angle =
+            desired_heading_angle + turn_offset * turn_limit * rng.range_f32(0.9, 1.08);
+        let heading = Vec3::new(heading_angle.cos(), 0.0, heading_angle.sin()).normalize_or_zero();
+        let right = Vec3::new(-heading.z, 0.0, heading.x);
+        for distance_push in distance_pushes {
+            for bend_offset in bend_offsets {
+                let bend =
+                    right * bend_offset * bend_strength * step_distance * rng.range_f32(0.85, 1.12);
+                let mut top = current_top + heading * (step_distance + distance_push) + bend;
+                top.y = current_height;
+                let cell = room_grid_cell(top);
+                let clearance = candidate_room_clearance(top, room_size, kind, difficulty, rooms);
+                let occupied_penalty = if occupied_rooms.contains(&cell) {
+                    180.0
+                } else {
+                    0.0
+                };
+                let score = clearance - occupied_penalty - distance_push * 0.06;
+                if score > best_score {
+                    best = (top, cell, heading_angle);
+                    best_score = score;
+                }
+                if clearance >= 10.0 && !occupied_rooms.contains(&cell) {
+                    return (top, cell, heading_angle);
+                }
+            }
+        }
+    }
+
+    if best_score < 0.0 {
+        let heading = Vec3::new(best.2.cos(), 0.0, best.2.sin()).normalize_or_zero();
+        let push = -best_score + 12.0;
+        best.0 += heading * push;
+        best.1 = room_grid_cell(best.0);
+    }
+
+    best
+}
+
+fn segment_route_lines_for_zone(zone: &ZonePlan, zone_t: f32) -> Vec<RouteLine> {
+    let interior = zone_t >= 0.12 && zone_t <= 0.88;
+    if interior {
+        return zone.route_lines.clone();
+    }
+
+    match zone.role {
+        ZoneRole::Recovery => vec![RouteLine::Safe, RouteLine::Speed],
+        ZoneRole::Spectacle if zone_t < 0.18 => vec![RouteLine::Speed, RouteLine::Trick],
+        _ => vec![RouteLine::Speed],
+    }
+}
+
 fn build_run_blueprint(seed: u64) -> RunBlueprint {
     let mut best_blueprint = None;
     let mut best_score = usize::MAX;
@@ -1811,6 +3260,7 @@ fn build_run_blueprint(seed: u64) -> RunBlueprint {
         let mut rng = RunRng::new(seed ^ (attempt as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let mut blueprint = draft_run_blueprint(seed, &mut rng);
         let repair_stats = repair_run_blueprint(&mut blueprint, &mut rng);
+        force_first_segment_to_surf(&mut blueprint);
         let validation = validate_run_blueprint(&blueprint);
 
         blueprint.stats.attempts = attempt + 1;
@@ -1856,6 +3306,8 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
     let floors = rng.range_usize(34, 49);
     let mut rooms = Vec::with_capacity(floors);
     let mut segments = Vec::with_capacity(floors.saturating_sub(1));
+    let mut zones = Vec::new();
+    let mut zone_edges = Vec::new();
     let mut occupied_rooms: HashSet<IVec2> = HashSet::default();
     let mut occupied_branches = HashSet::default();
     let theme_offset = (rng.next_u64() % 4) as usize;
@@ -1863,40 +3315,82 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
     let mut current_socket = SOCKET_SAFE_REST;
     let mut current_height = 420.0;
     let mut current_top = Vec3::new(0.0, current_height, 0.0);
-    let heading_phase = rng.range_f32(0.0, TAU);
-    let heading_frequency = rng.range_f32(0.42, 0.74);
-    let spiral_direction = if rng.chance(0.5) { 1.0 } else { -1.0 };
-    let spiral_turn = rng.range_f32(3.2_f32.to_radians(), 4.75_f32.to_radians()) * spiral_direction;
     let mut heading_angle = rng.range_f32(0.0, TAU);
+    let active_zone_index = push_zone_plan(
+        rng,
+        &mut zones,
+        &mut zone_edges,
+        0,
+        0.0,
+        Some(ZoneRole::Accelerator),
+    );
+    let active_zone = zones[active_zone_index].clone();
 
     let cell = room_grid_cell(current_top);
     occupied_rooms.insert(cell);
+    let first_room_seed = rng.next_u64();
     rooms.push(RoomPlan {
         index: 0,
         cell,
         top: current_top,
         size: Vec2::splat(13.5),
-        theme: theme_for(0, floors, theme_offset),
-        seed: rng.next_u64(),
+        theme: biome_theme(active_zone.biome, 0, floors, theme_offset),
+        seed: first_room_seed,
         section: RoomSectionKind::OpenPad,
         checkpoint_slot: Some(0),
+        biome: active_zone.biome,
+        zone_index: active_zone_index,
+        layer_index: zone_layer_index(
+            active_zone.signature,
+            active_zone.flow,
+            first_room_seed,
+            0.0,
+        ),
     });
 
+    let mut active_zone_index = active_zone_index;
     for index in 1..floors {
         let difficulty = index as f32 / (floors.saturating_sub(1).max(1)) as f32;
-        let room_size = Vec2::splat(lerp(13.2, 9.8, difficulty)).max(Vec2::splat(9.2));
-        let turn_wave =
-            (index as f32 * heading_frequency + heading_phase).sin() * 0.72_f32.to_radians();
-        let turn_jitter = rng.range_f32(-0.25_f32.to_radians(), 0.25_f32.to_radians());
-        heading_angle += (spiral_turn + turn_wave + turn_jitter)
-            .clamp(-MAX_SECTION_TURN_RADIANS, MAX_SECTION_TURN_RADIANS);
-        let heading = Vec3::new(heading_angle.cos(), 0.0, heading_angle.sin()).normalize_or_zero();
+        let segment_index = index - 1;
+        if segment_index > zones[active_zone_index].end_segment {
+            active_zone_index = push_zone_plan(
+                rng,
+                &mut zones,
+                &mut zone_edges,
+                segment_index,
+                difficulty,
+                None,
+            );
+        }
+        let active_zone = zones[active_zone_index].clone();
+        let zone_t = segment_local_progress(&active_zone, segment_index);
+        let flow_seed = seed ^ active_zone.index as u64 ^ 0xF10F_1E1D_u64;
+        let flow_sample = sample_flow_field(active_zone.flow, flow_seed, zone_t, 1.0);
+        let room_size = (Vec2::splat(lerp(13.2, 9.8, difficulty))
+            * flow_sample.width_scale.clamp(0.84, 1.28))
+        .max(Vec2::splat(9.2));
         let mut step_distance = rng.range_f32(CELL_SIZE * 5.8, CELL_SIZE * 8.4);
         let projected_gap = projected_gap(step_distance, rooms.last().unwrap().size, room_size);
-        let template = choose_module_template(rng, current_socket, difficulty, projected_gap);
+        let template = if index == 1 {
+            module_template(ModuleKind::SurfRamp)
+        } else {
+            choose_zone_module_template(
+                rng,
+                current_socket,
+                difficulty,
+                projected_gap,
+                &active_zone,
+            )
+        };
         step_distance = match template.kind {
             ModuleKind::SurfRamp => rng.range_f32(CELL_SIZE * 14.0, CELL_SIZE * 22.0),
             ModuleKind::StairRun => rng.range_f32(CELL_SIZE * 9.0, CELL_SIZE * 15.0),
+            ModuleKind::WindowHop => rng.range_f32(CELL_SIZE * 7.0, CELL_SIZE * 10.5),
+            ModuleKind::PillarAirstrafe => rng.range_f32(CELL_SIZE * 8.0, CELL_SIZE * 12.5),
+            ModuleKind::HeadcheckRun => rng.range_f32(CELL_SIZE * 7.0, CELL_SIZE * 10.0),
+            ModuleKind::SpeedcheckRun => rng.range_f32(CELL_SIZE * 8.0, CELL_SIZE * 12.0),
+            ModuleKind::MovingPlatformRun => rng.range_f32(CELL_SIZE * 7.5, CELL_SIZE * 11.5),
+            ModuleKind::ShapeGauntlet => rng.range_f32(CELL_SIZE * 9.0, CELL_SIZE * 13.5),
             ModuleKind::IceSpine | ModuleKind::CrumbleBridge | ModuleKind::WindTunnel => {
                 rng.range_f32(CELL_SIZE * 7.0, CELL_SIZE * 11.5)
             }
@@ -1905,40 +3399,60 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
                 rng.range_f32(CELL_SIZE * 5.0, CELL_SIZE * 8.0)
             }
         };
+        let distance_multiplier = match active_zone.flow.route_curve {
+            RouteCurveArchetype::Straight => 1.18,
+            RouteCurveArchetype::Carve => 1.04,
+            RouteCurveArchetype::Switchback => 0.96,
+            RouteCurveArchetype::Slalom => 1.0,
+        };
+        let flow_distance_scale = (active_zone.flow.width_scale
+            * (0.9 + active_zone.flow.curvature * 0.08))
+            .clamp(0.88, 1.34);
+        step_distance *= distance_multiplier * flow_distance_scale;
+        step_distance += flow_sample.lateral.abs() * CELL_SIZE * 0.22;
         let descent = rng.range_f32(template.min_rise, template.max_rise)
             + lerp(8.5, 15.0, difficulty)
-            + difficulty * 4.8;
+            + difficulty * 4.8
+            + active_zone.flow.vertical_wave * 9.0
+            + flow_sample.vertical.abs() * 6.0;
         current_height -= descent;
-        let right = Vec3::new(-heading.z, 0.0, heading.x);
-        let bend_scale = if matches!(template.kind, ModuleKind::SurfRamp | ModuleKind::StairRun) {
-            0.04 + difficulty * 0.04
-        } else if matches!(
+        let zone_turn_limit = route_turn_limit(template.kind, difficulty)
+            * active_zone.flow.curvature.clamp(0.85, 1.28);
+        heading_angle += route_turn_delta(
+            rng,
+            active_zone.flow.route_curve,
+            index,
+            active_zone.flow.drift_sign,
+            active_zone.flow.curvature,
+            difficulty,
             template.kind,
-            ModuleKind::IceSpine | ModuleKind::CrumbleBridge | ModuleKind::WindTunnel
-        ) {
-            0.08 + difficulty * 0.08
-        } else {
-            0.16 + difficulty * 0.14
-        };
-        let bend = right * rng.range_f32(-1.0, 1.0) * bend_scale * 1.25;
-        let mut top = Vec3::new(current_top.x, current_height, current_top.z)
-            + heading * step_distance
-            + bend;
-        top.y = current_height;
-        let mut cell = room_grid_cell(top);
-        let mut retries = 0;
-        while occupied_rooms.contains(&cell) && retries < 6 {
-            top += heading * (ROOM_GRID_SIZE * 0.75);
-            cell = room_grid_cell(top);
-            retries += 1;
-        }
+        )
+        .clamp(-zone_turn_limit, zone_turn_limit)
+            + flow_sample.lateral.signum()
+                * flow_sample.lateral.abs().min(1.0)
+                * 1.4_f32.to_radians();
+        let (top, cell, settled_heading_angle) = choose_room_candidate(
+            rng,
+            current_top,
+            current_height,
+            heading_angle,
+            step_distance,
+            room_size,
+            template.kind,
+            difficulty,
+            &rooms,
+            &occupied_rooms,
+        );
+        heading_angle = settled_heading_angle;
         occupied_rooms.insert(cell);
         current_top = top;
 
-        if matches!(template.kind, ModuleKind::SurfRamp) {
+        if is_primary_speed_section(template.kind) {
             if let Some(previous_room) = rooms.last_mut() {
                 previous_room.section = RoomSectionKind::OpenPad;
-                previous_room.size = previous_room.size.max(Vec2::splat(15.4));
+                previous_room.size = previous_room
+                    .size
+                    .max(Vec2::splat(speed_room_size(template.kind)));
             }
         }
 
@@ -1948,40 +3462,66 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
             top,
             size: if index == floors - 1 {
                 Vec2::splat(15.2)
-            } else if matches!(template.kind, ModuleKind::SurfRamp) {
-                room_size.max(Vec2::splat(15.4))
+            } else if is_primary_speed_section(template.kind) {
+                room_size.max(Vec2::splat(
+                    speed_room_size(template.kind) * flow_sample.width_scale.clamp(0.96, 1.24),
+                ))
             } else {
                 room_size
             },
-            theme: theme_for(index, floors, theme_offset),
+            theme: biome_theme(active_zone.biome, index, floors, theme_offset),
             seed: rng.next_u64(),
-            section: if matches!(template.kind, ModuleKind::SurfRamp) {
+            section: if is_primary_speed_section(template.kind) {
                 RoomSectionKind::OpenPad
             } else {
                 choose_room_section(rng, difficulty, index, floors)
             },
             checkpoint_slot: Some(index),
+            biome: active_zone.biome,
+            zone_index: active_zone_index,
+            layer_index: zone_layer_index(
+                active_zone.signature,
+                active_zone.flow,
+                flow_seed,
+                zone_t,
+            ),
         });
 
         segments.push(SegmentPlan {
-            index: index - 1,
-            from: index - 1,
+            index: segment_index,
+            from: segment_index,
             to: index,
             kind: template.kind,
             difficulty,
             seed: rng.next_u64(),
+            zone_role: active_zone.role,
+            zone_signature: active_zone.signature,
             shortcut_id: None,
             exit_socket: template.exit,
+            zone_index: active_zone_index,
+            biome: active_zone.biome,
+            connector: if segment_index == active_zone.start_segment {
+                active_zone.entry_connector
+            } else if segment_index == active_zone.end_segment {
+                active_zone.exit_connector
+            } else {
+                ConnectorKind::Transfer
+            },
+            flow: active_zone.flow,
+            route_lines: segment_route_lines_for_zone(&active_zone, zone_t),
+            zone_local_t: zone_t,
         });
         current_socket = template.exit;
     }
 
-    let branches = generate_side_branches(seed, rng, &rooms, &segments, &mut occupied_branches);
+    finalize_zone_ranges(&mut zones, segments.len());
+    let branches =
+        generate_side_branches(seed, rng, &rooms, &segments, &zones, &mut occupied_branches);
     let spawn = rooms[0].top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, rooms[0].size.y * 0.18);
     let summit = rooms.last().unwrap().top + Vec3::new(0.0, 1.4, 0.0);
     let death_plane = rooms.last().unwrap().top.y - 90.0;
 
-    RunBlueprint {
+    let mut blueprint = RunBlueprint {
         seed,
         floors,
         rooms,
@@ -1991,7 +3531,12 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
         summit,
         death_plane,
         stats: GenerationStats::default(),
-    }
+        zones,
+        zone_edges,
+    };
+    populate_zone_branch_targets(&mut blueprint.zones, &blueprint.rooms, &blueprint.branches);
+    force_first_segment_to_surf(&mut blueprint);
+    blueprint
 }
 
 fn repair_run_blueprint(blueprint: &mut RunBlueprint, rng: &mut RunRng) -> RepairStats {
@@ -2011,6 +3556,7 @@ fn repair_run_blueprint(blueprint: &mut RunBlueprint, rng: &mut RunRng) -> Repai
             stats.downgraded_segments += 1;
         }
     }
+    force_first_segment_to_surf(blueprint);
 
     for _ in 0..10 {
         let validation = validate_run_blueprint(blueprint);
@@ -2027,6 +3573,7 @@ fn repair_run_blueprint(blueprint: &mut RunBlueprint, rng: &mut RunRng) -> Repai
                 segment.exit_socket = module_template(segment.kind).exit;
                 stats.repairs += 1;
                 stats.downgraded_segments += 1;
+                force_first_segment_to_surf(blueprint);
                 continue;
             }
         }
@@ -2038,11 +3585,22 @@ fn repair_run_blueprint(blueprint: &mut RunBlueprint, rng: &mut RunRng) -> Repai
                 continue;
             }
 
+            if spread_room_owner(blueprint, a, 10.0) || spread_room_owner(blueprint, b, 10.0) {
+                stats.repairs += 1;
+                continue;
+            }
+
+            if trim_segment_route_lines(blueprint, a) || trim_segment_route_lines(blueprint, b) {
+                stats.repairs += 1;
+                continue;
+            }
+
             if downgrade_segment_owner(blueprint, a, rng)
                 || downgrade_segment_owner(blueprint, b, rng)
             {
                 stats.repairs += 1;
                 stats.downgraded_segments += 1;
+                force_first_segment_to_surf(blueprint);
                 continue;
             }
 
@@ -2071,12 +3629,295 @@ fn fallback_blueprint(seed: u64) -> RunBlueprint {
         segment.exit_socket = module_template(segment.kind).exit;
         segment.shortcut_id = None;
     }
+    force_first_segment_to_surf(&mut blueprint);
     let validation = validate_run_blueprint(&blueprint);
     blueprint.stats.attempts = 1;
     blueprint.stats.overlap_issues = validation.overlap_issues;
     blueprint.stats.clearance_issues = validation.clearance_issues;
     blueprint.stats.reachability_issues = validation.reachability_issues;
     blueprint
+}
+
+fn force_first_segment_to_surf(blueprint: &mut RunBlueprint) {
+    let Some(first_segment) = blueprint.segments.first_mut() else {
+        return;
+    };
+    first_segment.kind = ModuleKind::SurfRamp;
+    first_segment.exit_socket = module_template(ModuleKind::SurfRamp).exit;
+    first_segment.shortcut_id = None;
+
+    if let Some(first_room) = blueprint.rooms.get_mut(0) {
+        first_room.section = RoomSectionKind::OpenPad;
+        first_room.size = first_room
+            .size
+            .max(Vec2::splat(speed_room_size(ModuleKind::SurfRamp)));
+    }
+    if let Some(second_room) = blueprint.rooms.get_mut(1) {
+        second_room.section = RoomSectionKind::OpenPad;
+        second_room.size = second_room
+            .size
+            .max(Vec2::splat(speed_room_size(ModuleKind::SurfRamp)));
+    }
+}
+
+fn theme_offset_from_theme(theme: Theme) -> usize {
+    match theme {
+        Theme::Stone => 0,
+        Theme::Overgrown => 1,
+        Theme::Frost => 2,
+        Theme::Ember => 3,
+    }
+}
+
+fn tail_heading_angle(rooms: &[RoomPlan]) -> f32 {
+    if rooms.len() < 2 {
+        return 0.0;
+    }
+
+    let heading = direction_from_delta(rooms[rooms.len() - 1].top - rooms[rooms.len() - 2].top);
+    if heading == Vec3::ZERO {
+        0.0
+    } else {
+        heading.z.atan2(heading.x)
+    }
+}
+
+fn endless_difficulty(index: usize) -> f32 {
+    (index as f32 / 28.0).clamp(0.0, 1.0)
+}
+
+fn append_run_blueprint(blueprint: &mut RunBlueprint, additional_rooms: usize) {
+    if additional_rooms == 0 || blueprint.rooms.is_empty() {
+        return;
+    }
+
+    let start_index = blueprint.rooms.len();
+    let total_after_append = start_index + additional_rooms;
+    let theme_offset = blueprint
+        .rooms
+        .first()
+        .map(|room| theme_offset_from_theme(room.theme))
+        .unwrap_or(0);
+    let mut occupied_rooms = blueprint
+        .rooms
+        .iter()
+        .map(|room| room.cell)
+        .collect::<HashSet<_>>();
+    let mut occupied_branches = blueprint
+        .branches
+        .iter()
+        .map(|branch| room_grid_cell(branch.top))
+        .collect::<HashSet<_>>();
+
+    let mut rng =
+        RunRng::new(blueprint.seed ^ (start_index as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
+    let mut current_socket = blueprint
+        .segments
+        .last()
+        .map(|segment| segment.exit_socket)
+        .unwrap_or(SOCKET_SAFE_REST);
+    let mut current_top = blueprint.rooms.last().unwrap().top;
+    let mut current_height = current_top.y;
+    let mut heading_angle = tail_heading_angle(&blueprint.rooms);
+    let tail_difficulty = blueprint
+        .segments
+        .last()
+        .map(|segment| segment.difficulty)
+        .unwrap_or(0.0);
+    let mut active_zone_index = push_zone_plan(
+        &mut rng,
+        &mut blueprint.zones,
+        &mut blueprint.zone_edges,
+        blueprint.segments.len(),
+        tail_difficulty,
+        None,
+    );
+
+    for index in start_index..total_after_append {
+        let difficulty = endless_difficulty(index);
+        let segment_index = index - 1;
+        if segment_index > blueprint.zones[active_zone_index].end_segment {
+            active_zone_index = push_zone_plan(
+                &mut rng,
+                &mut blueprint.zones,
+                &mut blueprint.zone_edges,
+                segment_index,
+                difficulty,
+                None,
+            );
+        }
+        let active_zone = blueprint.zones[active_zone_index].clone();
+        let zone_t = segment_local_progress(&active_zone, segment_index);
+        let flow_seed = blueprint.seed ^ active_zone.index as u64 ^ 0xABCD_9876_u64;
+        let flow_sample = sample_flow_field(active_zone.flow, flow_seed, zone_t, 1.0);
+        let room_size = (Vec2::splat(lerp(13.2, 9.8, difficulty))
+            * flow_sample.width_scale.clamp(0.84, 1.28))
+        .max(Vec2::splat(9.2));
+        let mut step_distance = rng.range_f32(CELL_SIZE * 5.8, CELL_SIZE * 8.4);
+        let projected_gap = projected_gap(
+            step_distance,
+            blueprint.rooms.last().unwrap().size,
+            room_size,
+        );
+        let template = choose_zone_module_template(
+            &mut rng,
+            current_socket,
+            difficulty,
+            projected_gap,
+            &active_zone,
+        );
+        step_distance = match template.kind {
+            ModuleKind::SurfRamp => rng.range_f32(CELL_SIZE * 14.0, CELL_SIZE * 22.0),
+            ModuleKind::StairRun => rng.range_f32(CELL_SIZE * 9.0, CELL_SIZE * 15.0),
+            ModuleKind::WindowHop => rng.range_f32(CELL_SIZE * 7.0, CELL_SIZE * 10.5),
+            ModuleKind::PillarAirstrafe => rng.range_f32(CELL_SIZE * 8.0, CELL_SIZE * 12.5),
+            ModuleKind::HeadcheckRun => rng.range_f32(CELL_SIZE * 7.0, CELL_SIZE * 10.0),
+            ModuleKind::SpeedcheckRun => rng.range_f32(CELL_SIZE * 8.0, CELL_SIZE * 12.0),
+            ModuleKind::MovingPlatformRun => rng.range_f32(CELL_SIZE * 7.5, CELL_SIZE * 11.5),
+            ModuleKind::ShapeGauntlet => rng.range_f32(CELL_SIZE * 9.0, CELL_SIZE * 13.5),
+            ModuleKind::IceSpine | ModuleKind::CrumbleBridge | ModuleKind::WindTunnel => {
+                rng.range_f32(CELL_SIZE * 7.0, CELL_SIZE * 11.5)
+            }
+            ModuleKind::WallRunHall => rng.range_f32(CELL_SIZE * 6.0, CELL_SIZE * 9.0),
+            ModuleKind::MantleStack | ModuleKind::LiftChasm | ModuleKind::WaterGarden => {
+                rng.range_f32(CELL_SIZE * 5.0, CELL_SIZE * 8.0)
+            }
+        };
+        let distance_multiplier = match active_zone.flow.route_curve {
+            RouteCurveArchetype::Straight => 1.18,
+            RouteCurveArchetype::Carve => 1.04,
+            RouteCurveArchetype::Switchback => 0.96,
+            RouteCurveArchetype::Slalom => 1.0,
+        };
+        let flow_distance_scale = (active_zone.flow.width_scale
+            * (0.9 + active_zone.flow.curvature * 0.08))
+            .clamp(0.88, 1.34);
+        step_distance *= distance_multiplier * flow_distance_scale;
+        step_distance += flow_sample.lateral.abs() * CELL_SIZE * 0.22;
+        let descent = rng.range_f32(template.min_rise, template.max_rise)
+            + lerp(8.5, 15.0, difficulty)
+            + difficulty * 4.8
+            + active_zone.flow.vertical_wave * 9.0
+            + flow_sample.vertical.abs() * 6.0;
+        current_height -= descent;
+        let zone_turn_limit = route_turn_limit(template.kind, difficulty)
+            * active_zone.flow.curvature.clamp(0.85, 1.28);
+        heading_angle += route_turn_delta(
+            &mut rng,
+            active_zone.flow.route_curve,
+            index,
+            active_zone.flow.drift_sign,
+            active_zone.flow.curvature,
+            difficulty,
+            template.kind,
+        )
+        .clamp(-zone_turn_limit, zone_turn_limit)
+            + flow_sample.lateral.signum()
+                * flow_sample.lateral.abs().min(1.0)
+                * 1.4_f32.to_radians();
+        let (top, cell, settled_heading_angle) = choose_room_candidate(
+            &mut rng,
+            current_top,
+            current_height,
+            heading_angle,
+            step_distance,
+            room_size,
+            template.kind,
+            difficulty,
+            &blueprint.rooms,
+            &occupied_rooms,
+        );
+        heading_angle = settled_heading_angle;
+        occupied_rooms.insert(cell);
+        current_top = top;
+
+        if is_primary_speed_section(template.kind) {
+            if let Some(previous_room) = blueprint.rooms.last_mut() {
+                previous_room.section = RoomSectionKind::OpenPad;
+                previous_room.size = previous_room
+                    .size
+                    .max(Vec2::splat(speed_room_size(template.kind)));
+            }
+        }
+
+        blueprint.rooms.push(RoomPlan {
+            index,
+            cell,
+            top,
+            size: if is_primary_speed_section(template.kind) {
+                room_size.max(Vec2::splat(
+                    speed_room_size(template.kind) * flow_sample.width_scale.clamp(0.96, 1.24),
+                ))
+            } else {
+                room_size
+            },
+            theme: biome_theme(active_zone.biome, index, total_after_append, theme_offset),
+            seed: rng.next_u64(),
+            section: if is_primary_speed_section(template.kind) {
+                RoomSectionKind::OpenPad
+            } else {
+                choose_room_section(&mut rng, difficulty, index, total_after_append)
+            },
+            checkpoint_slot: Some(index),
+            biome: active_zone.biome,
+            zone_index: active_zone_index,
+            layer_index: zone_layer_index(
+                active_zone.signature,
+                active_zone.flow,
+                flow_seed,
+                zone_t,
+            ),
+        });
+
+        let mut segment = SegmentPlan {
+            index: segment_index,
+            from: segment_index,
+            to: index,
+            kind: template.kind,
+            difficulty,
+            seed: rng.next_u64(),
+            zone_role: active_zone.role,
+            zone_signature: active_zone.signature,
+            shortcut_id: None,
+            exit_socket: template.exit,
+            zone_index: active_zone_index,
+            biome: active_zone.biome,
+            connector: if segment_index == active_zone.start_segment {
+                active_zone.entry_connector
+            } else if segment_index == active_zone.end_segment {
+                active_zone.exit_connector
+            } else {
+                ConnectorKind::Transfer
+            },
+            flow: active_zone.flow,
+            route_lines: segment_route_lines_for_zone(&active_zone, zone_t),
+            zone_local_t: zone_t,
+        };
+        if !segment_reachable(&segment, &blueprint.rooms) {
+            segment.kind = safe_fallback_kind(segment.difficulty);
+            segment.exit_socket = module_template(segment.kind).exit;
+        }
+        current_socket = segment.exit_socket;
+        blueprint.segments.push(segment);
+    }
+
+    let new_branches = generate_side_branches_in_range(
+        &mut rng,
+        &blueprint.rooms,
+        &blueprint.segments,
+        &blueprint.zones,
+        &mut occupied_branches,
+        start_index,
+        blueprint.rooms.len().saturating_sub(1),
+    );
+    blueprint.branches.extend(new_branches);
+    finalize_zone_ranges(&mut blueprint.zones, blueprint.segments.len());
+    populate_zone_branch_targets(&mut blueprint.zones, &blueprint.rooms, &blueprint.branches);
+    blueprint.floors = blueprint.rooms.len();
+    if let Some(last_room) = blueprint.rooms.last() {
+        blueprint.summit = last_room.top + Vec3::Y * 1.4;
+        blueprint.death_plane = last_room.top.y - 90.0;
+    }
 }
 
 fn choose_room_section(
@@ -2102,96 +3943,61 @@ fn choose_room_section(
 }
 
 fn generate_side_branches(
-    seed: u64,
+    _seed: u64,
     rng: &mut RunRng,
     rooms: &[RoomPlan],
     segments: &[SegmentPlan],
+    zones: &[ZonePlan],
     occupied_branches: &mut HashSet<IVec2>,
 ) -> Vec<BranchPlan> {
-    let mut branches = Vec::new();
-    let occupied_rooms = rooms.iter().map(|room| room.cell).collect::<HashSet<_>>();
+    let _ = (rng, rooms, segments, zones, occupied_branches);
+    Vec::new()
+}
 
-    for room in rooms.iter().skip(1).take(rooms.len().saturating_sub(2)) {
-        let adjacent_to_surf = segments
-            .get(room.index.saturating_sub(1))
-            .is_some_and(|segment| matches!(segment.kind, ModuleKind::SurfRamp))
-            || segments
-                .get(room.index)
-                .is_some_and(|segment| matches!(segment.kind, ModuleKind::SurfRamp));
-        if adjacent_to_surf {
-            continue;
-        }
-        let difficulty = room.index as f32 / rooms.len().max(1) as f32;
-        let main_forward = if room.index < rooms.len() - 1 {
-            direction_from_delta(rooms[room.index + 1].top - room.top)
-        } else {
-            direction_from_delta(room.top - rooms[room.index - 1].top)
-        };
-        if main_forward == Vec3::ZERO {
-            continue;
-        }
-        let branch_dirs = [
-            Vec3::new(-main_forward.z, 0.0, main_forward.x),
-            Vec3::new(main_forward.z, 0.0, -main_forward.x),
-        ];
-
-        for dir in branch_dirs {
-            let branch_cell = room_grid_cell(room.top + dir * (CELL_SIZE * 0.72));
-            if occupied_rooms.contains(&branch_cell) || occupied_branches.contains(&branch_cell) {
-                continue;
-            }
-            if !rng.chance(if difficulty > 0.3 { 0.34 } else { 0.2 }) {
-                continue;
-            }
-
-            let kind = if difficulty > 0.55 && rng.chance(0.45) {
-                BranchKind::RiskDetour
-            } else {
-                BranchKind::PropCache
-            };
-
-            let branch_top =
-                room.top + dir * (CELL_SIZE * 0.68) + Vec3::Y * rng.range_f32(0.2, 1.8);
-            let size = Vec2::new(rng.range_f32(5.0, 6.8), rng.range_f32(5.0, 6.8));
-            occupied_branches.insert(branch_cell);
-            branches.push(BranchPlan {
-                room_index: room.index,
-                dir,
-                top: branch_top,
-                size,
-                theme: room.theme,
-                kind,
-                seed: rng.next_u64(),
-                treasure_id: None,
-                shortcut_id: None,
-            });
-            break;
-        }
-    }
-
-    branches
+fn generate_side_branches_in_range(
+    rng: &mut RunRng,
+    rooms: &[RoomPlan],
+    segments: &[SegmentPlan],
+    zones: &[ZonePlan],
+    occupied_branches: &mut HashSet<IVec2>,
+    start_room: usize,
+    end_room: usize,
+) -> Vec<BranchPlan> {
+    let _ = (
+        rng,
+        rooms,
+        segments,
+        zones,
+        occupied_branches,
+        start_room,
+        end_room,
+    );
+    Vec::new()
 }
 
 fn validate_run_blueprint(blueprint: &RunBlueprint) -> ValidationOutcome {
     let mut volumes = Vec::new();
     let mut clearances = Vec::new();
+    let mut outcome = ValidationOutcome::default();
 
     for room in &blueprint.rooms {
         let layout = build_room_layout(room);
+        collect_internal_route_line_overlaps(&layout, &mut outcome);
         collect_layout_validation(&layout, &mut volumes, &mut clearances);
     }
     for segment in &blueprint.segments {
         let layout = build_segment_layout(segment, &blueprint.rooms, &HashSet::default());
+        collect_internal_route_line_overlaps(&layout, &mut outcome);
         collect_layout_validation(&layout, &mut volumes, &mut clearances);
     }
     for (index, branch) in blueprint.branches.iter().enumerate() {
         let layout = build_branch_layout(index, branch, &blueprint.rooms, &HashSet::default());
+        collect_internal_route_line_overlaps(&layout, &mut outcome);
         collect_layout_validation(&layout, &mut volumes, &mut clearances);
     }
     let layout = build_summit_layout(blueprint.rooms.last().unwrap(), blueprint.summit);
+    collect_internal_route_line_overlaps(&layout, &mut outcome);
     collect_layout_validation(&layout, &mut volumes, &mut clearances);
-
-    let mut outcome = ValidationOutcome::default();
 
     for i in 0..volumes.len() {
         for j in i + 1..volumes.len() {
@@ -2255,12 +4061,49 @@ fn collect_layout_validation(
     clearances.extend(layout.clearances.iter().cloned());
 }
 
+fn layout_has_internal_route_line_overlap(layout: &ModuleLayout) -> bool {
+    let volumes = layout
+        .solids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, solid)| solid.preview_volume().map(|volume| (index, volume)))
+        .collect::<Vec<_>>();
+
+    for i in 0..volumes.len() {
+        for j in i + 1..volumes.len() {
+            let (solid_i, volume_i) = volumes[i];
+            let (solid_j, volume_j) = volumes[j];
+            let line_i = route_line_from_label(&layout.solids[solid_i].label);
+            let line_j = route_line_from_label(&layout.solids[solid_j].label);
+            if line_i.is_none() || line_j.is_none() || line_i == line_j {
+                continue;
+            }
+            if intersects(volume_i, volume_j, 0.08) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn collect_internal_route_line_overlaps(layout: &ModuleLayout, outcome: &mut ValidationOutcome) {
+    if layout_has_internal_route_line_overlap(layout) {
+        outcome.overlap_issues += 1;
+        if let Some(owner) = layout.solids.first().map(|solid| solid.owner) {
+            outcome.first_overlap.get_or_insert((owner, owner));
+        }
+    }
+}
+
 impl SolidSpec {
     fn preview_volume(&self) -> Option<AabbVolume> {
         let size = match &self.body {
-            SolidBody::Static | SolidBody::Crumbling { .. } | SolidBody::ShortcutBridge { .. } => {
-                self.size
-            }
+            SolidBody::Static
+            | SolidBody::StaticSphere
+            | SolidBody::StaticCylinder
+            | SolidBody::StaticTrapezoid { .. }
+            | SolidBody::Crumbling { .. }
+            | SolidBody::ShortcutBridge { .. } => self.size,
             SolidBody::StaticSurfWedge { render_points, .. } => {
                 if render_points.is_empty() {
                     return None;
@@ -2338,6 +4181,38 @@ fn downgrade_segment_owner(
     true
 }
 
+fn trim_segment_route_lines(blueprint: &mut RunBlueprint, owner: OwnerTag) -> bool {
+    let OwnerTag::Segment(index) = owner else {
+        return false;
+    };
+    let Some(segment) = blueprint.segments.get_mut(index) else {
+        return false;
+    };
+    if segment.route_lines.len() <= 1 {
+        return false;
+    }
+
+    if let Some(position) = segment
+        .route_lines
+        .iter()
+        .position(|line| matches!(line, RouteLine::Trick))
+    {
+        segment.route_lines.remove(position);
+        return true;
+    }
+    if let Some(position) = segment
+        .route_lines
+        .iter()
+        .position(|line| matches!(line, RouteLine::Safe))
+    {
+        segment.route_lines.remove(position);
+        return true;
+    }
+
+    segment.route_lines.truncate(1);
+    true
+}
+
 fn lift_room_owner(blueprint: &mut RunBlueprint, owner: OwnerTag) -> bool {
     let OwnerTag::Room(index) = owner else {
         return false;
@@ -2348,6 +4223,38 @@ fn lift_room_owner(blueprint: &mut RunBlueprint, owner: OwnerTag) -> bool {
 
     for room in blueprint.rooms.iter_mut().skip(index) {
         room.top.y += 0.9;
+    }
+    if let Some(last) = blueprint.rooms.last() {
+        blueprint.summit = last.top + Vec3::Y * 1.4;
+    }
+    true
+}
+
+fn spread_room_owner(blueprint: &mut RunBlueprint, owner: OwnerTag, amount: f32) -> bool {
+    let index = match owner {
+        OwnerTag::Room(index) => index,
+        OwnerTag::Segment(index) => index.saturating_add(1),
+        _ => return false,
+    };
+    if index == 0 || index >= blueprint.rooms.len() {
+        return false;
+    }
+
+    let forward = if index + 1 < blueprint.rooms.len() {
+        direction_from_delta(blueprint.rooms[index + 1].top - blueprint.rooms[index - 1].top)
+    } else {
+        direction_from_delta(blueprint.rooms[index].top - blueprint.rooms[index - 1].top)
+    };
+    if forward == Vec3::ZERO {
+        return false;
+    }
+    let right = Vec3::new(-forward.z, 0.0, forward.x);
+    let sign = if index % 2 == 0 { 1.0 } else { -1.0 };
+    let shift = right * amount * sign + forward * (amount * 0.4);
+
+    for room in blueprint.rooms.iter_mut().skip(index) {
+        room.top += shift;
+        room.cell = room_grid_cell(room.top);
     }
     if let Some(last) = blueprint.rooms.last() {
         blueprint.summit = last.top + Vec3::Y * 1.4;
@@ -2392,6 +4299,12 @@ fn choose_module_template(
                 template.kind,
                 ModuleKind::SurfRamp
                     | ModuleKind::StairRun
+                    | ModuleKind::WindowHop
+                    | ModuleKind::PillarAirstrafe
+                    | ModuleKind::HeadcheckRun
+                    | ModuleKind::SpeedcheckRun
+                    | ModuleKind::MovingPlatformRun
+                    | ModuleKind::ShapeGauntlet
                     | ModuleKind::CrumbleBridge
                     | ModuleKind::WindTunnel
                     | ModuleKind::IceSpine
@@ -2403,13 +4316,31 @@ fn choose_module_template(
         if difficulty > 0.2 && matches!(template.kind, ModuleKind::SurfRamp) {
             weight += 3;
         }
-        if difficulty > 0.35 && matches!(template.kind, ModuleKind::StairRun) {
+        if difficulty > 0.35
+            && matches!(template.kind, ModuleKind::StairRun | ModuleKind::WindowHop)
+        {
             weight += 4;
+        }
+        if difficulty > 0.32
+            && matches!(
+                template.kind,
+                ModuleKind::PillarAirstrafe
+                    | ModuleKind::HeadcheckRun
+                    | ModuleKind::SpeedcheckRun
+                    | ModuleKind::MovingPlatformRun
+                    | ModuleKind::ShapeGauntlet
+            )
+        {
+            weight += 3;
         }
         if difficulty < 0.35
             && matches!(
                 template.kind,
-                ModuleKind::SurfRamp | ModuleKind::MantleStack | ModuleKind::WaterGarden
+                ModuleKind::SurfRamp
+                    | ModuleKind::StairRun
+                    | ModuleKind::WindowHop
+                    | ModuleKind::MantleStack
+                    | ModuleKind::WaterGarden
             )
         {
             weight += 3;
@@ -2432,10 +4363,16 @@ fn choose_module_template(
     rng.weighted_choice(&weighted)
 }
 
-fn all_templates() -> [ModuleTemplate; 11] {
-    [
+fn all_templates() -> Vec<ModuleTemplate> {
+    vec![
         module_template(ModuleKind::StairRun),
         module_template(ModuleKind::SurfRamp),
+        module_template(ModuleKind::WindowHop),
+        module_template(ModuleKind::PillarAirstrafe),
+        module_template(ModuleKind::HeadcheckRun),
+        module_template(ModuleKind::SpeedcheckRun),
+        module_template(ModuleKind::MovingPlatformRun),
+        module_template(ModuleKind::ShapeGauntlet),
         module_template(ModuleKind::MantleStack),
         module_template(ModuleKind::WallRunHall),
         module_template(ModuleKind::LiftChasm),
@@ -2445,6 +4382,7 @@ fn all_templates() -> [ModuleTemplate; 11] {
         module_template(ModuleKind::WaterGarden),
         module_template(ModuleKind::StairRun),
         module_template(ModuleKind::SurfRamp),
+        module_template(ModuleKind::ShapeGauntlet),
     ]
 }
 
@@ -2474,6 +4412,84 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 150.0,
             min_gap: 40.0,
             max_gap: 520.0,
+            shortcut_eligible: false,
+        },
+        ModuleKind::WindowHop => ModuleTemplate {
+            kind,
+            entry: SOCKET_SAFE_REST | SOCKET_SHORTCUT_ANCHOR,
+            exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
+            min_difficulty: 0.1,
+            max_difficulty: 0.86,
+            weight: 4,
+            min_rise: 14.0,
+            max_rise: 34.0,
+            min_gap: 20.0,
+            max_gap: 88.0,
+            shortcut_eligible: false,
+        },
+        ModuleKind::PillarAirstrafe => ModuleTemplate {
+            kind,
+            entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
+            exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
+            min_difficulty: 0.18,
+            max_difficulty: 1.0,
+            weight: 4,
+            min_rise: 18.0,
+            max_rise: 48.0,
+            min_gap: 24.0,
+            max_gap: 128.0,
+            shortcut_eligible: false,
+        },
+        ModuleKind::HeadcheckRun => ModuleTemplate {
+            kind,
+            entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
+            exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
+            min_difficulty: 0.16,
+            max_difficulty: 0.92,
+            weight: 3,
+            min_rise: 16.0,
+            max_rise: 40.0,
+            min_gap: 20.0,
+            max_gap: 92.0,
+            shortcut_eligible: false,
+        },
+        ModuleKind::SpeedcheckRun => ModuleTemplate {
+            kind,
+            entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
+            exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH | SOCKET_SHORTCUT_ANCHOR,
+            min_difficulty: 0.28,
+            max_difficulty: 1.0,
+            weight: 4,
+            min_rise: 18.0,
+            max_rise: 54.0,
+            min_gap: 24.0,
+            max_gap: 128.0,
+            shortcut_eligible: false,
+        },
+        ModuleKind::MovingPlatformRun => ModuleTemplate {
+            kind,
+            entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH | SOCKET_SHORTCUT_ANCHOR,
+            exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
+            min_difficulty: 0.2,
+            max_difficulty: 0.9,
+            weight: 3,
+            min_rise: 18.0,
+            max_rise: 42.0,
+            min_gap: 22.0,
+            max_gap: 110.0,
+            shortcut_eligible: false,
+        },
+        ModuleKind::ShapeGauntlet => ModuleTemplate {
+            kind,
+            entry: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
+            exit: SOCKET_SAFE_REST | SOCKET_HAZARD_BRANCH,
+            min_difficulty: 0.24,
+            max_difficulty: 1.0,
+            weight: 4,
+            min_rise: 20.0,
+            max_rise: 58.0,
+            min_gap: 26.0,
+            max_gap: 150.0,
             shortcut_eligible: false,
         },
         ModuleKind::MantleStack => ModuleTemplate {
@@ -2571,7 +4587,9 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
 }
 
 fn safe_fallback_kind(difficulty: f32) -> ModuleKind {
-    if difficulty > 0.4 {
+    if difficulty > 0.62 {
+        ModuleKind::ShapeGauntlet
+    } else if difficulty > 0.4 {
         ModuleKind::StairRun
     } else {
         ModuleKind::SurfRamp
@@ -2666,7 +4684,8 @@ fn stream_focus_room(
     let last_room = blueprint.rooms.len().saturating_sub(1);
     let checkpoint_index = checkpoint_index.min(last_room);
     let search_start = checkpoint_index.saturating_sub(1);
-    let search_end = (checkpoint_index + STREAM_AHEAD_ROOMS + 4).min(last_room);
+    let search_end =
+        (checkpoint_index + STREAM_AHEAD_ROOMS + INFINITE_APPEND_TRIGGER_ROOMS + 8).min(last_room);
     let mut best_room = checkpoint_index;
     let mut best_score = f32::INFINITY;
 
@@ -2690,7 +4709,7 @@ fn stream_window(blueprint: &RunBlueprint, focus_room: usize) -> StreamWindow {
     let focus_room = focus_room.min(last_room);
     let start_room = focus_room.saturating_sub(STREAM_BEHIND_ROOMS);
     let end_room = (focus_room + STREAM_AHEAD_ROOMS).min(last_room);
-    let frontier_room = (end_room + 1).min(last_room);
+    let frontier_room = (end_room + 2).min(last_room);
 
     StreamWindow {
         start_room,
@@ -2707,7 +4726,7 @@ fn desired_chunk_window(blueprint: &RunBlueprint, focus_room: usize) -> Vec<Worl
     }
     for segment in &blueprint.segments {
         if segment.from >= window.start_room.saturating_sub(1)
-            && segment.from <= window.frontier_room
+            && segment.from < window.frontier_room
         {
             chunks.push(WorldChunkKey::Segment(segment.index));
         }
@@ -2716,9 +4735,6 @@ fn desired_chunk_window(blueprint: &RunBlueprint, focus_room: usize) -> Vec<Worl
         if (window.start_room..=window.frontier_room).contains(&branch.room_index) {
             chunks.push(WorldChunkKey::Branch(branch_index));
         }
-    }
-    if window.frontier_room + 1 == blueprint.rooms.len() {
-        chunks.push(WorldChunkKey::Summit);
     }
 
     chunks
@@ -2807,6 +4823,7 @@ fn spawn_sky_backdrop(
 ) {
     let (center, course_radius) = course_visual_center_and_radius(blueprint);
     let mut sky_rng = RunRng::new(blueprint.seed ^ 0xC1A0_DA7A_55AA_9911);
+    let manual_moon_scale = MANUAL_MOON_SIZE_MULTIPLIER;
     let moon_heading = if blueprint.rooms.len() > 1 {
         let mut heading = blueprint.rooms[1].top - blueprint.rooms[0].top;
         heading.y = 0.0;
@@ -2824,7 +4841,7 @@ fn spawn_sky_backdrop(
         ..default()
     });
     let upper_haze_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.24, 0.22, 0.38, 0.1),
+        base_color: Color::srgba(0.24, 0.22, 0.38, 0.06),
         emissive: LinearRgba::rgb(0.18, 0.16, 0.32),
         unlit: true,
         cull_mode: None,
@@ -2832,7 +4849,7 @@ fn spawn_sky_backdrop(
         ..default()
     });
     let horizon_glow_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.32, 0.24, 0.34, 0.16),
+        base_color: Color::srgba(0.32, 0.24, 0.34, 0.1),
         emissive: LinearRgba::rgb(0.52, 0.32, 0.46),
         unlit: true,
         cull_mode: None,
@@ -2840,39 +4857,55 @@ fn spawn_sky_backdrop(
         ..default()
     });
     let nebula_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.22, 0.18, 0.32, 0.1),
+        base_color: Color::srgba(0.22, 0.18, 0.32, 0.05),
         emissive: LinearRgba::rgb(0.34, 0.22, 0.36),
         unlit: true,
         cull_mode: None,
         alpha_mode: AlphaMode::Blend,
         ..default()
     });
+    let nebula_ribbon_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.22, 0.16, 0.3, 0.04),
+        emissive: LinearRgba::rgb(0.28, 0.18, 0.38),
+        unlit: true,
+        cull_mode: None,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
     let aurora_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.18, 0.7, 0.74, 0.05),
+        base_color: Color::srgba(0.18, 0.7, 0.74, 0.03),
         emissive: LinearRgba::rgb(0.18, 0.78, 0.86),
         unlit: true,
         cull_mode: None,
         alpha_mode: AlphaMode::Blend,
         ..default()
     });
-    let aurora_secondary_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.1, 0.34, 0.86, 0.035),
-        emissive: LinearRgba::rgb(0.08, 0.24, 0.72),
-        unlit: true,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
-    });
     let cloud_deck_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.12, 0.1, 0.14, 0.18),
+        base_color: Color::srgba(0.12, 0.1, 0.14, 0.1),
         emissive: LinearRgba::rgb(0.06, 0.05, 0.08),
         unlit: true,
         cull_mode: None,
         alpha_mode: AlphaMode::Blend,
         ..default()
     });
+    let light_shaft_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.44, 0.62, 0.92, 0.035),
+        emissive: LinearRgba::rgb(0.18, 0.28, 0.42),
+        unlit: true,
+        cull_mode: None,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    let dust_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.28, 0.32, 0.42, 0.025),
+        emissive: LinearRgba::rgb(0.06, 0.08, 0.14),
+        unlit: true,
+        cull_mode: None,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
     let cloud_puff_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.14, 0.12, 0.18, 0.12),
+        base_color: Color::srgba(0.14, 0.12, 0.18, 0.07),
         emissive: LinearRgba::rgb(0.07, 0.06, 0.11),
         unlit: true,
         cull_mode: None,
@@ -2981,40 +5014,6 @@ fn spawn_sky_backdrop(
     ));
     commands.spawn((
         GeneratedWorld,
-        AtmosphereMaterialKind::Aurora,
-        Name::new("Aurora Echo"),
-        Mesh3d(aurora_ring_mesh),
-        MeshMaterial3d(aurora_secondary_material),
-        Transform::from_translation(center + Vec3::new(120.0, 240.0, -80.0))
-            .with_rotation(
-                Quat::from_rotation_x(1.24)
-                    * Quat::from_rotation_y(-0.42)
-                    * Quat::from_rotation_z(-0.08),
-            )
-            .with_scale(Vec3::new(
-                course_radius + 680.0,
-                30.0,
-                course_radius + 680.0,
-            )),
-        NotShadowCaster,
-        NotShadowReceiver,
-        SkyDrift {
-            anchor: center + Vec3::new(120.0, 240.0, -80.0),
-            primary_axis: Vec3::new(0.8, 0.0, -0.5).normalize_or_zero(),
-            secondary_axis: Vec3::new(0.4, 0.0, 0.9).normalize_or_zero(),
-            primary_amplitude: 22.0,
-            secondary_amplitude: 12.0,
-            vertical_amplitude: 8.0,
-            speed: 0.02,
-            rotation_speed: -0.003,
-            phase: sky_rng.range_f32(0.0, TAU),
-            base_rotation: Quat::from_rotation_x(1.24)
-                * Quat::from_rotation_y(-0.42)
-                * Quat::from_rotation_z(-0.08),
-        },
-    ));
-    commands.spawn((
-        GeneratedWorld,
         AtmosphereMaterialKind::CloudDeck,
         Name::new("Cloud Sea"),
         Mesh3d(cloud_mesh.clone()),
@@ -3024,18 +5023,6 @@ fn spawn_sky_backdrop(
         NotShadowCaster,
         NotShadowReceiver,
     ));
-    commands.spawn((
-        GeneratedWorld,
-        AtmosphereMaterialKind::CloudDeck,
-        Name::new("Deep Fog Sea"),
-        Mesh3d(cloud_mesh.clone()),
-        MeshMaterial3d(cloud_deck_material.clone()),
-        Transform::from_translation(Vec3::new(center.x, blueprint.death_plane - 92.0, center.z))
-            .with_scale(Vec3::new(course_radius * 3.1, 52.0, course_radius * 3.1)),
-        NotShadowCaster,
-        NotShadowReceiver,
-    ));
-
     for cloud_index in 0..CLOUD_PUFF_COUNT {
         let angle =
             TAU * (cloud_index as f32 / CLOUD_PUFF_COUNT as f32) + sky_rng.range_f32(-0.35, 0.35);
@@ -3077,6 +5064,117 @@ fn spawn_sky_backdrop(
         ));
     }
 
+    for ribbon_index in 0..5 {
+        let angle = TAU * (ribbon_index as f32 / 5.0) + sky_rng.range_f32(-0.28, 0.28);
+        let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
+        let tangent = Vec3::new(-radial.z, 0.0, radial.x);
+        let anchor = center
+            + radial * sky_rng.range_f32(course_radius * 0.5, course_radius * 1.15)
+            + Vec3::Y * sky_rng.range_f32(180.0, 420.0);
+        commands.spawn((
+            GeneratedWorld,
+            AtmosphereMaterialKind::NebulaRibbon,
+            Name::new("Nebula Ribbon"),
+            Mesh3d(cloud_mesh.clone()),
+            MeshMaterial3d(nebula_ribbon_material.clone()),
+            Transform::from_translation(anchor)
+                .with_rotation(Quat::from_rotation_y(angle + PI * 0.5))
+                .with_scale(Vec3::new(
+                    sky_rng.range_f32(180.0, 320.0),
+                    sky_rng.range_f32(20.0, 36.0),
+                    sky_rng.range_f32(52.0, 92.0),
+                )),
+            NotShadowCaster,
+            NotShadowReceiver,
+            SkyDrift {
+                anchor,
+                primary_axis: tangent,
+                secondary_axis: radial,
+                primary_amplitude: sky_rng.range_f32(18.0, 36.0),
+                secondary_amplitude: sky_rng.range_f32(6.0, 14.0),
+                vertical_amplitude: sky_rng.range_f32(3.0, 8.0),
+                speed: sky_rng.range_f32(0.012, 0.03),
+                rotation_speed: sky_rng.range_f32(-0.006, 0.006),
+                phase: sky_rng.range_f32(0.0, TAU),
+                base_rotation: Quat::from_rotation_y(angle + PI * 0.5),
+            },
+        ));
+    }
+
+    for shaft_index in 0..8 {
+        let angle = TAU * (shaft_index as f32 / 8.0) + sky_rng.range_f32(-0.18, 0.18);
+        let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
+        let tangent = Vec3::new(-radial.z, 0.0, radial.x);
+        let anchor = center
+            + radial * sky_rng.range_f32(course_radius * 0.24, course_radius * 0.92)
+            + Vec3::Y * sky_rng.range_f32(120.0, 320.0);
+        commands.spawn((
+            GeneratedWorld,
+            AtmosphereMaterialKind::LightShaft,
+            Name::new("Light Shaft"),
+            Mesh3d(comet_mesh.clone()),
+            MeshMaterial3d(light_shaft_material.clone()),
+            Transform::from_translation(anchor)
+                .with_rotation(Quat::from_rotation_y(angle + sky_rng.range_f32(-0.2, 0.2)))
+                .with_scale(Vec3::new(
+                    sky_rng.range_f32(42.0, 88.0),
+                    sky_rng.range_f32(420.0, 720.0),
+                    sky_rng.range_f32(8.0, 18.0),
+                )),
+            NotShadowCaster,
+            NotShadowReceiver,
+            SkyDrift {
+                anchor,
+                primary_axis: tangent,
+                secondary_axis: radial,
+                primary_amplitude: sky_rng.range_f32(10.0, 18.0),
+                secondary_amplitude: sky_rng.range_f32(2.0, 6.0),
+                vertical_amplitude: sky_rng.range_f32(4.0, 10.0),
+                speed: sky_rng.range_f32(0.008, 0.02),
+                rotation_speed: sky_rng.range_f32(-0.003, 0.003),
+                phase: sky_rng.range_f32(0.0, TAU),
+                base_rotation: Quat::from_rotation_y(angle),
+            },
+        ));
+    }
+
+    for dust_index in 0..14 {
+        let angle = TAU * (dust_index as f32 / 14.0) + sky_rng.range_f32(-0.26, 0.26);
+        let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
+        let tangent = Vec3::new(-radial.z, 0.0, radial.x);
+        let anchor = center
+            + radial * sky_rng.range_f32(course_radius * 0.3, course_radius * 1.2)
+            + Vec3::Y * sky_rng.range_f32(-120.0, 260.0);
+        commands.spawn((
+            GeneratedWorld,
+            AtmosphereMaterialKind::DustField,
+            Name::new("Drifting Dust"),
+            Mesh3d(comet_mesh.clone()),
+            MeshMaterial3d(dust_material.clone()),
+            Transform::from_translation(anchor)
+                .with_rotation(Quat::from_rotation_y(angle + sky_rng.range_f32(-0.3, 0.3)))
+                .with_scale(Vec3::new(
+                    sky_rng.range_f32(140.0, 280.0),
+                    sky_rng.range_f32(12.0, 24.0),
+                    sky_rng.range_f32(36.0, 74.0),
+                )),
+            NotShadowCaster,
+            NotShadowReceiver,
+            SkyDrift {
+                anchor,
+                primary_axis: tangent,
+                secondary_axis: radial,
+                primary_amplitude: sky_rng.range_f32(20.0, 42.0),
+                secondary_amplitude: sky_rng.range_f32(8.0, 18.0),
+                vertical_amplitude: sky_rng.range_f32(2.0, 6.0),
+                speed: sky_rng.range_f32(0.014, 0.034),
+                rotation_speed: sky_rng.range_f32(-0.004, 0.004),
+                phase: sky_rng.range_f32(0.0, TAU),
+                base_rotation: Quat::from_rotation_y(angle),
+            },
+        ));
+    }
+
     let mut starfield = ColoredMeshBuilder::default();
     for star_index in 0..STAR_COUNT {
         let f = star_index as f32 / STAR_COUNT as f32;
@@ -3085,7 +5183,7 @@ fn spawn_sky_backdrop(
         let r = (1.0 - y * y).sqrt();
         let direction = Vec3::new(r * theta.cos(), y, r * theta.sin());
         let position = center + Vec3::Y * 120.0 + direction * (SKY_RADIUS * 0.9);
-        let size = 0.12 + ((star_index * 37 % 17) as f32) * 0.022;
+        let size = (0.12 + ((star_index * 37 % 17) as f32) * 0.022) * STAR_SIZE_MULTIPLIER;
         let tint = if star_index % 9 == 0 {
             Color::linear_rgb(4.2, 4.8, 6.9)
         } else if star_index % 7 == 0 {
@@ -3111,8 +5209,8 @@ fn spawn_sky_backdrop(
         let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
         let tangent = Vec3::new(-radial.z, 0.0, radial.x);
         let anchor = center
-            + radial * sky_rng.range_f32(course_radius + 260.0, course_radius + 430.0)
-            + Vec3::Y * sky_rng.range_f32(150.0, 280.0);
+            + radial * sky_rng.range_f32(course_radius + 540.0, course_radius + 960.0)
+            + Vec3::Y * sky_rng.range_f32(220.0, 420.0);
         let cluster_tint = if cluster_index % 2 == 0 {
             Color::linear_rgb(4.2, 5.0, 6.6)
         } else {
@@ -3130,7 +5228,7 @@ fn spawn_sky_backdrop(
                 &mut cluster_mesh,
                 offset,
                 direction,
-                sky_rng.range_f32(0.28, 0.9),
+                sky_rng.range_f32(0.28, 0.9) * STAR_CLUSTER_SIZE_MULTIPLIER,
                 cluster_tint,
             );
         }
@@ -3163,8 +5261,8 @@ fn spawn_sky_backdrop(
         let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
         let tangent = Vec3::new(-radial.z, 0.0, radial.x);
         let anchor = center
-            + radial * sky_rng.range_f32(course_radius + 320.0, course_radius + 520.0)
-            + Vec3::Y * sky_rng.range_f32(190.0, 320.0);
+            + radial * sky_rng.range_f32(course_radius + 760.0, course_radius + 1_280.0)
+            + Vec3::Y * sky_rng.range_f32(260.0, 520.0);
         let comet_tint = if comet_index % 2 == 0 {
             Color::linear_rgb(3.8, 4.8, 6.4)
         } else {
@@ -3184,8 +5282,8 @@ fn spawn_sky_backdrop(
             unlit: true,
             ..default()
         });
-        let tail_length = sky_rng.range_f32(24.0, 44.0);
-        let tail_width = sky_rng.range_f32(1.0, 2.0);
+        let tail_length = sky_rng.range_f32(24.0, 44.0) * COMET_SIZE_MULTIPLIER;
+        let tail_width = sky_rng.range_f32(1.0, 2.0) * COMET_SIZE_MULTIPLIER;
         commands
             .spawn((
                 GeneratedWorld,
@@ -3294,9 +5392,12 @@ fn spawn_sky_backdrop(
             ..default()
         })),
         Transform::from_translation(
-            center + moon_heading * (course_radius + 260.0) + moon_right * 120.0 + Vec3::Y * 310.0,
+            center
+                + moon_heading * (course_radius + 1_780.0)
+                + moon_right * 740.0
+                + Vec3::Y * 520.0,
         )
-        .with_scale(Vec3::splat(64.0)),
+        .with_scale(Vec3::splat(64.0 * manual_moon_scale)),
         NotShadowCaster,
         NotShadowReceiver,
     ));
@@ -3314,9 +5415,12 @@ fn spawn_sky_backdrop(
             ..default()
         })),
         Transform::from_translation(
-            center + moon_heading * (course_radius + 260.0) + moon_right * 120.0 + Vec3::Y * 310.0,
+            center
+                + moon_heading * (course_radius + 1_780.0)
+                + moon_right * 740.0
+                + Vec3::Y * 520.0,
         )
-        .with_scale(Vec3::splat(82.0)),
+        .with_scale(Vec3::splat(82.0 * manual_moon_scale)),
         NotShadowCaster,
         NotShadowReceiver,
     ));
@@ -3332,11 +5436,11 @@ fn spawn_sky_backdrop(
             ..default()
         })),
         Transform::from_xyz(
-            center.x - course_radius - 230.0,
-            center.y + 260.0,
-            center.z + course_radius + 180.0,
+            center.x - course_radius - 1_420.0,
+            center.y + 520.0,
+            center.z + course_radius + 1_180.0,
         )
-        .with_scale(Vec3::splat(34.0)),
+        .with_scale(Vec3::splat(34.0 * manual_moon_scale)),
         NotShadowCaster,
         NotShadowReceiver,
     ));
@@ -3352,11 +5456,11 @@ fn spawn_sky_backdrop(
             ..default()
         })),
         Transform::from_xyz(
-            center.x + course_radius + 280.0,
-            center.y + 170.0,
-            center.z - course_radius - 210.0,
+            center.x + course_radius + 1_640.0,
+            center.y + 440.0,
+            center.z - course_radius - 1_360.0,
         )
-        .with_scale(Vec3::splat(18.0)),
+        .with_scale(Vec3::splat(18.0 * manual_moon_scale)),
         NotShadowCaster,
         NotShadowReceiver,
     ));
@@ -3372,9 +5476,11 @@ fn spawn_sky_backdrop(
             ..default()
         })),
         Transform::from_translation(
-            center - moon_right * (course_radius + 220.0) + moon_heading * 140.0 + Vec3::Y * 240.0,
+            center - moon_right * (course_radius + 1_520.0)
+                + moon_heading * 620.0
+                + Vec3::Y * 600.0,
         )
-        .with_scale(Vec3::splat(22.0)),
+        .with_scale(Vec3::splat(22.0 * manual_moon_scale)),
         NotShadowCaster,
         NotShadowReceiver,
     ));
@@ -3390,9 +5496,10 @@ fn spawn_sky_backdrop(
             ..default()
         })),
         Transform::from_translation(
-            center + moon_right * (course_radius + 340.0) - moon_heading * 180.0 + Vec3::Y * 210.0,
+            center + moon_right * (course_radius + 1_940.0) - moon_heading * 820.0
+                + Vec3::Y * 460.0,
         )
-        .with_scale(Vec3::splat(14.0)),
+        .with_scale(Vec3::splat(14.0 * manual_moon_scale)),
         NotShadowCaster,
         NotShadowReceiver,
     ));
@@ -3450,7 +5557,7 @@ struct CelestialMeshLibrary {
     cuboid: Handle<Mesh>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CelestialShapeKind {
     Sphere,
     Torus,
@@ -3539,6 +5646,9 @@ fn spawn_floating_celestial_entity(
     let mesh = shape.mesh(mesh_library);
     let ring_mesh = mesh_library.torus.clone();
     let shape_scale = shape.scale(radius);
+    let emits_light = glows && ringed;
+    let glow_range = (radius * 1.2).clamp(140.0, 420.0);
+    let glow_intensity = (90_000.0 + radius * 5_000.0).min(900_000.0);
     let shell_material = materials.add(StandardMaterial {
         base_color: tint,
         emissive: LinearRgba::from(tint) * 0.18,
@@ -3551,8 +5661,8 @@ fn spawn_floating_celestial_entity(
         ..default()
     });
     let atmosphere_material = materials.add(StandardMaterial {
-        base_color: tint.with_alpha(0.14),
-        emissive: LinearRgba::from(tint) * 0.52,
+        base_color: tint.with_alpha(0.07),
+        emissive: LinearRgba::from(tint) * 0.24,
         unlit: true,
         alpha_mode: AlphaMode::Blend,
         cull_mode: None,
@@ -3577,7 +5687,7 @@ fn spawn_floating_celestial_entity(
     let mut entity = commands.spawn((
         GeneratedWorld,
         AtmosphereMaterialKind::Celestial,
-        Name::new("Floating Sphere"),
+        Name::new("Floating Celestial"),
         Mesh3d(mesh.clone()),
         MeshMaterial3d(shell_material),
         Transform::from_translation(anchor).with_scale(shape_scale),
@@ -3598,28 +5708,30 @@ fn spawn_floating_celestial_entity(
     ));
 
     entity.with_children(|parent| {
-        parent.spawn((
-            Name::new("Floating Sphere Core"),
-            AtmosphereMaterialKind::Celestial,
-            Mesh3d(mesh.clone()),
-            MeshMaterial3d(core_material),
-            Transform::from_scale(shape.halo_scale() * 0.9),
-            NotShadowCaster,
-            NotShadowReceiver,
-        ));
-        parent.spawn((
-            Name::new("Floating Sphere Atmosphere"),
-            AtmosphereMaterialKind::Celestial,
-            Mesh3d(mesh.clone()),
-            MeshMaterial3d(atmosphere_material),
-            Transform::from_scale(shape.halo_scale() + Vec3::splat(radius / 110.0)),
-            NotShadowCaster,
-            NotShadowReceiver,
-        ));
+        if glows {
+            parent.spawn((
+                Name::new("Floating Celestial Core"),
+                AtmosphereMaterialKind::Celestial,
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(core_material),
+                Transform::from_scale(shape.halo_scale() * 0.9),
+                NotShadowCaster,
+                NotShadowReceiver,
+            ));
+            parent.spawn((
+                Name::new("Floating Celestial Atmosphere"),
+                AtmosphereMaterialKind::Celestial,
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(atmosphere_material),
+                Transform::from_scale(shape.halo_scale() + Vec3::splat(radius / 220.0)),
+                NotShadowCaster,
+                NotShadowReceiver,
+            ));
+        }
 
         if ringed {
             parent.spawn((
-                Name::new("Floating Sphere Ring"),
+                Name::new("Floating Celestial Ring"),
                 AtmosphereMaterialKind::Celestial,
                 Mesh3d(ring_mesh),
                 MeshMaterial3d(ring_material),
@@ -3630,12 +5742,12 @@ fn spawn_floating_celestial_entity(
             ));
         }
 
-        if glows {
+        if emits_light {
             parent.spawn((
-                Name::new("Floating Sphere Light"),
+                Name::new("Floating Celestial Light"),
                 PointLight {
-                    intensity: 100_000.0 + radius * radius * 1_300.0,
-                    range: radius * 7.8,
+                    intensity: glow_intensity,
+                    range: glow_range,
                     color: tint,
                     shadows_enabled: false,
                     ..default()
@@ -3665,20 +5777,102 @@ struct CelestialBodyPlan {
     ringed: bool,
 }
 
+fn celestial_vertical_bias(rng: &mut RunRng, index: usize, count: usize) -> f32 {
+    let phase = TAU * (index as f32 / count.max(1) as f32);
+    let wave = (phase * 1.7).sin() * 0.82 + (phase * 0.55 + 1.2).cos() * 0.34;
+    (wave + rng.range_f32(-0.4, 0.4)).clamp(-1.25, 1.25)
+}
+
+fn disperse_celestial_anchor(
+    blueprint: &RunBlueprint,
+    anchor: Vec3,
+    radial: Vec3,
+    tangent: Vec3,
+    radius: f32,
+    major: bool,
+    vertical_bias: f32,
+) -> Vec3 {
+    let vertical_span = if major {
+        360.0 + radius * 0.18
+    } else {
+        250.0 + radius * 0.14
+    };
+    let tangential_shift = vertical_bias
+        * if major {
+            140.0 + radius * 0.12
+        } else {
+            90.0 + radius * 0.08
+        };
+    let minimum_clearance = if major {
+        140.0 + radius * 0.52
+    } else {
+        120.0 + radius * 0.4
+    };
+    let mut displaced =
+        anchor + Vec3::Y * (vertical_bias * vertical_span) + tangent * tangential_shift;
+    let clearance = celestial_course_clearance(blueprint, displaced, radius);
+    if clearance < minimum_clearance {
+        displaced += radial * (minimum_clearance - clearance + 24.0);
+    }
+    displaced
+}
+
 fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan> {
     let (center, course_radius) = course_visual_center_and_radius(blueprint);
     let mut rng = RunRng::new(blueprint.seed ^ 0x5151_AAAA_9999_7777);
-    let major_count = 12;
-    let moon_count = 18;
-    let decor_count = 28;
+    let major_shapes = [
+        CelestialShapeKind::Torus,
+        CelestialShapeKind::Capsule,
+        CelestialShapeKind::Frustum,
+        CelestialShapeKind::Cuboid,
+        CelestialShapeKind::Cone,
+        CelestialShapeKind::Cylinder,
+        CelestialShapeKind::Tetrahedron,
+        CelestialShapeKind::Cuboid,
+        CelestialShapeKind::Cuboid,
+        CelestialShapeKind::Torus,
+        CelestialShapeKind::Capsule,
+        CelestialShapeKind::Frustum,
+        CelestialShapeKind::Cone,
+        CelestialShapeKind::Cylinder,
+        CelestialShapeKind::Tetrahedron,
+        CelestialShapeKind::Capsule,
+    ];
+    let moon_shapes = [
+        CelestialShapeKind::Cuboid,
+        CelestialShapeKind::Tetrahedron,
+        CelestialShapeKind::Capsule,
+        CelestialShapeKind::Torus,
+        CelestialShapeKind::Frustum,
+        CelestialShapeKind::Cylinder,
+        CelestialShapeKind::Cone,
+        CelestialShapeKind::Sphere,
+        CelestialShapeKind::Cuboid,
+        CelestialShapeKind::Capsule,
+        CelestialShapeKind::Torus,
+        CelestialShapeKind::Frustum,
+        CelestialShapeKind::Tetrahedron,
+        CelestialShapeKind::Cylinder,
+        CelestialShapeKind::Cone,
+        CelestialShapeKind::Sphere,
+        CelestialShapeKind::Cuboid,
+        CelestialShapeKind::Capsule,
+        CelestialShapeKind::Torus,
+        CelestialShapeKind::Frustum,
+        CelestialShapeKind::Tetrahedron,
+        CelestialShapeKind::Sphere,
+    ];
+    let major_count = major_shapes.len();
+    let moon_count = moon_shapes.len();
+    let decor_count = 34;
     let mut bodies = Vec::with_capacity(major_count + moon_count + decor_count);
 
     for body_index in 0..major_count {
-        let angle = TAU * (body_index as f32 / major_count as f32) + rng.range_f32(-0.12, 0.12);
+        let angle = TAU * (body_index as f32 / major_count as f32) + rng.range_f32(-0.28, 0.28);
         let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
         let tangent = Vec3::new(-radial.z, 0.0, radial.x);
-        let radius = rng.range_f32(12.0, 24.0);
-        let shape = CelestialShapeKind::Sphere;
+        let radius = rng.range_f32(12.0, 24.0) * MAJOR_CELESTIAL_RADIUS_MULTIPLIER;
+        let shape = major_shapes[body_index];
         let clearance_radius = radius * shape.clearance_multiplier();
         let anchor = find_safe_celestial_anchor(
             blueprint,
@@ -3689,6 +5883,15 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             tangent,
             clearance_radius,
             true,
+        );
+        let anchor = disperse_celestial_anchor(
+            blueprint,
+            anchor,
+            radial,
+            tangent,
+            clearance_radius,
+            true,
+            celestial_vertical_bias(&mut rng, body_index, major_count),
         );
         let drift_secondary = (Vec3::Y * rng.range_f32(0.72, 1.0)
             + radial * rng.range_f32(-0.18, 0.18))
@@ -3707,17 +5910,18 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             phase: rng.range_f32(0.0, TAU),
             base_rotation: Quat::from_rotation_y(rng.range_f32(0.0, TAU)),
             tint: floating_sphere_color(body_index),
-            glows: true,
-            ringed: body_index % 3 == 0 || rng.range_f32(0.0, 1.0) > 0.72,
+            glows: body_index % 4 == 0 || rng.range_f32(0.0, 1.0) > 0.84,
+            ringed: shape != CelestialShapeKind::Torus
+                && (body_index % 4 == 0 || rng.range_f32(0.0, 1.0) > 0.78),
         });
     }
 
     for moon_index in 0..moon_count {
-        let angle = TAU * (moon_index as f32 / moon_count as f32) + rng.range_f32(-0.16, 0.16);
+        let angle = TAU * (moon_index as f32 / moon_count as f32) + rng.range_f32(-0.36, 0.36);
         let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
         let tangent = Vec3::new(-radial.z, 0.0, radial.x);
-        let radius = rng.range_f32(5.5, 10.5);
-        let shape = CelestialShapeKind::Sphere;
+        let radius = rng.range_f32(5.5, 10.5) * MOON_CELESTIAL_RADIUS_MULTIPLIER;
+        let shape = moon_shapes[moon_index];
         let clearance_radius = radius * shape.clearance_multiplier();
         let anchor = find_safe_celestial_anchor(
             blueprint,
@@ -3728,6 +5932,15 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             tangent,
             clearance_radius,
             false,
+        );
+        let anchor = disperse_celestial_anchor(
+            blueprint,
+            anchor,
+            radial,
+            tangent,
+            clearance_radius,
+            false,
+            celestial_vertical_bias(&mut rng, moon_index, moon_count),
         );
         let drift_secondary = (Vec3::Y * rng.range_f32(0.55, 0.95)
             + tangent * rng.range_f32(-0.25, 0.25))
@@ -3750,8 +5963,8 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
                 rng.range_f32(0.68, 0.9),
                 rng.range_f32(0.88, 1.0),
             ),
-            glows: true,
-            ringed: false,
+            glows: moon_index % 6 == 0 || rng.range_f32(0.0, 1.0) > 0.9,
+            ringed: shape != CelestialShapeKind::Torus && rng.range_f32(0.0, 1.0) > 0.9,
         });
     }
 
@@ -3765,11 +5978,11 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
         CelestialShapeKind::Cuboid,
     ];
     for decor_index in 0..decor_count {
-        let angle = TAU * (decor_index as f32 / decor_count as f32) + rng.range_f32(-0.08, 0.08);
+        let angle = TAU * (decor_index as f32 / decor_count as f32) + rng.range_f32(-0.24, 0.24);
         let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
         let tangent = Vec3::new(-radial.z, 0.0, radial.x);
         let shape = decor_shapes[decor_index % decor_shapes.len()];
-        let radius = rng.range_f32(4.0, 12.0);
+        let radius = rng.range_f32(4.0, 12.0) * DECOR_CELESTIAL_RADIUS_MULTIPLIER;
         let clearance_radius = radius * shape.clearance_multiplier();
         let mut anchor = find_safe_celestial_anchor(
             blueprint,
@@ -3780,7 +5993,16 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             tangent,
             clearance_radius,
             false,
-        ) + tangent * rng.range_f32(-42.0, 42.0);
+        );
+        anchor = disperse_celestial_anchor(
+            blueprint,
+            anchor,
+            radial,
+            tangent,
+            clearance_radius,
+            false,
+            celestial_vertical_bias(&mut rng, decor_index, decor_count),
+        ) + tangent * rng.range_f32(-72.0, 72.0);
         let decor_clearance = celestial_course_clearance(blueprint, anchor, clearance_radius);
         if decor_clearance < 120.0 {
             anchor += radial * (120.0 - decor_clearance + 24.0);
@@ -3809,7 +6031,7 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
                 rng.range_f32(0.0, TAU),
             ),
             tint: floating_sphere_color(decor_index + major_count + moon_count),
-            glows: decor_index % 3 != 0,
+            glows: decor_index % 7 == 0 || rng.range_f32(0.0, 1.0) > 0.93,
             ringed: false,
         });
     }
@@ -4049,6 +6271,249 @@ fn spawn_macro_spectacle(
             NotShadowReceiver,
         ));
     }
+
+    let landmark_ring_mesh = meshes.add(Torus {
+        minor_radius: 0.032,
+        major_radius: 1.0,
+    });
+    let landmark_box_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let landmark_material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        emissive: LinearRgba::rgb(0.22, 0.18, 0.36),
+        cull_mode: None,
+        alpha_mode: AlphaMode::Blend,
+        perceptual_roughness: 0.3,
+        reflectance: 0.52,
+        ..default()
+    });
+
+    for zone in &blueprint.zones {
+        let start_room_index = zone
+            .start_segment
+            .min(blueprint.rooms.len().saturating_sub(1));
+        let end_room_index = (zone.end_segment + 1).min(blueprint.rooms.len().saturating_sub(1));
+        let start_room = &blueprint.rooms[start_room_index];
+        let end_room = &blueprint.rooms[end_room_index];
+        let zone_forward = direction_from_delta(end_room.top - start_room.top);
+        let zone_forward = if zone_forward == Vec3::ZERO {
+            entry_heading
+        } else {
+            zone_forward
+        };
+        let zone_right = Vec3::new(-zone_forward.z, 0.0, zone_forward.x).normalize_or_zero();
+        let zone_center = start_room.top.lerp(end_room.top, 0.5);
+        let zone_span = start_room.top.distance(end_room.top).max(120.0);
+        let anchor = zone_center
+            + zone_right * zone.flow.drift_sign * (LANDMARK_OFFSET_RADIUS + zone_span * 0.08)
+            + Vec3::Y * (LANDMARK_VERTICAL_OFFSET + zone.index as f32 * 8.0);
+        let zone_color = match zone.role {
+            ZoneRole::Accelerator => Color::srgba(0.26, 0.88, 1.0, 0.16),
+            ZoneRole::Technical => Color::srgba(1.0, 0.42, 0.82, 0.16),
+            ZoneRole::Recovery => Color::srgba(0.54, 0.72, 1.0, 0.14),
+            ZoneRole::Spectacle => Color::srgba(0.88, 0.48, 1.0, 0.18),
+        };
+
+        match zone.landmark {
+            LandmarkKind::BrokenRing => {
+                let mut builder = ColoredMeshBuilder::default();
+                let radius = zone_span * 0.72 + 110.0;
+                let gap_start = rng.range_f32(0.1, 0.32);
+                let gap_end = gap_start + rng.range_f32(0.16, 0.28);
+                let samples = 56;
+                let mut previous = None;
+                for sample in 0..=samples {
+                    let t = sample as f32 / samples as f32;
+                    if (gap_start..gap_end).contains(&t) {
+                        previous = None;
+                        continue;
+                    }
+                    let angle = TAU * t + zone.index as f32 * 0.33;
+                    let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
+                    let point = anchor
+                        + radial * radius
+                        + Vec3::Y * ((t * TAU * 2.0).sin() * radius * 0.06);
+                    if let Some(last) = previous {
+                        append_beam_segment(
+                            &mut builder,
+                            last,
+                            point,
+                            10.0,
+                            1.0,
+                            radial,
+                            angle * 0.25,
+                            zone_color,
+                        );
+                    }
+                    previous = Some(point);
+                }
+                commands.spawn((
+                    GeneratedWorld,
+                    AtmosphereMaterialKind::Megastructure,
+                    Name::new("Zone Broken Ring"),
+                    Mesh3d(meshes.add(builder.build())),
+                    MeshMaterial3d(landmark_material.clone()),
+                    Transform::default(),
+                    NotShadowCaster,
+                    NotShadowReceiver,
+                ));
+            }
+            LandmarkKind::ImpossibleBridge => {
+                let mut builder = ColoredMeshBuilder::default();
+                let bridge_start = anchor - zone_forward * (zone_span * 0.55) + Vec3::Y * 22.0;
+                let bridge_end = anchor + zone_forward * (zone_span * 0.55) - Vec3::Y * 18.0;
+                append_beam_segment(
+                    &mut builder,
+                    bridge_start,
+                    bridge_end,
+                    16.0,
+                    1.6,
+                    zone_right,
+                    0.0,
+                    zone_color,
+                );
+                append_beam_segment(
+                    &mut builder,
+                    bridge_start + zone_right * 48.0 + Vec3::Y * 72.0,
+                    bridge_end - zone_right * 56.0 + Vec3::Y * 48.0,
+                    12.0,
+                    1.2,
+                    zone_right,
+                    0.0,
+                    brighten(zone_color, 0.12),
+                );
+                append_beam_segment(
+                    &mut builder,
+                    bridge_start + zone_right * 48.0 + Vec3::Y * 72.0,
+                    bridge_start,
+                    8.0,
+                    1.0,
+                    zone_forward,
+                    0.0,
+                    deepen(zone_color, 0.18),
+                );
+                commands.spawn((
+                    GeneratedWorld,
+                    AtmosphereMaterialKind::Megastructure,
+                    Name::new("Zone Impossible Bridge"),
+                    Mesh3d(meshes.add(builder.build())),
+                    MeshMaterial3d(landmark_material.clone()),
+                    Transform::default(),
+                    NotShadowCaster,
+                    NotShadowReceiver,
+                ));
+            }
+            LandmarkKind::CorkscrewTower => {
+                let mut builder = ColoredMeshBuilder::default();
+                let tower_top = anchor + Vec3::Y * (zone_span * 0.24 + 120.0);
+                append_beam_segment(
+                    &mut builder,
+                    anchor - Vec3::Y * 120.0,
+                    tower_top,
+                    14.0,
+                    2.0,
+                    zone_right,
+                    0.0,
+                    zone_color,
+                );
+                let turns = 2.4 * zone.flow.drift_sign;
+                let samples = 48;
+                let radius = zone_span * 0.18 + 34.0;
+                let mut previous = None;
+                for sample in 0..=samples {
+                    let t = sample as f32 / samples as f32;
+                    let angle = turns * TAU * t;
+                    let radial = Quat::from_axis_angle(Vec3::Y, angle) * zone_right;
+                    let point = anchor
+                        + radial * radius
+                        + Vec3::Y * lerp(-80.0, zone_span * 0.24 + 80.0, t);
+                    if let Some(last) = previous {
+                        append_beam_segment(
+                            &mut builder,
+                            last,
+                            point,
+                            9.0,
+                            0.9,
+                            radial,
+                            angle * 0.3,
+                            brighten(zone_color, 0.1),
+                        );
+                    }
+                    previous = Some(point);
+                }
+                commands.spawn((
+                    GeneratedWorld,
+                    AtmosphereMaterialKind::Megastructure,
+                    Name::new("Zone Corkscrew Tower"),
+                    Mesh3d(meshes.add(builder.build())),
+                    MeshMaterial3d(landmark_material.clone()),
+                    Transform::default(),
+                    NotShadowCaster,
+                    NotShadowReceiver,
+                ));
+            }
+            LandmarkKind::FloatingMonolithCluster => {
+                for monolith in 0..5 {
+                    let phase = TAU * (monolith as f32 / 5.0) + zone.index as f32 * 0.25;
+                    let radial = Vec3::new(phase.cos(), 0.0, phase.sin()).normalize_or_zero();
+                    let monolith_anchor = anchor
+                        + radial * (36.0 + monolith as f32 * 22.0)
+                        + Vec3::Y * (monolith as f32 * 18.0 - 24.0);
+                    commands.spawn((
+                        GeneratedWorld,
+                        AtmosphereMaterialKind::Megastructure,
+                        Name::new("Zone Monolith"),
+                        Mesh3d(landmark_box_mesh.clone()),
+                        MeshMaterial3d(landmark_material.clone()),
+                        Transform::from_translation(monolith_anchor)
+                            .with_rotation(Quat::from_euler(
+                                EulerRot::YXZ,
+                                phase,
+                                0.0,
+                                monolith as f32 * 0.08,
+                            ))
+                            .with_scale(Vec3::new(
+                                18.0 + monolith as f32 * 5.0,
+                                120.0 + monolith as f32 * 18.0,
+                                18.0 + monolith as f32 * 3.0,
+                            )),
+                        NotShadowCaster,
+                        NotShadowReceiver,
+                    ));
+                }
+            }
+            LandmarkKind::MovingMegastructure => {
+                commands.spawn((
+                    GeneratedWorld,
+                    AtmosphereMaterialKind::Megastructure,
+                    Name::new("Zone Moving Megastructure"),
+                    Mesh3d(landmark_ring_mesh.clone()),
+                    MeshMaterial3d(landmark_material.clone()),
+                    Transform::from_translation(anchor)
+                        .with_rotation(Quat::from_rotation_x(1.04) * Quat::from_rotation_y(0.3))
+                        .with_scale(Vec3::new(
+                            zone_span * 0.9 + 120.0,
+                            zone_span * 0.18 + 24.0,
+                            zone_span * 0.9 + 120.0,
+                        )),
+                    NotShadowCaster,
+                    NotShadowReceiver,
+                    SkyDrift {
+                        anchor,
+                        primary_axis: zone_forward,
+                        secondary_axis: zone_right,
+                        primary_amplitude: 36.0,
+                        secondary_amplitude: 18.0,
+                        vertical_amplitude: 12.0,
+                        speed: 0.018,
+                        rotation_speed: 0.018,
+                        phase: rng.range_f32(0.0, TAU),
+                        base_rotation: Quat::from_rotation_x(1.04)
+                            * Quat::from_rotation_y(zone.index as f32 * 0.21),
+                    },
+                ));
+            }
+        }
+    }
 }
 
 fn find_safe_celestial_anchor(
@@ -4062,34 +6527,41 @@ fn find_safe_celestial_anchor(
     major: bool,
 ) -> Vec3 {
     let orbit_min = if major {
-        course_radius + 180.0 + radius * 2.8
+        course_radius + 220.0 + radius * 0.82
     } else {
-        course_radius + 150.0 + radius * 2.1
+        course_radius + 180.0 + radius * 0.64
     };
     let orbit_max = if major {
-        course_radius + 360.0 + radius * 3.2
+        course_radius + 520.0 + radius * 1.28
     } else {
-        course_radius + 280.0 + radius * 2.6
+        course_radius + 360.0 + radius * 0.94
     };
     let altitude_min = if major {
-        120.0 + radius * 1.4
+        140.0 + radius * 0.28
     } else {
-        95.0 + radius
+        105.0 + radius * 0.22
     };
     let altitude_max = if major {
-        250.0 + radius * 1.8
+        360.0 + radius * 0.48
     } else {
-        190.0 + radius * 1.5
+        260.0 + radius * 0.34
     };
-    let tangential_span = if major { 56.0 } else { 40.0 };
+    let tangential_span = if major { 180.0 } else { 120.0 };
     let desired_clearance = if major {
-        140.0 + radius * 2.1
+        140.0 + radius * 0.72
     } else {
-        120.0 + radius * 1.8
+        120.0 + radius * 0.56
+    };
+    let desired_view_clearance = if major {
+        220.0 + radius * 0.24
+    } else {
+        120.0 + radius * 0.12
     };
 
     let mut best = center + radial * orbit_max + Vec3::Y * altitude_min;
     let mut best_clearance = f32::NEG_INFINITY;
+    let mut best_view_clearance = f32::NEG_INFINITY;
+    let mut best_score = f32::NEG_INFINITY;
 
     for _ in 0..16 {
         let orbit = rng.range_f32(orbit_min, orbit_max);
@@ -4098,11 +6570,15 @@ fn find_safe_celestial_anchor(
             + tangent * rng.range_f32(-tangential_span, tangential_span)
             + Vec3::Y * rng.range_f32(altitude_min, altitude_max);
         let clearance = celestial_course_clearance(blueprint, candidate, radius);
-        if clearance > best_clearance {
+        let view_clearance = celestial_entry_view_clearance(blueprint, candidate, radius);
+        let score = clearance.min(view_clearance);
+        if score > best_score {
             best = candidate;
             best_clearance = clearance;
+            best_view_clearance = view_clearance;
+            best_score = score;
         }
-        if clearance >= desired_clearance {
+        if clearance >= desired_clearance && view_clearance >= desired_view_clearance {
             return candidate;
         }
     }
@@ -4112,8 +6588,40 @@ fn find_safe_celestial_anchor(
         best += radial * push;
         best.y += push * 0.35;
     }
+    if best_view_clearance < desired_view_clearance {
+        let push = desired_view_clearance - best_view_clearance + 36.0;
+        let tangential_sign = {
+            let sign = (best - center).dot(tangent).signum();
+            if sign == 0.0 { 1.0 } else { sign }
+        };
+        best += tangent * (push * tangential_sign) + radial * (push * 0.35);
+        best.y += push * 0.24;
+    }
 
     best
+}
+
+fn celestial_entry_view_clearance(blueprint: &RunBlueprint, point: Vec3, radius: f32) -> f32 {
+    if blueprint.rooms.len() < 2 {
+        return f32::INFINITY;
+    }
+
+    let (center, course_radius) = course_visual_center_and_radius(blueprint);
+    let forward = direction_from_delta(blueprint.rooms[1].top - blueprint.rooms[0].top);
+    let eye = blueprint.spawn + Vec3::Y * (PLAYER_SPAWN_CLEARANCE + 1.4);
+    let target = center
+        + forward * (course_radius * 0.6)
+        + Vec3::Y * ((blueprint.rooms[0].top.y - blueprint.spawn.y).abs() * 0.12 + 44.0);
+    let corridor = target - eye;
+    let length = corridor.length();
+    if length <= f32::EPSILON {
+        return f32::INFINITY;
+    }
+
+    let direction = corridor / length;
+    let along = (point - eye).dot(direction).clamp(0.0, length);
+    let closest = eye + direction * along;
+    point.distance(closest) - radius
 }
 
 fn celestial_course_clearance(blueprint: &RunBlueprint, point: Vec3, radius: f32) -> f32 {
@@ -4275,6 +6783,21 @@ fn spawn_box_spec(
             ),
             paint_stripe_color(spec.paint),
         )),
+        SolidBody::StaticSphere => meshes.add(
+            Sphere::new(spec.size.x * 0.5)
+                .mesh()
+                .ico(5)
+                .expect("icosphere build should succeed"),
+        ),
+        SolidBody::StaticCylinder => meshes.add(Cylinder::new(spec.size.x * 0.5, spec.size.y)),
+        SolidBody::StaticTrapezoid { top_scale } => meshes.add(build_trapezoid_mesh(
+            spec.size,
+            *top_scale,
+            paint_base_color(
+                spec.paint,
+                matches!(&spec.body, SolidBody::ShortcutBridge { active: false, .. }),
+            ),
+        )),
         _ => cached_cuboid_mesh(asset_cache, meshes, spec.size),
     };
     let material = cached_game_material(
@@ -4284,7 +6807,10 @@ fn spawn_box_spec(
             paint: spec.paint,
             ghost: matches!(&spec.body, SolidBody::ShortcutBridge { active: false, .. }),
             surf: matches!(&spec.body, SolidBody::StaticSurfWedge { .. }),
-            vertex_colored: matches!(&spec.body, SolidBody::StaticSurfWedge { .. }),
+            vertex_colored: matches!(
+                &spec.body,
+                SolidBody::StaticSurfWedge { .. } | SolidBody::StaticTrapezoid { .. }
+            ),
         },
     );
 
@@ -4308,6 +6834,29 @@ fn spawn_box_spec(
                 Collider::cuboid(spec.size.x, spec.size.y, spec.size.z),
                 CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
             ));
+        }
+        SolidBody::StaticSphere => {
+            entity.insert((
+                RigidBody::Static,
+                Collider::sphere(spec.size.x * 0.5),
+                CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
+            ));
+        }
+        SolidBody::StaticCylinder => {
+            entity.insert((
+                RigidBody::Static,
+                Collider::cylinder(spec.size.x * 0.5, spec.size.y),
+                CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
+            ));
+        }
+        SolidBody::StaticTrapezoid { top_scale } => {
+            if let Some(collider) = Collider::convex_hull(trapezoid_points(spec.size, *top_scale)) {
+                entity.insert((
+                    RigidBody::Static,
+                    collider,
+                    CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
+                ));
+            }
         }
         SolidBody::StaticSurfWedge { .. } => {}
         SolidBody::StaticSurfStrip {
@@ -4799,6 +7348,36 @@ fn append_surf_wedge_render_geometry(
     }
 }
 
+fn trapezoid_points(size: Vec3, top_scale: f32) -> Vec<Vec3> {
+    let top_scale = top_scale.clamp(0.08, 0.92);
+    let half = size * 0.5;
+    let top_half = Vec3::new(half.x * top_scale, half.y, half.z * top_scale);
+    let bottom_half = Vec3::new(half.x, half.y, half.z);
+    vec![
+        Vec3::new(-top_half.x, top_half.y, -top_half.z),
+        Vec3::new(top_half.x, top_half.y, -top_half.z),
+        Vec3::new(top_half.x, top_half.y, top_half.z),
+        Vec3::new(-top_half.x, top_half.y, top_half.z),
+        Vec3::new(-bottom_half.x, -bottom_half.y, -bottom_half.z),
+        Vec3::new(bottom_half.x, -bottom_half.y, -bottom_half.z),
+        Vec3::new(bottom_half.x, -bottom_half.y, bottom_half.z),
+        Vec3::new(-bottom_half.x, -bottom_half.y, bottom_half.z),
+    ]
+}
+
+fn build_trapezoid_mesh(size: Vec3, top_scale: f32, base_color: Color) -> Mesh {
+    let points = trapezoid_points(size, top_scale);
+    let [a, b, c, d, e, f, g, h]: [Vec3; 8] = points.try_into().unwrap();
+    let mut builder = ColoredMeshBuilder::default();
+    builder.push_quad(a, b, c, d, brighten(base_color, 0.12));
+    builder.push_quad(e, h, g, f, deepen(base_color, 0.32));
+    builder.push_quad(a, e, f, b, deepen(base_color, 0.08));
+    builder.push_quad(b, f, g, c, brighten(base_color, 0.03));
+    builder.push_quad(c, g, h, d, deepen(base_color, 0.16));
+    builder.push_quad(d, h, e, a, brighten(base_color, 0.07));
+    builder.build()
+}
+
 fn spawn_box_collider_spec(
     spec: &SolidSpec,
     commands: &mut Commands,
@@ -4938,6 +7517,17 @@ fn validate_solid_spec(spec: &SolidSpec) -> Result<(), String> {
     }
 
     let aabb = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &spec.body {
+        SolidBody::StaticSphere => {
+            Collider::sphere(spec.size.x * 0.5).aabb(spec.center, Quat::IDENTITY)
+        }
+        SolidBody::StaticCylinder => {
+            Collider::cylinder(spec.size.x * 0.5, spec.size.y).aabb(spec.center, Quat::IDENTITY)
+        }
+        SolidBody::StaticTrapezoid { top_scale } => {
+            Collider::convex_hull(trapezoid_points(spec.size, *top_scale))
+                .unwrap()
+                .aabb(spec.center, Quat::IDENTITY)
+        }
         SolidBody::StaticSurfStrip {
             collider_strip_points,
             ..
@@ -5079,6 +7669,743 @@ fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
     layout
 }
 
+fn surf_path_style_from_flow(flow: FlowFieldProfile) -> PathLateralStyle {
+    match flow.path_style {
+        PathLateralStyle::Straight => PathLateralStyle::Straight,
+        PathLateralStyle::Arc | PathLateralStyle::OneSidedArc => flow.path_style,
+        PathLateralStyle::Serpentine | PathLateralStyle::Switchback => {
+            PathLateralStyle::OneSidedArc
+        }
+    }
+}
+
+fn append_connector_geometry(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    _rng: &mut RunRng,
+    connector: ConnectorKind,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    theme: Theme,
+    _difficulty: f32,
+    flow: FlowFieldProfile,
+) {
+    let along_x = forward.x.abs() > 0.5;
+    let span = (end - start).xz().length().max(8.0);
+    let center = start.lerp(end, 0.5);
+    let flow_bias = flow.width_scale.clamp(0.9, 1.3);
+    match connector {
+        ConnectorKind::Funnel => {
+            for side in [-1.0_f32, 1.0] {
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: format!("Connector Funnel Rail {side}"),
+                    center: center + right * side * (4.6 * flow_bias) + Vec3::Y * 0.08,
+                    size: axis_box_size(along_x, span * 0.18, 0.08, 0.08),
+                    paint: PaintStyle::ThemeAccent(theme),
+                    body: SolidBody::Decoration,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+        }
+        ConnectorKind::Booster => {}
+        ConnectorKind::Transfer => {}
+        ConnectorKind::Collector => {
+            for side in [-1.0_f32, 1.0] {
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: format!("Connector Collector Rail {side}"),
+                    center: end - forward * 1.4 + right * side * (4.2 * flow_bias) + Vec3::Y * 0.06,
+                    size: axis_box_size(along_x, span.min(10.0) * 0.16, 0.06, 0.08),
+                    paint: PaintStyle::ThemeFloor(theme),
+                    body: SolidBody::Decoration,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+        }
+        ConnectorKind::Splitter => {}
+        ConnectorKind::Crossover => {}
+    }
+}
+
+fn signature_lane_span(from: &RoomPlan, to: &RoomPlan, signature: ZoneSignature) -> f32 {
+    let base = from.size.min_element().min(to.size.min_element()) * 0.22;
+    let signature_scale = match signature {
+        ZoneSignature::BowlCollector => 1.18,
+        ZoneSignature::GiantCorkscrew => 0.88,
+        ZoneSignature::BraidLanes => 1.14,
+        ZoneSignature::WaveRamps => 1.0,
+        ZoneSignature::SplitTransfer => 1.08,
+        ZoneSignature::PillarForest => 1.22,
+        ZoneSignature::ShapeGarden => 1.28,
+    };
+    (base * signature_scale).clamp(ROUTE_LINE_LATERAL_SPAN * 0.7, ROUTE_LINE_LATERAL_SPAN * 1.9)
+}
+
+fn route_line_priority(line: RouteLine) -> usize {
+    match line {
+        RouteLine::Safe => 0,
+        RouteLine::Speed => 1,
+        RouteLine::Trick => 2,
+    }
+}
+
+fn route_line_label_prefix(line: RouteLine) -> &'static str {
+    match line {
+        RouteLine::Safe => "Safe Line",
+        RouteLine::Speed => "Speed Line",
+        RouteLine::Trick => "Trick Line",
+    }
+}
+
+fn route_line_from_label(label: &str) -> Option<RouteLine> {
+    if label.starts_with("Safe Line ") {
+        Some(RouteLine::Safe)
+    } else if label.starts_with("Speed Line ") {
+        Some(RouteLine::Speed)
+    } else if label.starts_with("Trick Line ") {
+        Some(RouteLine::Trick)
+    } else {
+        None
+    }
+}
+
+fn route_line_module_half_width(kind: ModuleKind, line: RouteLine) -> f32 {
+    let base = match kind {
+        ModuleKind::SurfRamp => 8.8,
+        ModuleKind::ShapeGauntlet => 7.8,
+        ModuleKind::MovingPlatformRun => 5.2,
+        ModuleKind::PillarAirstrafe => 4.8,
+        ModuleKind::WindowHop => 4.6,
+        ModuleKind::HeadcheckRun => 4.4,
+        ModuleKind::SpeedcheckRun => 4.2,
+        ModuleKind::StairRun => 4.0,
+        _ => 4.4,
+    };
+    match line {
+        RouteLine::Safe => base * 1.04,
+        RouteLine::Speed => base,
+        RouteLine::Trick => base * 0.96,
+    }
+}
+
+fn route_line_lane_gap(signature: ZoneSignature) -> f32 {
+    match signature {
+        ZoneSignature::BowlCollector => ROUTE_LINE_MIN_CORRIDOR_GAP + 0.8,
+        ZoneSignature::GiantCorkscrew => ROUTE_LINE_MIN_CORRIDOR_GAP + 1.0,
+        ZoneSignature::BraidLanes => ROUTE_LINE_MIN_CORRIDOR_GAP + 1.4,
+        ZoneSignature::WaveRamps => ROUTE_LINE_MIN_CORRIDOR_GAP + 0.4,
+        ZoneSignature::SplitTransfer => ROUTE_LINE_MIN_CORRIDOR_GAP + 1.0,
+        ZoneSignature::PillarForest => ROUTE_LINE_MIN_CORRIDOR_GAP + 1.6,
+        ZoneSignature::ShapeGarden => ROUTE_LINE_MIN_CORRIDOR_GAP + 2.1,
+    }
+}
+
+fn route_line_pair_gap(left: ModuleKind, right: ModuleKind, signature: ZoneSignature) -> f32 {
+    let mut gap = route_line_lane_gap(signature);
+    if matches!(left, ModuleKind::SurfRamp) || matches!(right, ModuleKind::SurfRamp) {
+        gap += 5.4;
+    }
+    if matches!(left, ModuleKind::ShapeGauntlet) || matches!(right, ModuleKind::ShapeGauntlet) {
+        gap += 4.6;
+    }
+    if matches!(left, ModuleKind::MovingPlatformRun)
+        || matches!(right, ModuleKind::MovingPlatformRun)
+    {
+        gap += 1.8;
+    }
+    gap
+}
+
+fn route_line_vertical_bias(kind: ModuleKind, line: RouteLine) -> f32 {
+    match line {
+        RouteLine::Safe => match kind {
+            ModuleKind::SurfRamp => -0.2,
+            _ => -0.9,
+        },
+        RouteLine::Speed => 0.0,
+        RouteLine::Trick => {
+            ROUTE_LINE_TRICK_VERTICAL_BIAS
+                + match kind {
+                    ModuleKind::ShapeGauntlet => 1.2,
+                    ModuleKind::MovingPlatformRun => 0.7,
+                    ModuleKind::PillarAirstrafe => 0.45,
+                    _ => 0.25,
+                }
+        }
+    }
+}
+
+fn route_line_forward_margins(kind: ModuleKind, line: RouteLine, distance: f32) -> (f32, f32) {
+    match kind {
+        ModuleKind::SurfRamp => match line {
+            RouteLine::Speed => (
+                (distance * 0.014).clamp(1.8, 4.2),
+                (distance * 0.012).clamp(1.6, 3.8),
+            ),
+            _ => (
+                (distance * 0.035).clamp(3.4, 7.6),
+                (distance * 0.03).clamp(3.0, 6.8),
+            ),
+        },
+        ModuleKind::ShapeGauntlet => (
+            (distance * 0.085).clamp(8.0, 16.0),
+            (distance * 0.075).clamp(7.0, 14.0),
+        ),
+        ModuleKind::MovingPlatformRun => (
+            (distance * 0.07).clamp(6.8, 13.0),
+            (distance * 0.062).clamp(6.0, 11.5),
+        ),
+        _ if matches!(line, RouteLine::Speed) => (
+            (distance * 0.03).clamp(3.0, 6.0),
+            (distance * 0.026).clamp(2.6, 5.2),
+        ),
+        _ => (
+            (distance * 0.072).clamp(7.0, 13.5),
+            (distance * 0.064).clamp(6.2, 12.0),
+        ),
+    }
+}
+
+fn route_line_center_offsets(
+    segment: &SegmentPlan,
+    from: &RoomPlan,
+    to: &RoomPlan,
+) -> Vec<(RouteLine, ModuleKind, f32)> {
+    let lane_span = signature_lane_span(from, to, segment.zone_signature);
+    let mut reservations = segment
+        .route_lines
+        .iter()
+        .copied()
+        .into_iter()
+        .map(|line| {
+            let kind = route_line_module_kind(segment.zone_signature, line, segment.kind);
+            let half_width = route_line_module_half_width(kind, line);
+            (line, kind, half_width, route_line_priority(line))
+        })
+        .collect::<Vec<_>>();
+
+    if reservations.len() >= 3
+        && reservations
+            .iter()
+            .any(|(_, kind, _, _)| matches!(kind, ModuleKind::SurfRamp))
+    {
+        let drop_line = match segment.zone_role {
+            ZoneRole::Recovery => RouteLine::Trick,
+            ZoneRole::Accelerator | ZoneRole::Technical | ZoneRole::Spectacle => RouteLine::Safe,
+        };
+        if let Some(position) = reservations
+            .iter()
+            .position(|(line, _, _, _)| *line == drop_line)
+        {
+            reservations.remove(position);
+        }
+    }
+
+    reservations.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.3.cmp(&b.3))
+    });
+
+    let arranged = match reservations.len() {
+        0 | 1 => reservations,
+        2 => vec![reservations[1], reservations[0]],
+        3 => vec![reservations[1], reservations[2], reservations[0]],
+        _ => {
+            let mut left = Vec::new();
+            let mut center = Vec::new();
+            let mut right = Vec::new();
+            for (index, reservation) in reservations.into_iter().enumerate() {
+                match index % 3 {
+                    0 => right.push(reservation),
+                    1 => left.push(reservation),
+                    _ => center.push(reservation),
+                }
+            }
+            left.reverse();
+            left.into_iter()
+                .chain(center)
+                .chain(right)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let total_width = arranged
+        .iter()
+        .map(|(_, _, half, _)| half * 2.0)
+        .sum::<f32>()
+        + arranged
+            .windows(2)
+            .map(|pair| route_line_pair_gap(pair[0].1, pair[1].1, segment.zone_signature))
+            .sum::<f32>();
+    let signature_bias = match segment.zone_signature {
+        ZoneSignature::BowlCollector => lane_span * 0.08,
+        ZoneSignature::GiantCorkscrew => lane_span * 0.14,
+        ZoneSignature::BraidLanes => lane_span * 0.12,
+        ZoneSignature::WaveRamps => lane_span * 0.04,
+        ZoneSignature::SplitTransfer => lane_span * 0.1,
+        ZoneSignature::PillarForest => lane_span * 0.16,
+        ZoneSignature::ShapeGarden => lane_span * 0.2,
+    };
+
+    let mut cursor = -total_width * 0.5 + signature_bias;
+    let mut centers = Vec::with_capacity(arranged.len());
+    for (index, (line, kind, half_width, _)) in arranged.iter().copied().enumerate() {
+        let center = cursor + half_width;
+        centers.push((line, kind, center));
+        cursor += half_width * 2.0;
+        if let Some((_, next_kind, _, _)) = arranged.get(index + 1) {
+            cursor += route_line_pair_gap(kind, *next_kind, segment.zone_signature);
+        }
+    }
+
+    centers
+}
+
+fn route_line_offsets(signature: ZoneSignature, center: f32, zone_local_t: f32) -> (f32, f32) {
+    let start_taper = if zone_local_t < 0.22 {
+        ROUTE_LINE_EDGE_TAPER
+    } else {
+        1.0
+    };
+    let end_taper = if zone_local_t > 0.78 {
+        ROUTE_LINE_EDGE_TAPER
+    } else {
+        1.0
+    };
+    match signature {
+        ZoneSignature::BraidLanes => (center * start_taper * 1.04, center * end_taper * 1.04),
+        ZoneSignature::SplitTransfer => (center * start_taper * 0.96, center * end_taper * 1.08),
+        ZoneSignature::BowlCollector => (center * start_taper, center * end_taper * 0.9),
+        ZoneSignature::GiantCorkscrew => (center * start_taper * 1.02, center * end_taper * 1.02),
+        ZoneSignature::WaveRamps => (center * start_taper, center * end_taper),
+        ZoneSignature::PillarForest | ZoneSignature::ShapeGarden => {
+            (center * start_taper * 1.08, center * end_taper * 1.08)
+        }
+    }
+}
+
+fn route_line_module_kind(
+    signature: ZoneSignature,
+    line: RouteLine,
+    _fallback: ModuleKind,
+) -> ModuleKind {
+    match signature {
+        ZoneSignature::BowlCollector => match line {
+            RouteLine::Safe => ModuleKind::SurfRamp,
+            RouteLine::Speed => ModuleKind::SurfRamp,
+            RouteLine::Trick => ModuleKind::SpeedcheckRun,
+        },
+        ZoneSignature::GiantCorkscrew => match line {
+            RouteLine::Safe => ModuleKind::SurfRamp,
+            RouteLine::Speed => ModuleKind::SurfRamp,
+            RouteLine::Trick => ModuleKind::WindowHop,
+        },
+        ZoneSignature::BraidLanes => match line {
+            RouteLine::Safe => ModuleKind::StairRun,
+            RouteLine::Speed => ModuleKind::SurfRamp,
+            RouteLine::Trick => ModuleKind::WindowHop,
+        },
+        ZoneSignature::WaveRamps => match line {
+            RouteLine::Safe => ModuleKind::SpeedcheckRun,
+            RouteLine::Speed => ModuleKind::SurfRamp,
+            RouteLine::Trick => ModuleKind::WindowHop,
+        },
+        ZoneSignature::SplitTransfer => match line {
+            RouteLine::Safe => ModuleKind::StairRun,
+            RouteLine::Speed => ModuleKind::SurfRamp,
+            RouteLine::Trick => ModuleKind::WindowHop,
+        },
+        ZoneSignature::PillarForest => match line {
+            RouteLine::Safe => ModuleKind::WindowHop,
+            RouteLine::Speed => ModuleKind::SpeedcheckRun,
+            RouteLine::Trick => ModuleKind::StairRun,
+        },
+        ZoneSignature::ShapeGarden => match line {
+            RouteLine::Safe => ModuleKind::SpeedcheckRun,
+            RouteLine::Speed => ModuleKind::WindowHop,
+            RouteLine::Trick => ModuleKind::StairRun,
+        },
+    }
+}
+
+fn supports_parallel_route_choice(kind: ModuleKind) -> bool {
+    matches!(
+        kind,
+        ModuleKind::StairRun | ModuleKind::WindowHop | ModuleKind::SpeedcheckRun
+    )
+}
+
+fn route_line_flow(
+    base: FlowFieldProfile,
+    signature: ZoneSignature,
+    line: RouteLine,
+) -> FlowFieldProfile {
+    let mut flow = base;
+    match line {
+        RouteLine::Safe => {
+            flow.width_scale *= 0.86;
+            flow.curvature *= 0.88;
+            flow.lateral_amplitude *= 0.82;
+            flow.vertical_wave *= 0.76;
+            flow.noise_amplitude *= 0.74;
+        }
+        RouteLine::Speed => {
+            flow.width_scale *= 0.74;
+            flow.noise_amplitude *= 0.68;
+        }
+        RouteLine::Trick => {
+            flow.width_scale *= 0.72;
+            flow.curvature *= 1.08;
+            flow.lateral_amplitude *= 1.16;
+            flow.vertical_wave *= 1.12;
+            flow.noise_amplitude *= 0.92;
+            flow.dynamic_bias += 0.08;
+        }
+    }
+
+    flow.lateral_amplitude = flow.lateral_amplitude.clamp(
+        0.18,
+        match line {
+            RouteLine::Safe => 0.48,
+            RouteLine::Speed => 0.42,
+            RouteLine::Trick => 0.62,
+        },
+    );
+    flow.vertical_wave = flow.vertical_wave.clamp(
+        0.02,
+        match line {
+            RouteLine::Safe => 0.12,
+            RouteLine::Speed => 0.1,
+            RouteLine::Trick => 0.16,
+        },
+    );
+
+    match signature {
+        ZoneSignature::BowlCollector => {
+            flow.path_style = PathLateralStyle::Arc;
+            if matches!(line, RouteLine::Trick) {
+                flow.path_style = PathLateralStyle::OneSidedArc;
+            }
+        }
+        ZoneSignature::GiantCorkscrew => {
+            flow.route_curve = RouteCurveArchetype::Carve;
+            flow.path_style = PathLateralStyle::OneSidedArc;
+            flow.layered_offset += 0.12;
+        }
+        ZoneSignature::BraidLanes => {
+            flow.route_curve = RouteCurveArchetype::Switchback;
+            flow.path_style = if matches!(line, RouteLine::Speed) {
+                PathLateralStyle::Arc
+            } else {
+                PathLateralStyle::OneSidedArc
+            };
+        }
+        ZoneSignature::WaveRamps => {
+            flow.path_style = if matches!(line, RouteLine::Speed) {
+                PathLateralStyle::OneSidedArc
+            } else {
+                PathLateralStyle::Arc
+            };
+            flow.vertical_wave += 0.04;
+        }
+        ZoneSignature::SplitTransfer => {
+            flow.path_style = if matches!(line, RouteLine::Speed) {
+                PathLateralStyle::Arc
+            } else {
+                PathLateralStyle::OneSidedArc
+            };
+        }
+        ZoneSignature::PillarForest | ZoneSignature::ShapeGarden => {
+            flow.route_curve = RouteCurveArchetype::Switchback;
+            flow.path_style = PathLateralStyle::Arc;
+            flow.lateral_amplitude *= 0.86;
+        }
+    }
+
+    flow
+}
+
+fn append_route_line_module(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    rng: &mut RunRng,
+    kind: ModuleKind,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    difficulty: f32,
+    theme: Theme,
+    flow: FlowFieldProfile,
+    outer_surf_side: Option<f32>,
+) {
+    match kind {
+        ModuleKind::StairRun => append_bhop_platform_sequence(
+            layout, owner, rng, start, end, forward, right, theme, flow,
+        ),
+        ModuleKind::SurfRamp => append_css_surf_sequence(
+            layout,
+            owner,
+            rng,
+            start,
+            end,
+            forward,
+            right,
+            theme,
+            flow,
+            true,
+            outer_surf_side,
+        ),
+        ModuleKind::WindowHop => {
+            append_window_hop_sequence(layout, owner, rng, start, end, forward, right, theme, flow)
+        }
+        ModuleKind::PillarAirstrafe => append_pillar_air_strafe_sequence(
+            layout, owner, rng, start, end, forward, right, theme, flow,
+        ),
+        ModuleKind::HeadcheckRun => {
+            append_headcheck_sequence(layout, owner, rng, start, end, forward, right, theme, flow)
+        }
+        ModuleKind::SpeedcheckRun => {
+            append_speedcheck_sequence(layout, owner, rng, start, end, forward, right, theme, flow)
+        }
+        ModuleKind::MovingPlatformRun => append_moving_platform_sequence(
+            layout, owner, rng, start, end, forward, right, difficulty, theme, flow,
+        ),
+        ModuleKind::ShapeGauntlet => append_shape_gauntlet_sequence(
+            layout, owner, rng, start, end, forward, right, theme, flow,
+        ),
+        _ => append_descending_pad_sequence(
+            layout,
+            owner,
+            rng,
+            start,
+            end,
+            forward,
+            right,
+            PaintStyle::ThemeFloor(theme),
+            |_| SolidBody::Static,
+            None,
+            "Fallback Flow Pad",
+            10.0,
+            4.4,
+            0.55,
+            2.1,
+            0.95,
+        ),
+    }
+}
+
+fn append_signature_landscape_features(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    signature: ZoneSignature,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    theme: Theme,
+) {
+    let along_x = forward.x.abs() > 0.5;
+    let center = start.lerp(end, 0.5);
+    let span = start.distance(end).max(16.0);
+    match signature {
+        ZoneSignature::BowlCollector => {
+            layout.solids.push(SolidSpec {
+                owner,
+                label: "Bowl Collector Shelf".into(),
+                center: top_to_center(end - forward * 2.2 + Vec3::Y * 0.2, 0.44),
+                size: axis_box_size(along_x, span.min(16.0), 0.44, 14.0),
+                paint: PaintStyle::ThemeAccent(theme),
+                body: SolidBody::Static,
+                friction: None,
+                extra: ExtraKind::None,
+            });
+        }
+        ZoneSignature::GiantCorkscrew => {
+            layout.solids.push(SolidSpec {
+                owner,
+                label: "Corkscrew Tower".into(),
+                center: center + right * 18.0 + Vec3::Y * 10.0,
+                size: Vec3::new(4.2, 24.0, 4.2),
+                paint: PaintStyle::ThemeShadow(theme),
+                body: SolidBody::Decoration,
+                friction: None,
+                extra: ExtraKind::None,
+            });
+        }
+        ZoneSignature::BraidLanes => {
+            for side in [-1.0_f32, 1.0] {
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: format!("Braid Rail {side}"),
+                    center: center + right * side * 10.5 + Vec3::Y * 0.26,
+                    size: axis_box_size(along_x, span * 0.72, 0.22, 0.18),
+                    paint: PaintStyle::ThemeAccent(theme),
+                    body: SolidBody::Decoration,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+        }
+        ZoneSignature::WaveRamps => {
+            for side in [-1.0_f32, 1.0] {
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: format!("Wave Fin {side}"),
+                    center: center + right * side * 12.0 + Vec3::Y * 2.6,
+                    size: axis_box_size(along_x, span * 0.48, 5.2, 0.18),
+                    paint: PaintStyle::ThemeShadow(theme),
+                    body: SolidBody::Decoration,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+        }
+        ZoneSignature::SplitTransfer => {
+            layout.solids.push(SolidSpec {
+                owner,
+                label: "Splitter Spire".into(),
+                center: start.lerp(end, 0.28) + Vec3::Y * 3.2,
+                size: axis_box_size(along_x, 0.22, 6.0, 7.6),
+                paint: PaintStyle::ThemeAccent(theme),
+                body: SolidBody::Decoration,
+                friction: None,
+                extra: ExtraKind::None,
+            });
+            layout.solids.push(SolidSpec {
+                owner,
+                label: "Collector Spire".into(),
+                center: start.lerp(end, 0.78) + Vec3::Y * 2.8,
+                size: axis_box_size(along_x, 0.2, 5.2, 6.2),
+                paint: PaintStyle::ThemeFloor(theme),
+                body: SolidBody::Decoration,
+                friction: None,
+                extra: ExtraKind::None,
+            });
+        }
+        ZoneSignature::PillarForest => {
+            for side in [-1.0_f32, 1.0] {
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: format!("Forest Monolith {side}"),
+                    center: center + right * side * 16.0 + Vec3::Y * 8.0,
+                    size: Vec3::new(2.2, 18.0, 2.2),
+                    paint: PaintStyle::ThemeShadow(theme),
+                    body: SolidBody::Decoration,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+        }
+        ZoneSignature::ShapeGarden => {
+            for side in [-1.0_f32, 1.0] {
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: format!("Shape Garden Anchor {side}"),
+                    center: center + right * side * 18.0 + Vec3::Y * 4.8,
+                    size: Vec3::new(8.0, 8.0, 8.0),
+                    paint: PaintStyle::ThemeShadow(theme),
+                    body: SolidBody::Decoration,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+        }
+    }
+}
+
+fn append_signature_route_choice(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    segment: &SegmentPlan,
+    from: &RoomPlan,
+    to: &RoomPlan,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    theme: Theme,
+) -> bool {
+    if segment.route_lines.len() <= 1
+        || !is_primary_speed_section(segment.kind)
+        || !supports_parallel_route_choice(segment.kind)
+        || !ENABLE_PARALLEL_ROUTE_GEOMETRY
+    {
+        return false;
+    }
+
+    let line_specs = route_line_center_offsets(segment, from, to);
+    if line_specs.len() > 1
+        && (!line_specs
+            .iter()
+            .all(|(_, kind, _)| supports_parallel_route_choice(*kind))
+            || line_specs
+                .iter()
+                .any(|(_, kind, _)| matches!(kind, ModuleKind::SurfRamp)))
+    {
+        return false;
+    }
+
+    append_signature_landscape_features(
+        layout,
+        owner,
+        segment.zone_signature,
+        start,
+        end,
+        forward,
+        right,
+        theme,
+    );
+
+    for (line_index, (line, line_kind, lane_center)) in line_specs.into_iter().enumerate() {
+        let line_distance = start.distance(end).max(12.0);
+        let (entry_margin, exit_margin) =
+            route_line_forward_margins(line_kind, line, line_distance);
+        let (start_offset, end_offset) =
+            route_line_offsets(segment.zone_signature, lane_center, segment.zone_local_t);
+        let vertical_bias = route_line_vertical_bias(line_kind, line);
+        let line_start =
+            start + forward * entry_margin + right * start_offset + Vec3::Y * vertical_bias;
+        let line_end =
+            end - forward * exit_margin + right * end_offset + Vec3::Y * vertical_bias * 0.72;
+        let line_flow = route_line_flow(segment.flow, segment.zone_signature, line);
+        let mut line_rng = RunRng::new(
+            segment.seed ^ ((line_index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+        );
+        let solid_start = layout.solids.len();
+        append_route_line_module(
+            layout,
+            owner,
+            &mut line_rng,
+            line_kind,
+            line_start,
+            line_end,
+            forward,
+            right,
+            segment.difficulty,
+            theme,
+            line_flow,
+            if matches!(line_kind, ModuleKind::SurfRamp) && lane_center.abs() > 0.01 {
+                Some(lane_center.signum())
+            } else {
+                None
+            },
+        );
+        let line_prefix = route_line_label_prefix(line);
+        for solid in &mut layout.solids[solid_start..] {
+            solid.label = format!("{line_prefix} {}", solid.label);
+        }
+    }
+
+    true
+}
+
 fn build_segment_layout(
     segment: &SegmentPlan,
     rooms: &[RoomPlan],
@@ -5096,294 +8423,407 @@ fn build_segment_layout(
     let start = room_edge(from, forward);
     let end = room_edge(to, -forward);
     let rise = to.top.y - from.top.y;
+    append_connector_geometry(
+        &mut layout,
+        owner,
+        &mut rng,
+        segment.connector,
+        start,
+        end,
+        forward,
+        right,
+        to.theme,
+        segment.difficulty,
+        segment.flow,
+    );
 
-    match segment.kind {
-        ModuleKind::StairRun => {
-            append_css_surf_sequence(
-                &mut layout,
-                owner,
-                &mut rng,
-                start,
-                end,
-                forward,
-                right,
-                to.theme,
-                false,
-            );
-        }
-        ModuleKind::SurfRamp => {
-            append_css_surf_sequence(
-                &mut layout,
-                owner,
-                &mut rng,
-                start,
-                end,
-                forward,
-                right,
-                to.theme,
-                true,
-            );
-        }
-        ModuleKind::MantleStack => {
-            append_descending_pad_sequence(
-                &mut layout,
-                owner,
-                &mut rng,
-                start,
-                end,
-                forward,
-                right,
-                PaintStyle::ThemeAccent(to.theme),
-                |_| SolidBody::Static,
-                None,
-                "Mantle Ledge",
-                8.8,
-                4.6,
-                0.92,
-                3.4,
-                1.35,
-            );
+    let used_route_choice = append_signature_route_choice(
+        &mut layout,
+        owner,
+        segment,
+        from,
+        to,
+        start,
+        end,
+        forward,
+        right,
+        to.theme,
+    );
 
-            let wall_height = (from.top.y - to.top.y).abs() + 6.8;
-            let wall_mid = start.lerp(end, 0.62) + right * 2.8;
-            layout.solids.push(SolidSpec {
-                owner,
-                label: "Mantle Wall".into(),
-                center: Vec3::new(
-                    wall_mid.x,
-                    underside_y(from.top.y, ROOM_HEIGHT) + wall_height * 0.5,
-                    wall_mid.z,
-                ),
-                size: axis_box_size(along_x, 5.4, wall_height, 1.0),
-                paint: PaintStyle::ThemeShadow(to.theme),
-                body: SolidBody::Static,
-                friction: None,
-                extra: ExtraKind::None,
-            });
-        }
-        ModuleKind::WallRunHall => {
-            let shaft_center = start.lerp(end, 0.5);
-            let shaft_floor_top = Vec3::new(shaft_center.x, start.y - 0.55, shaft_center.z);
-            let shaft_height = (from.top.y - to.top.y).abs() + 7.2;
-            let wall_length = (end - start).xz().length().max(14.0);
-            let wall_thickness = 0.72;
-            let gap_half = 1.08;
+    if !used_route_choice {
+        match segment.kind {
+            ModuleKind::StairRun => {
+                append_bhop_platform_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    to.theme,
+                    segment.flow,
+                );
+            }
+            ModuleKind::SurfRamp => {
+                append_css_surf_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    to.theme,
+                    segment.flow,
+                    true,
+                    None,
+                );
+            }
+            ModuleKind::WindowHop => {
+                append_window_hop_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    to.theme,
+                    segment.flow,
+                );
+            }
+            ModuleKind::PillarAirstrafe => {
+                append_pillar_air_strafe_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    to.theme,
+                    segment.flow,
+                );
+            }
+            ModuleKind::HeadcheckRun => {
+                append_headcheck_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    to.theme,
+                    segment.flow,
+                );
+            }
+            ModuleKind::SpeedcheckRun => {
+                append_speedcheck_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    to.theme,
+                    segment.flow,
+                );
+            }
+            ModuleKind::MovingPlatformRun => {
+                append_moving_platform_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    segment.difficulty,
+                    to.theme,
+                    segment.flow,
+                );
+            }
+            ModuleKind::ShapeGauntlet => {
+                append_shape_gauntlet_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    to.theme,
+                    segment.flow,
+                );
+            }
+            ModuleKind::MantleStack => {
+                append_descending_pad_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    PaintStyle::ThemeAccent(to.theme),
+                    |_| SolidBody::Static,
+                    None,
+                    "Mantle Ledge",
+                    8.8,
+                    4.6,
+                    0.92,
+                    3.4,
+                    1.35,
+                );
 
-            layout.solids.push(SolidSpec {
-                owner,
-                label: "Shaft Entry".into(),
-                center: top_to_center(start.lerp(end, 0.24) + Vec3::Y * 0.24, 0.5),
-                size: axis_box_size(along_x, 5.2, 0.5, 3.4),
-                paint: PaintStyle::ThemeAccent(to.theme),
-                body: SolidBody::Static,
-                friction: None,
-                extra: ExtraKind::None,
-            });
-
-            for side in [-1.0, 1.0] {
+                let wall_height = (from.top.y - to.top.y).abs() + 6.8;
+                let wall_mid = start.lerp(end, 0.62) + right * 2.8;
                 layout.solids.push(SolidSpec {
                     owner,
-                    label: "Shaft Wall".into(),
+                    label: "Mantle Wall".into(),
                     center: Vec3::new(
-                        shaft_center.x + right.x * side * (gap_half + wall_thickness * 0.5),
-                        shaft_floor_top.y + shaft_height * 0.5 - 0.2,
-                        shaft_center.z + right.z * side * (gap_half + wall_thickness * 0.5),
+                        wall_mid.x,
+                        underside_y(from.top.y, ROOM_HEIGHT) + wall_height * 0.5,
+                        wall_mid.z,
                     ),
-                    size: axis_box_size(along_x, wall_length, shaft_height, wall_thickness),
+                    size: axis_box_size(along_x, 5.4, wall_height, 1.0),
                     paint: PaintStyle::ThemeShadow(to.theme),
                     body: SolidBody::Static,
                     friction: None,
                     extra: ExtraKind::None,
                 });
             }
+            ModuleKind::WallRunHall => {
+                let shaft_center = start.lerp(end, 0.5);
+                let shaft_floor_top = Vec3::new(shaft_center.x, start.y - 0.55, shaft_center.z);
+                let shaft_height = (from.top.y - to.top.y).abs() + 7.2;
+                let wall_length = (end - start).xz().length().max(14.0);
+                let wall_thickness = 0.72;
+                let gap_half = 1.08;
 
-            layout.solids.push(SolidSpec {
-                owner,
-                label: "Shaft Floor".into(),
-                center: top_to_center(shaft_floor_top, 0.46),
-                size: axis_box_size(along_x, wall_length - 0.2, 0.46, gap_half * 1.7),
-                paint: PaintStyle::ThemeFloor(to.theme),
-                body: SolidBody::Static,
-                friction: None,
-                extra: ExtraKind::None,
-            });
-            layout.solids.push(SolidSpec {
-                owner,
-                label: "Shaft Exit".into(),
-                center: top_to_center(end + Vec3::Y * 0.22, 0.48),
-                size: axis_box_size(along_x, 5.0, 0.48, 3.4),
-                paint: PaintStyle::ThemeFloor(to.theme),
-                body: SolidBody::Static,
-                friction: None,
-                extra: ExtraKind::None,
-            });
-            append_descending_pad_sequence(
-                &mut layout,
-                owner,
-                &mut rng,
-                start.lerp(end, 0.12),
-                end.lerp(start, 0.12),
-                forward,
-                right,
-                PaintStyle::ThemeFloor(to.theme),
-                |_| SolidBody::Static,
-                None,
-                "Shaft Floor Pad",
-                10.0,
-                3.8,
-                0.42,
-                gap_half * 1.55,
-                0.28,
-            );
-        }
-        ModuleKind::LiftChasm => {
-            let mover_size = Vec3::new(3.2, 0.72, 3.2);
-            let start_top = start.lerp(end, 0.24) + Vec3::Y * (rise * 0.25 + 0.9);
-            let end_top = start.lerp(end, 0.74) + Vec3::Y * (rise * 0.72 + 1.1);
-            layout.solids.push(SolidSpec {
-                owner,
-                label: "Sky Lift".into(),
-                center: top_to_center(start_top, mover_size.y),
-                size: mover_size,
-                paint: PaintStyle::ThemeAccent(to.theme),
-                body: SolidBody::Moving {
-                    end: top_to_center(end_top, mover_size.y),
-                    speed: lerp(2.6, 4.4, segment.difficulty),
-                    lethal: false,
-                },
-                friction: None,
-                extra: ExtraKind::None,
-            });
-            for anchor in [start_top, end_top] {
-                let support_top = anchor.y - mover_size.y;
-                let support_height = lerp(5.6, 8.4, segment.difficulty);
                 layout.solids.push(SolidSpec {
                     owner,
-                    label: "Lift Support".into(),
-                    center: Vec3::new(
-                        anchor.x - right.x * 3.2,
-                        support_top - support_height * 0.5,
-                        anchor.z - right.z * 3.2,
-                    ),
-                    size: Vec3::new(1.4, support_height, 1.4),
-                    paint: PaintStyle::ThemeShadow(to.theme),
+                    label: "Shaft Entry".into(),
+                    center: top_to_center(start.lerp(end, 0.24) + Vec3::Y * 0.24, 0.5),
+                    size: axis_box_size(along_x, 5.2, 0.5, 3.4),
+                    paint: PaintStyle::ThemeAccent(to.theme),
                     body: SolidBody::Static,
                     friction: None,
                     extra: ExtraKind::None,
                 });
-            }
-        }
-        ModuleKind::CrumbleBridge => {
-            let delay = lerp(0.9, 0.45, segment.difficulty);
-            let sink_speed = lerp(2.8, 5.0, segment.difficulty);
-            append_descending_pad_sequence(
-                &mut layout,
-                owner,
-                &mut rng,
-                start,
-                end,
-                forward,
-                right,
-                PaintStyle::Hazard,
-                |_| SolidBody::Crumbling { delay, sink_speed },
-                None,
-                "Crumble Span",
-                8.0,
-                4.4,
-                0.55,
-                2.3,
-                0.95,
-            );
-        }
-        ModuleKind::WindTunnel => {
-            append_descending_pad_sequence(
-                &mut layout,
-                owner,
-                &mut rng,
-                start,
-                end,
-                forward,
-                right,
-                PaintStyle::ThemeFloor(to.theme),
-                |_| SolidBody::Static,
-                None,
-                "Wind Perch",
-                8.8,
-                4.2,
-                0.58,
-                1.95,
-                1.15,
-            );
-            layout.features.push(FeatureSpec::WindZone {
-                center: start.lerp(end, 0.52) + Vec3::Y * (rise * 0.55 + 1.5),
-                size: axis_box_size(along_x, (end - start).xz().length() + 6.0, 3.8, 7.4),
-                direction: right * if rng.chance(0.5) { 1.0 } else { -1.0 } + Vec3::Y * 0.1,
-                strength: lerp(6.0, 11.0, segment.difficulty),
-                gust: lerp(1.2, 2.8, segment.difficulty),
-            });
-        }
-        ModuleKind::IceSpine => {
-            append_descending_pad_sequence(
-                &mut layout,
-                owner,
-                &mut rng,
-                start,
-                end,
-                forward,
-                right,
-                PaintStyle::Ice,
-                |_| SolidBody::Static,
-                Some(0.02),
-                "Ice Spine",
-                7.6,
-                4.6,
-                0.58,
-                1.85,
-                0.88,
-            );
-        }
-        ModuleKind::WaterGarden => {
-            let basin_top = from.top.y.min(to.top.y) - 2.3;
-            let basin_mid = start.lerp(end, 0.5);
-            let basin_size = axis_box_size(along_x, (end - start).xz().length() + 6.5, 0.78, 9.2);
-            let water_size = Vec3::new(
-                (basin_size.x - 0.7).max(2.5),
-                2.1,
-                (basin_size.z - 0.7).max(2.5),
-            );
-            layout.solids.push(SolidSpec {
-                owner,
-                label: "Water Basin".into(),
-                center: top_to_center(Vec3::new(basin_mid.x, basin_top, basin_mid.z), basin_size.y),
-                size: basin_size,
-                paint: PaintStyle::ThemeShadow(to.theme),
-                body: SolidBody::Static,
-                friction: None,
-                extra: ExtraKind::None,
-            });
-            layout.solids.push(SolidSpec {
-                owner,
-                label: "Water".into(),
-                center: Vec3::new(basin_mid.x, basin_top + water_size.y * 0.5, basin_mid.z),
-                size: water_size,
-                paint: PaintStyle::Water,
-                body: SolidBody::Water { speed: 0.72 },
-                friction: None,
-                extra: ExtraKind::None,
-            });
-            for pillar in [0.2, 0.5, 0.8] {
-                let mut top = start.lerp(end, pillar);
-                top.y = from.top.y + rise * pillar - 0.85;
+
+                for side in [-1.0, 1.0] {
+                    layout.solids.push(SolidSpec {
+                        owner,
+                        label: "Shaft Wall".into(),
+                        center: Vec3::new(
+                            shaft_center.x + right.x * side * (gap_half + wall_thickness * 0.5),
+                            shaft_floor_top.y + shaft_height * 0.5 - 0.2,
+                            shaft_center.z + right.z * side * (gap_half + wall_thickness * 0.5),
+                        ),
+                        size: axis_box_size(along_x, wall_length, shaft_height, wall_thickness),
+                        paint: PaintStyle::ThemeShadow(to.theme),
+                        body: SolidBody::Static,
+                        friction: None,
+                        extra: ExtraKind::None,
+                    });
+                }
+
                 layout.solids.push(SolidSpec {
                     owner,
-                    label: "Water Pillar".into(),
-                    center: Vec3::new(top.x, (top.y + basin_top) * 0.5, top.z),
-                    size: Vec3::new(2.4, top.y - basin_top, 2.4),
+                    label: "Shaft Floor".into(),
+                    center: top_to_center(shaft_floor_top, 0.46),
+                    size: axis_box_size(along_x, wall_length - 0.2, 0.46, gap_half * 1.7),
                     paint: PaintStyle::ThemeFloor(to.theme),
                     body: SolidBody::Static,
                     friction: None,
                     extra: ExtraKind::None,
                 });
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: "Shaft Exit".into(),
+                    center: top_to_center(end + Vec3::Y * 0.22, 0.48),
+                    size: axis_box_size(along_x, 5.0, 0.48, 3.4),
+                    paint: PaintStyle::ThemeFloor(to.theme),
+                    body: SolidBody::Static,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+                append_descending_pad_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start.lerp(end, 0.12),
+                    end.lerp(start, 0.12),
+                    forward,
+                    right,
+                    PaintStyle::ThemeFloor(to.theme),
+                    |_| SolidBody::Static,
+                    None,
+                    "Shaft Floor Pad",
+                    10.0,
+                    3.8,
+                    0.42,
+                    gap_half * 1.55,
+                    0.28,
+                );
+            }
+            ModuleKind::LiftChasm => {
+                let mover_size = Vec3::new(3.2, 0.72, 3.2);
+                let start_top = start.lerp(end, 0.24) + Vec3::Y * (rise * 0.25 + 0.9);
+                let end_top = start.lerp(end, 0.74) + Vec3::Y * (rise * 0.72 + 1.1);
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: "Sky Lift".into(),
+                    center: top_to_center(start_top, mover_size.y),
+                    size: mover_size,
+                    paint: PaintStyle::ThemeAccent(to.theme),
+                    body: SolidBody::Moving {
+                        end: top_to_center(end_top, mover_size.y),
+                        speed: lerp(2.6, 4.4, segment.difficulty),
+                        lethal: false,
+                    },
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+                for anchor in [start_top, end_top] {
+                    let support_top = anchor.y - mover_size.y;
+                    let support_height = lerp(5.6, 8.4, segment.difficulty);
+                    layout.solids.push(SolidSpec {
+                        owner,
+                        label: "Lift Support".into(),
+                        center: Vec3::new(
+                            anchor.x - right.x * 3.2,
+                            support_top - support_height * 0.5,
+                            anchor.z - right.z * 3.2,
+                        ),
+                        size: Vec3::new(1.4, support_height, 1.4),
+                        paint: PaintStyle::ThemeShadow(to.theme),
+                        body: SolidBody::Static,
+                        friction: None,
+                        extra: ExtraKind::None,
+                    });
+                }
+            }
+            ModuleKind::CrumbleBridge => {
+                let delay = lerp(0.9, 0.45, segment.difficulty);
+                let sink_speed = lerp(2.8, 5.0, segment.difficulty);
+                append_descending_pad_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    PaintStyle::Hazard,
+                    |_| SolidBody::Crumbling { delay, sink_speed },
+                    None,
+                    "Crumble Span",
+                    8.0,
+                    4.4,
+                    0.55,
+                    2.3,
+                    0.95,
+                );
+            }
+            ModuleKind::WindTunnel => {
+                append_descending_pad_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    PaintStyle::ThemeFloor(to.theme),
+                    |_| SolidBody::Static,
+                    None,
+                    "Wind Perch",
+                    8.8,
+                    4.2,
+                    0.58,
+                    1.95,
+                    1.15,
+                );
+                layout.features.push(FeatureSpec::WindZone {
+                    center: start.lerp(end, 0.52) + Vec3::Y * (rise * 0.55 + 1.5),
+                    size: axis_box_size(along_x, (end - start).xz().length() + 6.0, 3.8, 7.4),
+                    direction: right * if rng.chance(0.5) { 1.0 } else { -1.0 } + Vec3::Y * 0.1,
+                    strength: lerp(6.0, 11.0, segment.difficulty),
+                    gust: lerp(1.2, 2.8, segment.difficulty),
+                });
+            }
+            ModuleKind::IceSpine => {
+                append_descending_pad_sequence(
+                    &mut layout,
+                    owner,
+                    &mut rng,
+                    start,
+                    end,
+                    forward,
+                    right,
+                    PaintStyle::Ice,
+                    |_| SolidBody::Static,
+                    Some(0.02),
+                    "Ice Spine",
+                    7.6,
+                    4.6,
+                    0.58,
+                    1.85,
+                    0.88,
+                );
+            }
+            ModuleKind::WaterGarden => {
+                let basin_top = from.top.y.min(to.top.y) - 2.3;
+                let basin_mid = start.lerp(end, 0.5);
+                let basin_size =
+                    axis_box_size(along_x, (end - start).xz().length() + 6.5, 0.78, 9.2);
+                let water_size = Vec3::new(
+                    (basin_size.x - 0.7).max(2.5),
+                    2.1,
+                    (basin_size.z - 0.7).max(2.5),
+                );
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: "Water Basin".into(),
+                    center: top_to_center(
+                        Vec3::new(basin_mid.x, basin_top, basin_mid.z),
+                        basin_size.y,
+                    ),
+                    size: basin_size,
+                    paint: PaintStyle::ThemeShadow(to.theme),
+                    body: SolidBody::Static,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: "Water".into(),
+                    center: Vec3::new(basin_mid.x, basin_top + water_size.y * 0.5, basin_mid.z),
+                    size: water_size,
+                    paint: PaintStyle::Water,
+                    body: SolidBody::Water { speed: 0.72 },
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+                for pillar in [0.2, 0.5, 0.8] {
+                    let mut top = start.lerp(end, pillar);
+                    top.y = from.top.y + rise * pillar - 0.85;
+                    layout.solids.push(SolidSpec {
+                        owner,
+                        label: "Water Pillar".into(),
+                        center: Vec3::new(top.x, (top.y + basin_top) * 0.5, top.z),
+                        size: Vec3::new(2.4, top.y - basin_top, 2.4),
+                        paint: PaintStyle::ThemeFloor(to.theme),
+                        body: SolidBody::Static,
+                        friction: None,
+                        extra: ExtraKind::None,
+                    });
+                }
             }
         }
     }
@@ -5406,7 +8846,9 @@ fn append_css_surf_sequence(
     forward: Vec3,
     right: Vec3,
     theme: Theme,
+    flow: FlowFieldProfile,
     intense: bool,
+    outer_only_side: Option<f32>,
 ) {
     let direct_distance = start.distance(end).max(12.0);
     let entry_margin = if intense {
@@ -5419,41 +8861,49 @@ fn append_css_surf_sequence(
     } else {
         (direct_distance * 0.016).clamp(1.4, 4.0)
     };
-    let surf_start = start + forward * entry_margin + Vec3::Y * 0.4;
-    let surf_end = end - forward * exit_margin + Vec3::Y * 0.18;
+    let mut surf_start = start + forward * entry_margin + Vec3::Y * 0.4;
+    let mut surf_end = end - forward * exit_margin + Vec3::Y * 0.18;
     let total_distance = surf_start.distance(surf_end).max(12.0);
-    let curve_cycles = if intense {
-        rng.range_f32(1.0, 1.6)
-    } else {
-        rng.range_f32(0.75, 1.25)
+    let mut surf_flow = flow;
+    surf_flow.path_style = surf_path_style_from_flow(flow);
+    surf_flow.curvature = (flow.curvature * if intense { 1.08 } else { 0.98 }).clamp(0.82, 1.36);
+    surf_flow.weave_cycles = match surf_flow.path_style {
+        PathLateralStyle::Straight => flow.weave_cycles.clamp(0.25, 0.8),
+        PathLateralStyle::Arc => flow.weave_cycles.clamp(0.45, 1.15),
+        PathLateralStyle::OneSidedArc => flow.weave_cycles.clamp(0.08, 0.4),
+        PathLateralStyle::Serpentine | PathLateralStyle::Switchback => unreachable!(),
     };
-    let curve_phase = rng.range_f32(0.0, TAU);
-    let curve_amplitude = if intense {
-        rng.range_f32(0.62, 1.15)
-    } else {
-        rng.range_f32(0.42, 0.88)
-    };
+    surf_flow.lateral_amplitude =
+        (flow.lateral_amplitude * if intense { 1.22 } else { 1.08 }).clamp(0.32, 2.8);
+    surf_flow.vertical_wave =
+        (flow.vertical_wave * if intense { 1.24 } else { 1.06 }).clamp(0.08, 0.48);
+    let flow_seed = rng.next_u64();
     let ramp_span = if intense {
-        rng.range_f32(9.6, 13.8)
+        rng.range_f32(9.6, 13.8) * surf_flow.width_scale.clamp(0.9, 1.26)
     } else {
-        rng.range_f32(7.6, 10.6)
+        rng.range_f32(7.6, 10.6) * surf_flow.width_scale.clamp(0.92, 1.22)
     };
     let ramp_drop = if intense {
-        rng.range_f32(16.0, 24.0)
+        rng.range_f32(16.0, 24.0) * surf_flow.curvature.clamp(0.92, 1.22)
     } else {
-        rng.range_f32(12.0, 18.0)
+        rng.range_f32(12.0, 18.0) * surf_flow.curvature.clamp(0.92, 1.18)
     };
     let ridge_lift = if intense {
-        rng.range_f32(3.8, 5.8)
+        rng.range_f32(3.8, 5.8) + surf_flow.vertical_wave * 6.0
     } else {
-        rng.range_f32(2.6, 4.2)
+        rng.range_f32(2.6, 4.2) + surf_flow.vertical_wave * 4.2
     };
+    if let Some(side) = outer_only_side {
+        let outward_shift = right * side.signum() * ramp_span * 0.58;
+        surf_start += outward_shift;
+        surf_end += outward_shift;
+    }
 
     let centerline_point = |t: f32| {
         let envelope = (t * PI).sin().max(0.0).powf(0.85);
-        let weave = (t * curve_cycles * TAU + curve_phase).sin();
-        let offset = right * weave * curve_amplitude * envelope;
-        let lift = Vec3::Y * ridge_lift * envelope;
+        let sample = sample_flow_field(surf_flow, flow_seed, t, envelope);
+        let offset = right * sample.lateral;
+        let lift = Vec3::Y * (ridge_lift * envelope + sample.vertical * ramp_drop * 0.14);
         surf_start.lerp(surf_end, t) + offset + lift
     };
     let base_segment_count = if intense {
@@ -5511,6 +8961,11 @@ fn append_css_surf_sequence(
         let section_start = centerline[index];
         let section_end = centerline[index + 1];
         for side in [-1.0_f32, 1.0] {
+            if let Some(outer_side) = outer_only_side
+                && side.signum() != outer_side.signum()
+            {
+                continue;
+            }
             let wedge = surf_wedge_from_seams(
                 section_start,
                 section_end,
@@ -5561,6 +9016,11 @@ fn append_css_surf_sequence(
     let collider_outwards = sample_curve_outwards(&collider_tangents, outward_hint);
 
     for side in [-1.0_f32, 1.0] {
+        if let Some(outer_side) = outer_only_side
+            && side.signum() != outer_side.signum()
+        {
+            continue;
+        }
         let strip = surf_strip_from_path(
             &collider_centerline,
             &collider_tangents,
@@ -5591,6 +9051,842 @@ fn append_css_surf_sequence(
             friction: Some(0.0),
             extra: ExtraKind::None,
         });
+    }
+}
+
+fn append_bhop_platform_sequence(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    rng: &mut RunRng,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    theme: Theme,
+    flow: FlowFieldProfile,
+) {
+    let along_x = forward.x.abs() > 0.5;
+    let distance = start.distance(end).max(18.0);
+    let start_margin = bhop_path_margin(distance, 0.15, 0.85);
+    let end_margin = bhop_path_margin(distance, 0.12, 0.75);
+    let path_start = start + forward * start_margin + Vec3::Y * 0.24;
+    let path_end = end - forward * end_margin + Vec3::Y * 0.18;
+    let requested_count =
+        ((distance / scaled_bhop_cadence(4.8, 6.6, rng)).round() as usize).clamp(6, 16);
+    let pad_count =
+        clamp_platform_count_for_spacing(distance, requested_count, scaled_bhop_size(4.0), 4);
+    let style = choose_bhop_path_style(rng, ModuleKind::StairRun);
+    let weave_cycles = rng.range_f32(1.6, 3.2);
+    let phase = rng.range_f32(0.0, TAU);
+    let lateral_amplitude = scaled_bhop_size(rng.range_f32(1.0, 1.8));
+    let vertical_wave = scaled_bhop_size(rng.range_f32(0.06, 0.22));
+    let mut section_flow = flow;
+    section_flow.lateral_amplitude = section_flow.lateral_amplitude.clamp(0.48, 1.45);
+    section_flow.vertical_wave = section_flow.vertical_wave.clamp(0.05, 0.2);
+    let flow_seed = rng.next_u64();
+    let tops = sample_descending_platform_tops(
+        path_start,
+        path_end,
+        right,
+        pad_count,
+        style,
+        weave_cycles,
+        phase,
+        lateral_amplitude,
+        vertical_wave,
+        Some((section_flow, flow_seed)),
+    );
+
+    for (step, top) in tops.into_iter().enumerate() {
+        let catch_platform = step == 0 || step + 1 == pad_count || step % 5 == 0;
+        let square_side = scaled_bhop_size(if catch_platform {
+            rng.range_f32(3.8, 5.4)
+        } else if step % 3 == 0 {
+            rng.range_f32(2.8, 3.6)
+        } else {
+            rng.range_f32(1.9, 2.8)
+        });
+        let pad_height = scaled_bhop_size(if catch_platform {
+            rng.range_f32(0.9, 1.15)
+        } else {
+            rng.range_f32(0.72, 0.94)
+        }) * 0.45;
+        let paint = if catch_platform || step % 4 == 0 {
+            PaintStyle::ThemeAccent(theme)
+        } else {
+            PaintStyle::ThemeFloor(theme)
+        };
+
+        layout.solids.push(SolidSpec {
+            owner,
+            label: if catch_platform {
+                format!("Bhop Catch Pad {step}")
+            } else {
+                format!("Bhop Pad {step}")
+            },
+            center: top_to_center(top, pad_height),
+            size: axis_box_size(along_x, square_side, pad_height, square_side),
+            paint,
+            body: SolidBody::Static,
+            friction: None,
+            extra: ExtraKind::None,
+        });
+    }
+}
+
+fn sample_descending_platform_tops(
+    start: Vec3,
+    end: Vec3,
+    right: Vec3,
+    count: usize,
+    style: PathLateralStyle,
+    weave_cycles: f32,
+    phase: f32,
+    lateral_amplitude: f32,
+    vertical_wave: f32,
+    flow: Option<(FlowFieldProfile, u64)>,
+) -> Vec<Vec3> {
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let mut points = Vec::with_capacity(count);
+    let last = count.saturating_sub(1);
+    for step in 0..count {
+        let t = if count == 1 {
+            0.5
+        } else {
+            step as f32 / last as f32
+        };
+        let envelope = (t * PI).sin().max(0.0).powf(0.72);
+        let endpoint_factor = match step.min(last - step) {
+            0 => 0.0,
+            1 => 0.22,
+            _ => 1.0,
+        };
+        let (lateral_offset, vertical_offset) = if let Some((profile, seed)) = flow {
+            let sample = sample_flow_field(profile, seed, t, envelope * endpoint_factor);
+            (
+                sample.lateral * lateral_amplitude.max(1.0),
+                sample.vertical * vertical_wave.max(0.01) * 3.2,
+            )
+        } else {
+            (
+                path_lateral_offset(
+                    style,
+                    t,
+                    envelope * endpoint_factor,
+                    phase,
+                    weave_cycles,
+                    lateral_amplitude,
+                ),
+                (t * TAU * 1.35 + phase * 0.7).sin() * vertical_wave * envelope * endpoint_factor,
+            )
+        };
+        points.push(start.lerp(end, t) + right * lateral_offset + Vec3::Y * vertical_offset);
+    }
+    points
+}
+
+fn scaled_bhop_size(value: f32) -> f32 {
+    value * BHOP_OBJECT_SCALE
+}
+
+fn bhop_path_margin(distance: f32, min: f32, max: f32) -> f32 {
+    (distance * 0.0045).clamp(min, max)
+}
+
+fn clamp_platform_count_for_spacing(
+    distance: f32,
+    requested_count: usize,
+    min_spacing: f32,
+    minimum_count: usize,
+) -> usize {
+    let max_by_spacing = ((distance / min_spacing.max(1.0)).floor() as usize).saturating_add(1);
+    requested_count
+        .min(max_by_spacing.max(minimum_count))
+        .max(minimum_count)
+}
+
+fn choose_bhop_path_style(rng: &mut RunRng, kind: ModuleKind) -> PathLateralStyle {
+    let straight_weight = if matches!(kind, ModuleKind::SpeedcheckRun) {
+        4
+    } else {
+        1
+    };
+    let arc_weight = if matches!(
+        kind,
+        ModuleKind::MovingPlatformRun | ModuleKind::PillarAirstrafe
+    ) {
+        6
+    } else {
+        4
+    };
+    let switch_weight = if matches!(
+        kind,
+        ModuleKind::StairRun | ModuleKind::WindowHop | ModuleKind::ShapeGauntlet
+    ) {
+        8
+    } else {
+        3
+    };
+    rng.weighted_choice(&[
+        (PathLateralStyle::Straight, straight_weight),
+        (PathLateralStyle::Serpentine, 6),
+        (PathLateralStyle::Switchback, switch_weight),
+        (PathLateralStyle::Arc, arc_weight),
+    ])
+}
+
+fn choose_surf_path_style(rng: &mut RunRng, intense: bool) -> PathLateralStyle {
+    rng.weighted_choice(&[
+        (PathLateralStyle::Straight, if intense { 1 } else { 2 }),
+        (PathLateralStyle::OneSidedArc, if intense { 8 } else { 7 }),
+        (PathLateralStyle::Arc, 4),
+    ])
+}
+
+fn path_lateral_offset(
+    style: PathLateralStyle,
+    t: f32,
+    envelope: f32,
+    phase: f32,
+    weave_cycles: f32,
+    amplitude: f32,
+) -> f32 {
+    let wave = (t * weave_cycles * TAU + phase).sin();
+    let arc = (t * 2.0 - 1.0) + (phase * 0.35).sin() * 0.24;
+    let scalar = match style {
+        PathLateralStyle::Straight => (wave * 0.2 + arc * 0.18).clamp(-0.36, 0.36),
+        PathLateralStyle::Serpentine => wave * 1.12,
+        PathLateralStyle::Switchback => wave.signum() * wave.abs().powf(0.18) * 1.08,
+        PathLateralStyle::Arc => (arc * 1.08 + wave * 0.24).clamp(-1.25, 1.25),
+        PathLateralStyle::OneSidedArc => {
+            let direction = if phase.sin() >= 0.0 { 1.0 } else { -1.0 };
+            let bias = (phase.cos() * 0.5 + 0.5).clamp(0.18, 0.82);
+            let lead = t.powf(lerp(0.72, 1.5, bias));
+            let trail = (1.0 - t).powf(lerp(1.5, 0.72, bias));
+            let hump = (lead * trail).powf(0.4) * 2.18;
+            direction * hump.clamp(0.0, 1.22)
+        }
+    };
+    scalar * amplitude * envelope
+}
+
+fn scaled_bhop_cadence(min: f32, max: f32, rng: &mut RunRng) -> f32 {
+    rng.range_f32(min * BHOP_CADENCE_SCALE, max * BHOP_CADENCE_SCALE)
+}
+
+fn append_window_hop_sequence(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    rng: &mut RunRng,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    theme: Theme,
+    flow: FlowFieldProfile,
+) {
+    let along_x = forward.x.abs() > 0.5;
+    let distance = start.distance(end).max(18.0);
+    let path_start = start + forward * bhop_path_margin(distance, 0.15, 0.75) + Vec3::Y * 0.22;
+    let path_end = end - forward * bhop_path_margin(distance, 0.12, 0.7) + Vec3::Y * 0.18;
+    let requested_count =
+        ((distance / scaled_bhop_cadence(5.8, 7.8, rng)).round() as usize).clamp(5, 12);
+    let pad_count =
+        clamp_platform_count_for_spacing(distance, requested_count, scaled_bhop_size(4.2), 4);
+    let mut section_flow = flow;
+    section_flow.lateral_amplitude = (section_flow.lateral_amplitude * 0.95).clamp(0.42, 1.25);
+    section_flow.vertical_wave = section_flow.vertical_wave.clamp(0.04, 0.16);
+    let flow_seed = rng.next_u64();
+    let tops = sample_descending_platform_tops(
+        path_start,
+        path_end,
+        right,
+        pad_count,
+        choose_bhop_path_style(rng, ModuleKind::WindowHop),
+        rng.range_f32(1.4, 2.6),
+        rng.range_f32(0.0, TAU),
+        scaled_bhop_size(rng.range_f32(0.8, 1.4)),
+        scaled_bhop_size(rng.range_f32(0.05, 0.16)),
+        Some((section_flow, flow_seed)),
+    );
+
+    for (step, top) in tops.iter().enumerate() {
+        let catch_platform = step == 0 || step + 1 == tops.len() || step % 3 == 0;
+        let square_side = scaled_bhop_size(if catch_platform {
+            rng.range_f32(3.8, 5.2)
+        } else {
+            rng.range_f32(2.3, 3.2)
+        });
+        let pad_height = scaled_bhop_size(if catch_platform {
+            rng.range_f32(0.82, 1.05)
+        } else {
+            rng.range_f32(0.64, 0.86)
+        }) * 0.45;
+        layout.solids.push(SolidSpec {
+            owner,
+            label: format!("Window Hop Pad {step}"),
+            center: top_to_center(*top, pad_height),
+            size: axis_box_size(along_x, square_side, pad_height, square_side),
+            paint: if catch_platform {
+                PaintStyle::ThemeAccent(theme)
+            } else {
+                PaintStyle::ThemeFloor(theme)
+            },
+            body: SolidBody::Static,
+            friction: None,
+            extra: ExtraKind::None,
+        });
+
+        if step + 1 >= tops.len() {
+            continue;
+        }
+
+        let next_top = tops[step + 1];
+        let frame_center =
+            top.lerp(next_top, 0.5) + Vec3::Y * scaled_bhop_size(rng.range_f32(0.34, 0.44));
+        let frame_depth = scaled_bhop_size(rng.range_f32(0.12, 0.18));
+        let frame_height = scaled_bhop_size(rng.range_f32(0.76, 0.96));
+        let frame_width = scaled_bhop_size(rng.range_f32(0.72, 0.94));
+        let thickness = scaled_bhop_size(rng.range_f32(0.05, 0.08));
+        let side_offset = frame_width * 0.5 + thickness * 0.5;
+        let base_paint = if step % 2 == 0 {
+            PaintStyle::ThemeAccent(theme)
+        } else {
+            PaintStyle::ThemeShadow(theme)
+        };
+
+        for side in [-1.0, 1.0] {
+            layout.solids.push(SolidSpec {
+                owner,
+                label: format!("Window Frame Post {step} {side}"),
+                center: Vec3::new(
+                    frame_center.x + right.x * side * side_offset,
+                    frame_center.y,
+                    frame_center.z + right.z * side * side_offset,
+                ),
+                size: axis_box_size(along_x, frame_depth, frame_height, thickness),
+                paint: base_paint,
+                body: SolidBody::Static,
+                friction: None,
+                extra: ExtraKind::None,
+            });
+        }
+        layout.solids.push(SolidSpec {
+            owner,
+            label: format!("Window Frame Lintel {step}"),
+            center: frame_center + Vec3::Y * (frame_height * 0.5 - thickness * 0.5),
+            size: axis_box_size(
+                along_x,
+                frame_depth,
+                thickness,
+                frame_width + thickness * 2.0,
+            ),
+            paint: base_paint,
+            body: SolidBody::Static,
+            friction: None,
+            extra: ExtraKind::None,
+        });
+    }
+}
+
+fn append_pillar_air_strafe_sequence(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    rng: &mut RunRng,
+    start: Vec3,
+    end: Vec3,
+    _forward: Vec3,
+    right: Vec3,
+    theme: Theme,
+    flow: FlowFieldProfile,
+) {
+    let distance = start.distance(end).max(18.0);
+    let path_start = start + Vec3::Y * 0.26;
+    let path_end = end + Vec3::Y * 0.14;
+    let pillar_count = clamp_platform_count_for_spacing(
+        distance,
+        ((distance / scaled_bhop_cadence(5.4, 7.4, rng)).round() as usize).clamp(5, 12),
+        scaled_bhop_size(4.6),
+        4,
+    );
+    let mut section_flow = flow;
+    section_flow.lateral_amplitude = (section_flow.lateral_amplitude * 1.22).clamp(0.64, 1.8);
+    section_flow.vertical_wave = section_flow.vertical_wave.clamp(0.04, 0.14);
+    let flow_seed = rng.next_u64();
+    let tops = sample_descending_platform_tops(
+        path_start,
+        path_end,
+        right,
+        pillar_count,
+        choose_bhop_path_style(rng, ModuleKind::PillarAirstrafe),
+        rng.range_f32(1.1, 2.3),
+        rng.range_f32(0.0, TAU),
+        scaled_bhop_size(rng.range_f32(0.9, 1.8)),
+        scaled_bhop_size(rng.range_f32(0.05, 0.16)),
+        Some((section_flow, flow_seed)),
+    );
+    let hanging_base = end.y - scaled_bhop_size(rng.range_f32(1.4, 2.2));
+
+    for (step, top) in tops.iter().enumerate() {
+        let catch_pillar = step == 0 || step + 1 == tops.len() || step % 4 == 0;
+        let radius = scaled_bhop_size(if catch_pillar {
+            rng.range_f32(1.7, 2.4)
+        } else {
+            rng.range_f32(1.1, 1.7)
+        });
+        let cap_height = scaled_bhop_size(if catch_pillar {
+            rng.range_f32(5.0, 7.4)
+        } else {
+            rng.range_f32(3.6, 6.0)
+        }) * 0.5;
+        let base_y = hanging_base.min(top.y - cap_height + scaled_bhop_size(0.2));
+        let center = Vec3::new(top.x, base_y + cap_height * 0.5, top.z);
+        layout.solids.push(SolidSpec {
+            owner,
+            label: format!("Airstrafe Pillar {step}"),
+            center,
+            size: Vec3::new(radius * 2.0, cap_height, radius * 2.0),
+            paint: if catch_pillar {
+                PaintStyle::ThemeAccent(theme)
+            } else {
+                PaintStyle::ThemeFloor(theme)
+            },
+            body: SolidBody::StaticCylinder,
+            friction: None,
+            extra: ExtraKind::None,
+        });
+    }
+}
+
+fn append_headcheck_sequence(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    rng: &mut RunRng,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    theme: Theme,
+    flow: FlowFieldProfile,
+) {
+    let along_x = forward.x.abs() > 0.5;
+    let distance = start.distance(end).max(18.0);
+    let path_start = start + forward * bhop_path_margin(distance, 0.2, 0.9) + Vec3::Y * 0.24;
+    let path_end = end - forward * bhop_path_margin(distance, 0.18, 0.82) + Vec3::Y * 0.18;
+    let pad_count = clamp_platform_count_for_spacing(
+        distance,
+        ((distance / scaled_bhop_cadence(5.0, 6.8, rng)).round() as usize).clamp(5, 12),
+        scaled_bhop_size(4.4),
+        4,
+    );
+    let mut section_flow = flow;
+    section_flow.lateral_amplitude = (section_flow.lateral_amplitude * 0.84).clamp(0.34, 1.05);
+    section_flow.vertical_wave = section_flow.vertical_wave.clamp(0.03, 0.12);
+    let flow_seed = rng.next_u64();
+    let tops = sample_descending_platform_tops(
+        path_start,
+        path_end,
+        right,
+        pad_count,
+        choose_bhop_path_style(rng, ModuleKind::HeadcheckRun),
+        rng.range_f32(1.5, 2.8),
+        rng.range_f32(0.0, TAU),
+        scaled_bhop_size(rng.range_f32(0.7, 1.2)),
+        scaled_bhop_size(rng.range_f32(0.03, 0.11)),
+        Some((section_flow, flow_seed)),
+    );
+
+    for (step, top) in tops.iter().enumerate() {
+        let catch_platform = step == 0 || step + 1 == tops.len() || step % 4 == 0;
+        let pad_length = scaled_bhop_size(if catch_platform {
+            rng.range_f32(4.2, 5.2)
+        } else {
+            rng.range_f32(2.8, 3.8)
+        });
+        let pad_height = scaled_bhop_size(if catch_platform { 0.92 } else { 0.72 }) * 0.45;
+        layout.solids.push(SolidSpec {
+            owner,
+            label: format!("Headcheck Pad {step}"),
+            center: top_to_center(*top, pad_height),
+            size: axis_box_size(along_x, pad_length, pad_height, pad_length),
+            paint: if catch_platform {
+                PaintStyle::ThemeAccent(theme)
+            } else {
+                PaintStyle::ThemeFloor(theme)
+            },
+            body: SolidBody::Static,
+            friction: None,
+            extra: ExtraKind::None,
+        });
+
+        if step + 1 >= tops.len() || step % 2 == 0 {
+            continue;
+        }
+
+        let blocker_center =
+            top.lerp(tops[step + 1], 0.5) + Vec3::Y * scaled_bhop_size(rng.range_f32(0.34, 0.4));
+        let blocker_height = scaled_bhop_size(rng.range_f32(0.08, 0.11));
+        layout.solids.push(SolidSpec {
+            owner,
+            label: format!("Headcheck Blocker {step}"),
+            center: blocker_center,
+            size: axis_box_size(
+                along_x,
+                scaled_bhop_size(rng.range_f32(0.92, 1.32)),
+                blocker_height,
+                scaled_bhop_size(0.78),
+            ),
+            paint: PaintStyle::ThemeShadow(theme),
+            body: SolidBody::Static,
+            friction: None,
+            extra: ExtraKind::None,
+        });
+    }
+}
+
+fn append_speedcheck_sequence(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    rng: &mut RunRng,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    theme: Theme,
+    flow: FlowFieldProfile,
+) {
+    let along_x = forward.x.abs() > 0.5;
+    let distance = start.distance(end).max(18.0);
+    let path_start = start + forward * bhop_path_margin(distance, 0.16, 0.8) + Vec3::Y * 0.2;
+    let path_end = end - forward * bhop_path_margin(distance, 0.14, 0.74) + Vec3::Y * 0.12;
+    let longjump = rng.chance(0.55);
+    let requested_count = if longjump {
+        ((distance / scaled_bhop_cadence(7.2, 9.8, rng)).round() as usize).clamp(4, 8)
+    } else {
+        ((distance / scaled_bhop_cadence(6.0, 8.0, rng)).round() as usize).clamp(4, 7)
+    };
+    let pad_count = clamp_platform_count_for_spacing(
+        distance,
+        requested_count,
+        if longjump {
+            scaled_bhop_size(5.8)
+        } else {
+            scaled_bhop_size(4.6)
+        },
+        4,
+    );
+    let mut section_flow = flow;
+    if matches!(
+        section_flow.path_style,
+        PathLateralStyle::Serpentine | PathLateralStyle::Switchback
+    ) {
+        section_flow.path_style = PathLateralStyle::Arc;
+    }
+    section_flow.lateral_amplitude =
+        (section_flow.lateral_amplitude * if longjump { 0.58 } else { 0.76 }).clamp(0.18, 0.92);
+    section_flow.vertical_wave = section_flow.vertical_wave.clamp(0.02, 0.08);
+    let flow_seed = rng.next_u64();
+    let tops = sample_descending_platform_tops(
+        path_start,
+        path_end,
+        right,
+        pad_count,
+        choose_bhop_path_style(rng, ModuleKind::SpeedcheckRun),
+        rng.range_f32(1.0, 2.2),
+        rng.range_f32(0.0, TAU),
+        if longjump {
+            scaled_bhop_size(rng.range_f32(0.22, 0.44))
+        } else {
+            scaled_bhop_size(rng.range_f32(0.34, 0.56))
+        },
+        scaled_bhop_size(rng.range_f32(0.02, 0.07)),
+        Some((section_flow, flow_seed)),
+    );
+
+    for (step, mut top) in tops.into_iter().enumerate() {
+        if !longjump && step > 0 && step < pad_count.saturating_sub(1) && step % 2 == 1 {
+            top.y += scaled_bhop_size(rng.range_f32(0.36, 0.68));
+        }
+        let catch_platform = step == 0 || step + 1 == pad_count || step % 3 == 0;
+        let pad_length = scaled_bhop_size(if longjump {
+            if catch_platform {
+                rng.range_f32(4.2, 5.6)
+            } else {
+                rng.range_f32(2.8, 3.8)
+            }
+        } else if catch_platform {
+            rng.range_f32(3.8, 5.2)
+        } else {
+            rng.range_f32(2.4, 3.2)
+        });
+        let pad_height = scaled_bhop_size(if catch_platform { 0.92 } else { 0.74 }) * 0.45;
+        layout.solids.push(SolidSpec {
+            owner,
+            label: if longjump {
+                format!("Longjump Pad {step}")
+            } else {
+                format!("Highjump Pad {step}")
+            },
+            center: top_to_center(top, pad_height),
+            size: axis_box_size(along_x, pad_length, pad_height, pad_length),
+            paint: if longjump {
+                PaintStyle::ThemeFloor(theme)
+            } else {
+                PaintStyle::ThemeAccent(theme)
+            },
+            body: SolidBody::Static,
+            friction: None,
+            extra: ExtraKind::None,
+        });
+    }
+}
+
+fn append_moving_platform_sequence(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    rng: &mut RunRng,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    difficulty: f32,
+    theme: Theme,
+    flow: FlowFieldProfile,
+) {
+    let along_x = forward.x.abs() > 0.5;
+    let distance = start.distance(end).max(18.0);
+    let path_start = start + forward * bhop_path_margin(distance, 0.18, 0.82) + Vec3::Y * 0.24;
+    let path_end = end - forward * bhop_path_margin(distance, 0.18, 0.82) + Vec3::Y * 0.14;
+    let pad_count = clamp_platform_count_for_spacing(
+        distance,
+        ((distance / scaled_bhop_cadence(5.8, 7.8, rng)).round() as usize).clamp(4, 9),
+        scaled_bhop_size(4.8),
+        4,
+    );
+    let mut section_flow = flow;
+    section_flow.lateral_amplitude = (section_flow.lateral_amplitude * 1.12).clamp(0.42, 1.5);
+    section_flow.vertical_wave = section_flow.vertical_wave.clamp(0.03, 0.12);
+    let flow_seed = rng.next_u64();
+    let tops = sample_descending_platform_tops(
+        path_start,
+        path_end,
+        right,
+        pad_count,
+        choose_bhop_path_style(rng, ModuleKind::MovingPlatformRun),
+        rng.range_f32(1.2, 2.2),
+        rng.range_f32(0.0, TAU),
+        scaled_bhop_size(rng.range_f32(0.8, 1.4)),
+        scaled_bhop_size(rng.range_f32(0.02, 0.06)),
+        Some((section_flow, flow_seed)),
+    );
+
+    for (step, top) in tops.iter().enumerate() {
+        let mover = step > 0 && step + 1 < tops.len() && step % 2 == 1;
+        let pad_size = scaled_bhop_size(rng.range_f32(3.2, 4.8));
+        let pad_height = scaled_bhop_size(rng.range_f32(0.72, 0.96)) * 0.45;
+        let center = top_to_center(*top, pad_height);
+        let body = if mover {
+            let travel = if rng.chance(0.55) {
+                right * scaled_bhop_size(rng.range_f32(0.56, 1.04))
+            } else {
+                Vec3::Y * scaled_bhop_size(rng.range_f32(0.28, 0.52))
+            };
+            SolidBody::Moving {
+                end: center + travel,
+                speed: lerp(2.1, 3.8, difficulty),
+                lethal: false,
+            }
+        } else {
+            SolidBody::Static
+        };
+        layout.solids.push(SolidSpec {
+            owner,
+            label: if mover {
+                format!("Mover Hop {step}")
+            } else {
+                format!("Mover Catch {step}")
+            },
+            center,
+            size: axis_box_size(along_x, pad_size, pad_height, pad_size),
+            paint: if mover {
+                PaintStyle::Checkpoint
+            } else {
+                PaintStyle::ThemeFloor(theme)
+            },
+            body,
+            friction: None,
+            extra: ExtraKind::None,
+        });
+    }
+}
+
+fn append_shape_gauntlet_sequence(
+    layout: &mut ModuleLayout,
+    owner: OwnerTag,
+    rng: &mut RunRng,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    theme: Theme,
+    flow: FlowFieldProfile,
+) {
+    #[derive(Clone, Copy)]
+    enum ShapeFamily {
+        Spheres,
+        Cubes,
+        Trapezoids,
+        Cylinders,
+        Mixed,
+    }
+
+    let along_x = forward.x.abs() > 0.5;
+    let distance = start.distance(end).max(18.0);
+    let path_start = start + forward * bhop_path_margin(distance, 0.2, 0.95) + Vec3::Y * 0.3;
+    let path_end = end - forward * bhop_path_margin(distance, 0.18, 0.88) + Vec3::Y * 0.18;
+    let pad_count = clamp_platform_count_for_spacing(
+        distance,
+        ((distance / scaled_bhop_cadence(6.8, 8.8, rng)).round() as usize).clamp(4, 10),
+        scaled_bhop_size(7.6),
+        4,
+    );
+    let mut section_flow = flow;
+    section_flow.lateral_amplitude = (section_flow.lateral_amplitude * 1.36).clamp(0.66, 1.95);
+    section_flow.vertical_wave = section_flow.vertical_wave.clamp(0.03, 0.1);
+    let flow_seed = rng.next_u64();
+    let tops = sample_descending_platform_tops(
+        path_start,
+        path_end,
+        right,
+        pad_count,
+        choose_bhop_path_style(rng, ModuleKind::ShapeGauntlet),
+        rng.range_f32(1.1, 2.1),
+        rng.range_f32(0.0, TAU),
+        scaled_bhop_size(rng.range_f32(0.8, 1.5)),
+        scaled_bhop_size(rng.range_f32(0.03, 0.09)),
+        Some((section_flow, flow_seed)),
+    );
+    let family = rng.weighted_choice(&[
+        (ShapeFamily::Spheres, 4),
+        (ShapeFamily::Cubes, 2),
+        (ShapeFamily::Trapezoids, 2),
+        (ShapeFamily::Cylinders, 2),
+        (ShapeFamily::Mixed, 3),
+    ]);
+
+    for (step, top) in tops.iter().enumerate() {
+        let catch_platform = step == 0 || step + 1 == tops.len() || step % 3 == 0;
+        let shape_kind = match family {
+            ShapeFamily::Spheres => 0,
+            ShapeFamily::Cubes => 1,
+            ShapeFamily::Trapezoids => 2,
+            ShapeFamily::Cylinders => 3,
+            ShapeFamily::Mixed => rng.range_usize(0, 4),
+        };
+        match shape_kind {
+            0 => {
+                let radius = scaled_bhop_size(if catch_platform {
+                    rng.range_f32(2.8, 4.2)
+                } else {
+                    rng.range_f32(2.2, 3.3)
+                });
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: format!("Sphere Gauntlet {step}"),
+                    center: *top - Vec3::Y * radius,
+                    size: Vec3::splat(radius * 2.0),
+                    paint: if catch_platform {
+                        PaintStyle::ThemeAccent(theme)
+                    } else {
+                        PaintStyle::ThemeFloor(theme)
+                    },
+                    body: SolidBody::StaticSphere,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+            1 => {
+                let side = scaled_bhop_size(if catch_platform {
+                    rng.range_f32(4.4, 6.2)
+                } else {
+                    rng.range_f32(3.0, 4.4)
+                });
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: format!("Cube Gauntlet {step}"),
+                    center: top_to_center(*top, side),
+                    size: axis_box_size(along_x, side, side, side),
+                    paint: if catch_platform {
+                        PaintStyle::ThemeAccent(theme)
+                    } else {
+                        PaintStyle::ThemeFloor(theme)
+                    },
+                    body: SolidBody::Static,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+            2 => {
+                let height = scaled_bhop_size(if catch_platform {
+                    rng.range_f32(3.4, 5.4)
+                } else {
+                    rng.range_f32(2.6, 4.2)
+                }) * 0.5;
+                let base = scaled_bhop_size(if catch_platform {
+                    rng.range_f32(5.0, 7.2)
+                } else {
+                    rng.range_f32(3.6, 5.2)
+                });
+                let top_scale = if catch_platform {
+                    rng.range_f32(0.45, 0.72)
+                } else {
+                    rng.range_f32(0.18, 0.48)
+                };
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: format!("Trapezoid Gauntlet {step}"),
+                    center: top_to_center(*top, height),
+                    size: Vec3::new(base, height, base),
+                    paint: if catch_platform {
+                        PaintStyle::ThemeAccent(theme)
+                    } else {
+                        PaintStyle::ThemeFloor(theme)
+                    },
+                    body: SolidBody::StaticTrapezoid { top_scale },
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+            _ => {
+                let radius = scaled_bhop_size(if catch_platform {
+                    rng.range_f32(1.9, 2.8)
+                } else {
+                    rng.range_f32(1.4, 2.1)
+                });
+                let height = scaled_bhop_size(if catch_platform {
+                    rng.range_f32(4.2, 6.4)
+                } else {
+                    rng.range_f32(3.1, 4.8)
+                }) * 0.5;
+                layout.solids.push(SolidSpec {
+                    owner,
+                    label: format!("Cylinder Gauntlet {step}"),
+                    center: top_to_center(*top, height),
+                    size: Vec3::new(radius * 2.0, height, radius * 2.0),
+                    paint: if catch_platform {
+                        PaintStyle::ThemeAccent(theme)
+                    } else {
+                        PaintStyle::ThemeFloor(theme)
+                    },
+                    body: SolidBody::StaticCylinder,
+                    friction: None,
+                    extra: ExtraKind::None,
+                });
+            }
+        }
     }
 }
 
@@ -5643,101 +9939,8 @@ fn build_branch_layout(
     rooms: &[RoomPlan],
     _unlocked_shortcuts: &HashSet<u64>,
 ) -> ModuleLayout {
-    let mut layout = ModuleLayout::default();
-    let owner = OwnerTag::Branch(index);
-    let room = &rooms[branch.room_index];
-    let branch_dir = branch.dir.normalize_or_zero();
-    let along_x = branch_dir.x.abs() > 0.5;
-    let start = room_edge(room, branch_dir);
-    let bridge_top = room.top + branch_dir * (CELL_SIZE * 0.34) + Vec3::Y * 0.22;
-    let platform_top = branch.top;
-
-    let bridge_body = if matches!(branch.kind, BranchKind::RiskDetour) {
-        SolidBody::Crumbling {
-            delay: 0.7,
-            sink_speed: 3.8,
-        }
-    } else {
-        SolidBody::Static
-    };
-    let bridge_paint = if matches!(branch.kind, BranchKind::RiskDetour) {
-        PaintStyle::Hazard
-    } else {
-        PaintStyle::ThemeAccent(branch.theme)
-    };
-    layout.solids.push(SolidSpec {
-        owner,
-        label: "Branch Bridge".into(),
-        center: top_to_center(bridge_top, 0.6),
-        size: axis_box_size(along_x, CELL_SIZE * 0.58, 0.6, 2.2),
-        paint: bridge_paint,
-        body: bridge_body,
-        friction: if matches!(branch.kind, BranchKind::RiskDetour) {
-            Some(0.04)
-        } else {
-            None
-        },
-        extra: ExtraKind::None,
-    });
-
-    layout.solids.push(SolidSpec {
-        owner,
-        label: "Branch Platform".into(),
-        center: top_to_center(platform_top, 0.82),
-        size: Vec3::new(branch.size.x, 0.82, branch.size.y),
-        paint: PaintStyle::ThemeFloor(branch.theme),
-        body: SolidBody::Static,
-        friction: if matches!(branch.kind, BranchKind::RiskDetour) {
-            Some(0.05)
-        } else {
-            None
-        },
-        extra: ExtraKind::None,
-    });
-
-    match branch.kind {
-        BranchKind::TreasureAlcove | BranchKind::PropCache | BranchKind::ShortcutLever => {
-            let mut rng = RunRng::new(branch.seed);
-            for prop_index in 0..2 {
-                let offset = Vec3::new(
-                    rng.range_f32(-branch.size.x * 0.18, branch.size.x * 0.18),
-                    0.08,
-                    rng.range_f32(-branch.size.y * 0.18, branch.size.y * 0.18),
-                );
-                layout.solids.push(SolidSpec {
-                    owner,
-                    label: format!("Cache Crate {}", prop_index),
-                    center: top_to_center(platform_top + offset + Vec3::Y * 0.75, 1.35),
-                    size: Vec3::splat(1.35),
-                    paint: PaintStyle::Prop(branch.theme),
-                    body: SolidBody::DynamicProp,
-                    friction: None,
-                    extra: ExtraKind::None,
-                });
-            }
-        }
-        BranchKind::RiskDetour => {
-            layout.features.push(FeatureSpec::WindZone {
-                center: start.lerp(platform_top, 0.5) + Vec3::Y * 1.5,
-                size: axis_box_size(along_x, CELL_SIZE * 0.48, 2.8, 5.0),
-                direction: Vec3::Y * 0.15 + Vec3::new(-branch_dir.z, 0.0, branch_dir.x),
-                strength: 6.5,
-                gust: 2.0,
-            });
-        }
-    }
-
-    layout.clearances.push(ClearanceProbe {
-        owner,
-        center: platform_top + Vec3::Y * (ROOM_CLEARANCE_HEIGHT * 0.45),
-        size: Vec3::new(
-            (branch.size.x - 0.8).max(2.6),
-            ROOM_CLEARANCE_HEIGHT,
-            (branch.size.y - 0.8).max(2.6),
-        ),
-    });
-
-    layout
+    let _ = (index, branch, rooms);
+    ModuleLayout::default()
 }
 
 fn build_summit_layout(room: &RoomPlan, summit: Vec3) -> ModuleLayout {
@@ -6040,6 +10243,114 @@ fn floating_sphere_color(index: usize) -> Color {
 mod tests {
     use super::*;
 
+    fn test_flow() -> FlowFieldProfile {
+        default_flow_profile()
+    }
+
+    fn test_room(index: usize, cell: IVec2, top: Vec3, seed: u64) -> RoomPlan {
+        RoomPlan {
+            index,
+            cell,
+            top,
+            size: Vec2::splat(15.0),
+            theme: Theme::Frost,
+            seed,
+            section: RoomSectionKind::OpenPad,
+            checkpoint_slot: Some(index),
+            biome: BiomeStyle::NeonCyber,
+            zone_index: 0,
+            layer_index: 0,
+        }
+    }
+
+    fn test_segment(index: usize, kind: ModuleKind, seed: u64) -> SegmentPlan {
+        SegmentPlan {
+            index,
+            from: 0,
+            to: 1,
+            kind,
+            difficulty: 0.52,
+            seed,
+            zone_role: ZoneRole::Accelerator,
+            zone_signature: ZoneSignature::WaveRamps,
+            shortcut_id: None,
+            exit_socket: module_template(kind).exit,
+            zone_index: 0,
+            biome: BiomeStyle::NeonCyber,
+            connector: ConnectorKind::Transfer,
+            flow: test_flow(),
+            route_lines: vec![RouteLine::Speed],
+            zone_local_t: 0.5,
+        }
+    }
+
+    fn test_zone(end_segment: usize) -> ZonePlan {
+        ZonePlan {
+            index: 0,
+            kind: ZoneKind::Accelerator,
+            role: ZoneRole::Accelerator,
+            signature: ZoneSignature::WaveRamps,
+            biome: BiomeStyle::NeonCyber,
+            start_segment: 0,
+            end_segment,
+            flow: test_flow(),
+            entry_connector: ConnectorKind::Funnel,
+            exit_connector: ConnectorKind::Collector,
+            landmark: LandmarkKind::BrokenRing,
+            route_lines: vec![RouteLine::Safe, RouteLine::Speed, RouteLine::Trick],
+            branch_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn zone_generation_cycles_roles_and_assigns_landmarks() {
+        let blueprint = build_run_blueprint(42);
+        assert!(blueprint.zones.len() >= 4);
+
+        let roles = blueprint
+            .zones
+            .iter()
+            .take(4)
+            .map(|zone| zone.role)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            vec![
+                ZoneRole::Accelerator,
+                ZoneRole::Technical,
+                ZoneRole::Recovery,
+                ZoneRole::Spectacle
+            ]
+        );
+        assert!(
+            blueprint
+                .zones
+                .iter()
+                .all(|zone| !zone.route_lines.is_empty()),
+            "every zone should expose at least one route line"
+        );
+    }
+
+    #[test]
+    fn generated_run_contains_multi_line_choice_segments() {
+        let blueprint = build_run_blueprint(1337);
+        assert!(
+            blueprint
+                .segments
+                .iter()
+                .any(|segment| segment.route_lines.len() >= 2),
+            "expected at least one route-choice segment"
+        );
+        assert!(
+            blueprint.segments.iter().any(|segment| {
+                segment.route_lines.contains(&RouteLine::Safe)
+                    && segment.route_lines.contains(&RouteLine::Speed)
+                    && segment.route_lines.contains(&RouteLine::Trick)
+            }),
+            "expected at least one full safe/speed/trick segment"
+        );
+    }
+
     #[test]
     fn generated_solids_have_valid_collider_bounds() {
         for seed in 0_u64..256 {
@@ -6120,6 +10431,325 @@ mod tests {
     }
 
     #[test]
+    fn generated_celestials_avoid_the_entry_view_corridor() {
+        for seed in 0_u64..256 {
+            let blueprint = build_run_blueprint(seed);
+            for body in build_celestial_body_plans(&blueprint) {
+                let view_clearance =
+                    celestial_entry_view_clearance(&blueprint, body.anchor, body.radius);
+                let minimum = if body.radius >= 800.0 { 220.0 } else { 100.0 };
+                assert!(
+                    view_clearance >= minimum,
+                    "seed {seed} celestial body {:?} radius {} intruded into entry view corridor with clearance {}",
+                    body.anchor,
+                    body.radius,
+                    view_clearance,
+                );
+                assert!(
+                    !(body.radius >= 800.0 && body.shape == CelestialShapeKind::Sphere),
+                    "seed {seed} generated a giant central-prone sphere with radius {}",
+                    body.radius,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn new_speed_modules_generate_valid_solids() {
+        let rooms = vec![
+            test_room(0, IVec2::ZERO, Vec3::new(0.0, 120.0, 0.0), 1),
+            test_room(1, IVec2::new(4, 1), Vec3::new(92.0, 84.0, 26.0), 2),
+        ];
+
+        for (index, kind) in [
+            ModuleKind::StairRun,
+            ModuleKind::WindowHop,
+            ModuleKind::PillarAirstrafe,
+            ModuleKind::HeadcheckRun,
+            ModuleKind::SpeedcheckRun,
+            ModuleKind::MovingPlatformRun,
+            ModuleKind::ShapeGauntlet,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut segment = test_segment(index, kind, 0xC0DE_BAAD_u64 ^ index as u64);
+            segment.difficulty = 0.52;
+            let layout = build_segment_layout(&segment, &rooms, &HashSet::default());
+            assert!(
+                !layout.solids.is_empty(),
+                "module {:?} should generate gameplay solids",
+                kind
+            );
+            for solid in &layout.solids {
+                assert!(
+                    validate_solid_spec(solid).is_ok(),
+                    "module {:?} solid '{}' invalid: {}",
+                    kind,
+                    solid.label,
+                    validate_solid_spec(solid).unwrap_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bhop_platform_sampling_hugs_segment_endcaps() {
+        let start = Vec3::new(0.0, 10.0, 0.0);
+        let end = Vec3::new(100.0, -10.0, 0.0);
+        let points = sample_descending_platform_tops(
+            start,
+            end,
+            Vec3::Z,
+            6,
+            PathLateralStyle::Serpentine,
+            2.0,
+            1.3,
+            50.0,
+            20.0,
+            None,
+        );
+
+        assert_eq!(points.len(), 6);
+        assert!(
+            points.first().unwrap().distance(start) < 0.001,
+            "first bhop point drifted too far from the entry endcap"
+        );
+        assert!(
+            points.last().unwrap().distance(end) < 0.001,
+            "last bhop point drifted too far from the exit endcap"
+        );
+    }
+
+    #[test]
+    fn bhop_modules_start_close_to_the_entry_platform() {
+        let rooms = vec![
+            test_room(0, IVec2::ZERO, Vec3::new(0.0, 120.0, 0.0), 1),
+            test_room(1, IVec2::new(4, 1), Vec3::new(92.0, 84.0, 26.0), 2),
+        ];
+        let forward = direction_from_delta(rooms[1].top - rooms[0].top);
+        let start = room_edge(&rooms[0], forward);
+
+        for (index, kind) in [ModuleKind::StairRun, ModuleKind::ShapeGauntlet]
+            .into_iter()
+            .enumerate()
+        {
+            let mut segment = test_segment(index, kind, 0xA11C_7000_u64 ^ index as u64);
+            segment.difficulty = 0.52;
+            let layout = build_segment_layout(&segment, &rooms, &HashSet::default());
+            let closest_progress = layout
+                .solids
+                .iter()
+                .map(|solid| {
+                    let top = solid.center + Vec3::Y * (solid.size.y * 0.5);
+                    (top - start).dot(forward)
+                })
+                .filter(|progress| *progress > -0.5)
+                .fold(f32::INFINITY, f32::min);
+
+            assert!(
+                closest_progress <= 1.6,
+                "module {:?} started too far from the entry platform: {}",
+                kind,
+                closest_progress
+            );
+        }
+    }
+
+    #[test]
+    fn route_generation_varies_turn_strength() {
+        let mut saw_straight = false;
+        let mut saw_curved = false;
+
+        for seed in 0_u64..24 {
+            let blueprint = build_run_blueprint(seed);
+            for triple in blueprint.rooms.windows(3) {
+                let a = direction_from_delta(triple[1].top - triple[0].top);
+                let b = direction_from_delta(triple[2].top - triple[1].top);
+                if a == Vec3::ZERO || b == Vec3::ZERO {
+                    continue;
+                }
+                let turn = a.angle_between(b).to_degrees();
+                if turn <= 1.6 {
+                    saw_straight = true;
+                }
+                if turn >= 7.5 {
+                    saw_curved = true;
+                }
+            }
+        }
+
+        assert!(
+            saw_straight,
+            "expected at least some near-straight route sections"
+        );
+        assert!(
+            saw_curved,
+            "expected at least some strongly curving route sections"
+        );
+    }
+
+    #[test]
+    fn first_segment_is_always_surf() {
+        for seed in 0_u64..128 {
+            let blueprint = build_run_blueprint(seed);
+            assert_eq!(
+                blueprint.segments.first().map(|segment| segment.kind),
+                Some(ModuleKind::SurfRamp),
+                "seed {seed} did not start with a surf segment"
+            );
+        }
+    }
+
+    #[test]
+    fn infinite_append_adds_more_rooms_and_segments() {
+        let mut blueprint = build_run_blueprint(0x1eed_5eed);
+        let original_room_count = blueprint.rooms.len();
+        let original_segment_count = blueprint.segments.len();
+        let original_tail_y = blueprint.rooms.last().unwrap().top.y;
+
+        append_run_blueprint(&mut blueprint, 8);
+
+        assert_eq!(blueprint.rooms.len(), original_room_count + 8);
+        assert_eq!(blueprint.segments.len(), original_segment_count + 8);
+        assert!(blueprint.rooms.last().unwrap().top.y < original_tail_y);
+        assert_eq!(blueprint.floors, blueprint.rooms.len());
+    }
+
+    #[test]
+    fn active_blueprints_do_not_generate_branch_platforms_or_cache_props() {
+        for seed in 0_u64..64 {
+            let blueprint = build_run_blueprint(seed);
+            assert!(
+                blueprint.branches.is_empty(),
+                "seed {seed} still generated side-branch clutter",
+            );
+        }
+    }
+
+    #[test]
+    fn endless_chunk_window_never_spawns_summit_chunk() {
+        let blueprint = build_run_blueprint(0x51de_cafe);
+        for focus_room in [
+            0,
+            blueprint.rooms.len() / 2,
+            blueprint.rooms.len().saturating_sub(1),
+        ] {
+            assert!(
+                !desired_chunk_window(&blueprint, focus_room).contains(&WorldChunkKey::Summit),
+                "summit chunk was still requested for focus room {focus_room}",
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_death_plane_looks_ahead_for_long_drops() {
+        let blueprint = RunBlueprint {
+            seed: 7,
+            floors: 3,
+            rooms: vec![
+                test_room(0, IVec2::ZERO, Vec3::new(0.0, 420.0, 0.0), 1),
+                test_room(1, IVec2::new(3, 0), Vec3::new(120.0, 240.0, 0.0), 2),
+                test_room(2, IVec2::new(7, 0), Vec3::new(280.0, 40.0, 0.0), 3),
+            ],
+            segments: Vec::new(),
+            branches: Vec::new(),
+            spawn: Vec3::new(0.0, 422.0, 0.0),
+            summit: Vec3::new(280.0, 41.4, 0.0),
+            death_plane: -999.0,
+            stats: GenerationStats::default(),
+            zones: vec![test_zone(1)],
+            zone_edges: Vec::new(),
+        };
+        let checkpoints = blueprint
+            .rooms
+            .iter()
+            .map(|room| room.top + Vec3::Y * PLAYER_SPAWN_CLEARANCE)
+            .collect::<Vec<_>>();
+
+        let death_plane = checkpoint_death_plane(&blueprint, &checkpoints, 0, 0);
+
+        assert!(
+            death_plane < blueprint.rooms[1].top.y - 40.0,
+            "death plane {} still sits too high for a long descending opener",
+            death_plane
+        );
+        assert!(
+            death_plane <= blueprint.rooms[2].top.y - CHECKPOINT_DEATH_MARGIN,
+            "death plane {} failed to look ahead to the deeper generated rooms",
+            death_plane
+        );
+    }
+
+    #[test]
+    fn giant_bhop_sections_do_not_self_overlap() {
+        let rooms = vec![
+            test_room(0, IVec2::ZERO, Vec3::new(0.0, 120.0, 0.0), 1),
+            test_room(1, IVec2::new(6, 1), Vec3::new(180.0, 72.0, 24.0), 2),
+        ];
+
+        for (index, kind) in [ModuleKind::StairRun, ModuleKind::ShapeGauntlet]
+            .into_iter()
+            .enumerate()
+        {
+            let mut segment = test_segment(index, kind, 0x51DE_CAFE_u64 ^ index as u64);
+            segment.difficulty = 0.62;
+            let layout = build_segment_layout(&segment, &rooms, &HashSet::default());
+            let volumes = layout
+                .solids
+                .iter()
+                .filter_map(|solid| solid.preview_volume())
+                .collect::<Vec<_>>();
+
+            for i in 0..volumes.len() {
+                for j in i + 1..volumes.len() {
+                    assert!(
+                        !intersects(volumes[i], volumes[j], 0.02),
+                        "module {:?} produced overlapping gameplay solids between '{}' and '{}'",
+                        kind,
+                        layout.solids[i].label,
+                        layout.solids[j].label,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn route_choice_lines_keep_distinct_corridors() {
+        for seed in 0_u64..24 {
+            let blueprint = build_run_blueprint(seed);
+            for segment in &blueprint.segments {
+                let layout = build_segment_layout(segment, &blueprint.rooms, &HashSet::default());
+                assert!(
+                    !layout_has_internal_route_line_overlap(&layout),
+                    "seed {seed} segment {} {:?} still had cross-line overlap",
+                    segment.index,
+                    segment.kind,
+                );
+                if segment.route_lines.len() > 1
+                    && layout
+                        .solids
+                        .iter()
+                        .any(|solid| matches!(&solid.body, SolidBody::StaticSurfStrip { .. }))
+                {
+                    assert!(
+                        layout
+                            .solids
+                            .iter()
+                            .filter_map(|solid| route_line_from_label(&solid.label))
+                            .collect::<HashSet<_>>()
+                            .len()
+                            <= 1,
+                        "seed {seed} segment {} kept multiple surf-bearing route lines active",
+                        segment.index,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn surf_segments_share_seam_edges() {
         let mut layout = ModuleLayout::default();
         let mut rng = RunRng::new(0x5eed_cafe_u64);
@@ -6132,7 +10762,9 @@ mod tests {
             Vec3::X,
             Vec3::Z,
             Theme::Frost,
+            test_flow(),
             true,
+            None,
         );
 
         let wedges = layout
@@ -6186,7 +10818,9 @@ mod tests {
             Vec3::X,
             Vec3::Z,
             Theme::Frost,
+            test_flow(),
             true,
+            None,
         );
 
         let render_wedges = layout
@@ -6265,7 +10899,9 @@ mod tests {
             Vec3::X,
             Vec3::Z,
             Theme::Frost,
+            test_flow(),
             true,
+            None,
         );
 
         let render_count = layout
@@ -6309,7 +10945,9 @@ mod tests {
             Vec3::X,
             Vec3::Z,
             Theme::Frost,
+            test_flow(),
             true,
+            None,
         );
 
         let render_wedge_count = layout
@@ -6383,6 +11021,36 @@ mod tests {
     }
 
     #[test]
+    fn surf_one_sided_arc_does_not_flip_direction() {
+        for &phase in &[0.2, 1.1, 2.6, 4.2, 5.7] {
+            let mut sign = 0.0;
+            for step in 0..33 {
+                let t = step as f32 / 32.0;
+                let offset = path_lateral_offset(
+                    PathLateralStyle::OneSidedArc,
+                    t,
+                    (t * PI).sin().max(0.0),
+                    phase,
+                    0.0,
+                    1.0,
+                );
+                if offset.abs() < 0.0001 {
+                    continue;
+                }
+                let current = offset.signum();
+                if sign == 0.0 {
+                    sign = current;
+                } else {
+                    assert!(
+                        current == sign,
+                        "one-sided surf arc flipped direction for phase {phase}: {sign} then {current}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn chunk_window_keeps_frontier_connectors_loaded() {
         let blueprint = build_run_blueprint(0x51eed_u64);
         let focus_room = 8.min(blueprint.rooms.len().saturating_sub(2));
@@ -6404,12 +11072,38 @@ mod tests {
             );
         }
 
-        if window.frontier_room < blueprint.rooms.len() - 1 {
+        if window.frontier_room > 1 {
             assert!(
-                chunks.contains(&WorldChunkKey::Segment(window.frontier_room)),
-                "frontier exit segment {} -> {} should be preloaded",
-                window.frontier_room,
-                window.frontier_room + 1
+                chunks.contains(&WorldChunkKey::Room(window.frontier_room - 1)),
+                "landing room {} ahead of the previous frontier connector should be loaded",
+                window.frontier_room - 1
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_window_keeps_next_landing_room_loaded() {
+        let blueprint = build_run_blueprint(0x7eed_u64);
+        let focus_room = 10.min(blueprint.rooms.len().saturating_sub(3));
+        let window = stream_window(&blueprint, focus_room);
+        let chunks = desired_chunk_window(&blueprint, focus_room);
+
+        assert!(
+            chunks.contains(&WorldChunkKey::Room(window.frontier_room)),
+            "front landing room {} should be loaded",
+            window.frontier_room
+        );
+        if window.frontier_room > 0 {
+            assert!(
+                chunks.contains(&WorldChunkKey::Segment(window.frontier_room - 1)),
+                "segment into the front landing room {} should be loaded",
+                window.frontier_room
+            );
+        }
+        if window.frontier_room > 1 {
+            assert!(
+                chunks.contains(&WorldChunkKey::Segment(window.frontier_room - 2)),
+                "penultimate connector into the approach room should be loaded"
             );
         }
     }
