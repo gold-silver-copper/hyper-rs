@@ -71,8 +71,7 @@ const DECOR_CELESTIAL_RADIUS_MULTIPLIER: f32 = 50.0;
 const MAX_SECTION_TURN_RADIANS: f32 = 22.0_f32.to_radians();
 const STAR_COUNT: usize = 1100;
 const STAR_CLUSTER_COUNT: usize = 6;
-const COMET_COUNT: usize = 4;
-const CLOUD_PUFF_COUNT: usize = 8;
+const COMET_COUNT: usize = 18;
 const STREAM_BEHIND_ROOMS: usize = 2;
 const STREAM_AHEAD_ROOMS: usize = 12;
 const INFINITE_APPEND_TRIGGER_ROOMS: usize = 5;
@@ -100,6 +99,7 @@ const ROUTE_LINE_EDGE_TAPER: f32 = 0.92;
 const ENABLE_PARALLEL_ROUTE_GEOMETRY: bool = false;
 const LANDMARK_OFFSET_RADIUS: f32 = 168.0;
 const LANDMARK_VERTICAL_OFFSET: f32 = 78.0;
+const ENABLE_MACRO_SPECTACLE: bool = false;
 
 type SocketMask = u32;
 const SOCKET_SAFE_REST: SocketMask = 1 << 0;
@@ -126,7 +126,7 @@ struct BasicGamePlugin;
 
 impl Plugin for BasicGamePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ClearColor(Color::srgb(0.07, 0.078, 0.15)))
+        app.insert_resource(ClearColor(Color::srgb(0.11, 0.14, 0.22)))
             .insert_resource(RunDirector::default())
             .insert_resource(WorldAssetCache::default())
             .insert_resource(SubstepCount(PHYSICS_SUBSTEPS))
@@ -238,25 +238,25 @@ fn basic_game_asset_path() -> String {
 
 fn night_bloom() -> Bloom {
     let mut bloom = Bloom::NATURAL;
-    bloom.intensity = 0.3;
-    bloom.low_frequency_boost = 0.68;
+    bloom.intensity = 0.035;
+    bloom.low_frequency_boost = 0.14;
     bloom.low_frequency_boost_curvature = 0.8;
-    bloom.high_pass_frequency = 0.64;
-    bloom.prefilter.threshold = 0.46;
-    bloom.prefilter.threshold_softness = 0.2;
+    bloom.high_pass_frequency = 0.86;
+    bloom.prefilter.threshold = 0.88;
+    bloom.prefilter.threshold_softness = 0.03;
     bloom
 }
 
 fn night_color_grading() -> ColorGrading {
     ColorGrading::with_identical_sections(
         ColorGradingGlobal {
-            exposure: 0.62,
-            post_saturation: 1.1,
+            exposure: 1.12,
+            post_saturation: 1.04,
             ..default()
         },
         ColorGradingSection {
-            saturation: 1.08,
-            contrast: 1.0,
+            saturation: 1.03,
+            contrast: 1.06,
             ..default()
         },
     )
@@ -264,13 +264,13 @@ fn night_color_grading() -> ColorGrading {
 
 fn night_distance_fog() -> DistanceFog {
     DistanceFog {
-        color: Color::srgba(0.1, 0.09, 0.16, 1.0),
-        directional_light_color: Color::srgba(0.92, 0.78, 0.88, 0.34),
-        directional_light_exponent: 10.0,
+        color: Color::srgba(0.14, 0.16, 0.22, 1.0),
+        directional_light_color: Color::srgba(0.97, 0.96, 0.92, 0.1),
+        directional_light_exponent: 5.3,
         falloff: FogFalloff::from_visibility_colors(
-            2600.0,
-            Color::srgb(0.1, 0.09, 0.15),
-            Color::srgb(0.34, 0.28, 0.42),
+            1_750.0,
+            Color::srgb(0.14, 0.17, 0.23),
+            Color::srgb(0.3, 0.34, 0.42),
         ),
     }
 }
@@ -282,8 +282,8 @@ fn setup_scene(
     mut asset_cache: ResMut<WorldAssetCache>,
 ) {
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.2, 0.18, 0.24),
-        brightness: 22.0,
+        color: Color::srgb(0.36, 0.38, 0.44),
+        brightness: 42.0,
         affects_lightmapped_meshes: true,
     });
 
@@ -359,7 +359,7 @@ fn setup_scene(
         Camera3d::default(),
         AtmosphereCamera,
         Hdr,
-        Msaa::Off,
+        Msaa::Sample2,
         Fxaa::default(),
         Tonemapping::AgX,
         DebandDither::Enabled,
@@ -480,7 +480,6 @@ fn evolve_atmosphere_with_progress(
     camera: Option<
         Single<(&mut DistanceFog, &mut ColorGrading, &mut Bloom), With<AtmosphereCamera>>,
     >,
-    mut lights: Query<(&AtmosphereLightKind, &mut DirectionalLight)>,
     atmosphere_layers: Query<(&AtmosphereMaterialKind, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -490,71 +489,50 @@ fn evolve_atmosphere_with_progress(
 
     let progress = smoothstep01(run_descent_progress(&run, player.translation.y));
     clear_color.0 = mix_color(
-        Color::srgb(0.1, 0.11, 0.2),
-        Color::srgb(0.16, 0.1, 0.24),
+        Color::srgb(0.15, 0.14, 0.22),
+        Color::srgb(0.1, 0.1, 0.16),
         progress,
     );
 
     ambient.color = mix_color(
-        Color::srgb(0.18, 0.17, 0.24),
-        Color::srgb(0.22, 0.18, 0.28),
+        Color::srgb(0.36, 0.38, 0.44),
+        Color::srgb(0.28, 0.3, 0.36),
         progress,
     );
-    ambient.brightness = lerp(24.0, 18.0, progress);
+    ambient.brightness = lerp(42.0, 29.0, progress);
 
     if let Some(camera) = camera {
         let (mut fog, mut grading, mut bloom) = camera.into_inner();
         fog.color = mix_color(
-            Color::srgba(0.12, 0.11, 0.2, 1.0),
-            Color::srgba(0.16, 0.1, 0.24, 1.0),
+            Color::srgba(0.14, 0.16, 0.22, 1.0),
+            Color::srgba(0.1, 0.11, 0.17, 1.0),
             progress,
         );
         fog.directional_light_color = mix_color(
-            Color::srgba(0.98, 0.74, 0.8, 0.34),
-            Color::srgba(0.76, 0.8, 1.0, 0.42),
+            Color::srgba(0.97, 0.96, 0.92, 0.1),
+            Color::srgba(0.82, 0.88, 0.96, 0.12),
             progress,
         );
-        fog.directional_light_exponent = lerp(8.5, 11.5, progress);
+        fog.directional_light_exponent = lerp(5.3, 6.6, progress);
         fog.falloff = FogFalloff::from_visibility_colors(
-            lerp(3200.0, 2400.0, progress),
+            lerp(1_850.0, 1_250.0, progress),
             mix_color(
-                Color::srgb(0.16, 0.14, 0.22),
-                Color::srgb(0.1, 0.08, 0.16),
+                Color::srgb(0.14, 0.17, 0.23),
+                Color::srgb(0.1, 0.11, 0.17),
                 progress,
             ),
             mix_color(
-                Color::srgb(0.4, 0.3, 0.42),
-                Color::srgb(0.32, 0.22, 0.4),
+                Color::srgb(0.3, 0.34, 0.42),
+                Color::srgb(0.22, 0.24, 0.32),
                 progress,
             ),
         );
-        grading.global.exposure = lerp(0.7, 0.58, progress);
-        grading.global.post_saturation = lerp(1.02, 1.12, progress);
-        bloom.intensity = lerp(0.2, 0.28, progress);
-        bloom.low_frequency_boost = lerp(0.52, 0.72, progress);
-        bloom.prefilter.threshold = lerp(0.52, 0.4, progress);
-        bloom.prefilter.threshold_softness = lerp(0.16, 0.22, progress);
-    }
-
-    for (kind, mut light) in &mut lights {
-        match kind {
-            AtmosphereLightKind::MoonKey => {
-                light.illuminance = lerp(20_000.0, 26_000.0, progress);
-                light.color = mix_color(
-                    Color::srgb(0.92, 0.8, 0.88),
-                    Color::srgb(0.72, 0.82, 1.0),
-                    progress,
-                );
-            }
-            AtmosphereLightKind::StarlightFill => {
-                light.illuminance = lerp(10_000.0, 6_800.0, progress);
-                light.color = mix_color(
-                    Color::srgb(0.62, 0.54, 0.84),
-                    Color::srgb(0.46, 0.62, 0.96),
-                    progress,
-                );
-            }
-        }
+        grading.global.exposure = lerp(1.12, 1.02, progress);
+        grading.global.post_saturation = lerp(1.04, 1.0, progress);
+        bloom.intensity = lerp(0.03, 0.045, progress);
+        bloom.low_frequency_boost = lerp(0.12, 0.16, progress);
+        bloom.prefilter.threshold = lerp(0.88, 0.82, progress);
+        bloom.prefilter.threshold_softness = lerp(0.03, 0.04, progress);
     }
 
     for (kind, material_handle) in &atmosphere_layers {
@@ -565,114 +543,35 @@ fn evolve_atmosphere_with_progress(
         match kind {
             AtmosphereMaterialKind::SkyDome => {
                 material.base_color = mix_color(
-                    Color::srgb(0.09, 0.1, 0.18),
-                    Color::srgb(0.13, 0.1, 0.2),
+                    Color::srgb(0.12, 0.14, 0.22),
+                    Color::srgb(0.08, 0.09, 0.15),
                     progress,
                 );
                 material.emissive = LinearRgba::from(mix_color(
-                    Color::srgb(0.18, 0.17, 0.28),
-                    Color::srgb(0.26, 0.18, 0.34),
-                    progress,
-                )) * 0.95;
-            }
-            AtmosphereMaterialKind::UpperHaze => {
-                material.base_color = mix_color(
-                    Color::srgba(0.26, 0.24, 0.38, 0.11),
-                    Color::srgba(0.28, 0.18, 0.36, 0.12),
-                    progress,
-                );
-                material.emissive = LinearRgba::from(mix_color(
-                    Color::srgb(0.18, 0.16, 0.3),
-                    Color::srgb(0.28, 0.18, 0.38),
-                    progress,
-                )) * 1.0;
-            }
-            AtmosphereMaterialKind::HorizonGlow => {
-                material.base_color = mix_color(
-                    Color::srgba(0.38, 0.28, 0.34, 0.16),
-                    Color::srgba(0.34, 0.18, 0.38, 0.18),
-                    progress,
-                );
-                material.emissive = LinearRgba::from(mix_color(
-                    Color::srgb(0.58, 0.34, 0.42),
-                    Color::srgb(0.46, 0.28, 0.56),
-                    progress,
-                )) * 1.08;
-            }
-            AtmosphereMaterialKind::Nebula => {
-                material.base_color = mix_color(
-                    Color::srgba(0.22, 0.18, 0.3, 0.1),
-                    Color::srgba(0.26, 0.16, 0.34, 0.11),
-                    progress,
-                );
-                material.emissive = LinearRgba::from(mix_color(
-                    Color::srgb(0.34, 0.22, 0.36),
-                    Color::srgb(0.46, 0.24, 0.42),
-                    progress,
-                )) * 0.92;
-            }
-            AtmosphereMaterialKind::NebulaRibbon => {
-                material.base_color = mix_color(
-                    Color::srgba(0.24, 0.16, 0.3, 0.07),
-                    Color::srgba(0.28, 0.18, 0.36, 0.08),
-                    progress,
-                );
-                material.emissive = LinearRgba::from(mix_color(
-                    Color::srgb(0.3, 0.18, 0.38),
-                    Color::srgb(0.44, 0.24, 0.46),
+                    Color::srgb(0.1, 0.12, 0.2),
+                    Color::srgb(0.06, 0.07, 0.12),
                     progress,
                 )) * 0.74;
             }
-            AtmosphereMaterialKind::Aurora => {
-                material.emissive = LinearRgba::from(mix_color(
-                    Color::srgb(0.16, 0.72, 0.82),
-                    Color::srgb(0.34, 0.52, 0.96),
-                    progress,
-                )) * 1.06;
-            }
             AtmosphereMaterialKind::CloudDeck => {
                 material.base_color = mix_color(
-                    Color::srgba(0.13, 0.1, 0.14, 0.17),
-                    Color::srgba(0.18, 0.11, 0.18, 0.18),
+                    Color::srgb(0.09, 0.1, 0.14),
+                    Color::srgb(0.1, 0.08, 0.12),
                     progress,
                 );
                 material.emissive = LinearRgba::from(mix_color(
-                    Color::srgb(0.08, 0.06, 0.1),
-                    Color::srgb(0.12, 0.08, 0.14),
+                    Color::srgb(0.03, 0.04, 0.06),
+                    Color::srgb(0.04, 0.03, 0.05),
                     progress,
-                )) * 0.8;
-            }
-            AtmosphereMaterialKind::LightShaft => {
-                material.base_color = mix_color(
-                    Color::srgba(0.44, 0.56, 0.88, 0.04),
-                    Color::srgba(0.58, 0.44, 0.86, 0.045),
-                    progress,
-                );
-                material.emissive = LinearRgba::from(mix_color(
-                    Color::srgb(0.16, 0.24, 0.36),
-                    Color::srgb(0.28, 0.2, 0.42),
-                    progress,
-                )) * 0.82;
-            }
-            AtmosphereMaterialKind::DustField => {
-                material.base_color = mix_color(
-                    Color::srgba(0.28, 0.32, 0.42, 0.025),
-                    Color::srgba(0.34, 0.24, 0.4, 0.03),
-                    progress,
-                );
-                material.emissive = LinearRgba::from(mix_color(
-                    Color::srgb(0.06, 0.08, 0.14),
-                    Color::srgb(0.12, 0.08, 0.16),
-                    progress,
-                )) * 0.52;
+                )) * 0.32;
             }
             AtmosphereMaterialKind::Celestial => {
                 material.emissive = LinearRgba::from(material.base_color.with_alpha(1.0))
-                    * lerp(0.34, 0.62, progress);
+                    * lerp(0.18, 0.3, progress);
             }
             AtmosphereMaterialKind::Megastructure => {
                 material.emissive = LinearRgba::from(material.base_color.with_alpha(1.0))
-                    * lerp(0.18, 0.34, progress);
+                    * lerp(0.14, 0.22, progress);
             }
         }
     }
@@ -724,6 +623,7 @@ fn activate_checkpoints(
         if delta.y.abs() < 2.0 && delta.xz().length() <= CHECKPOINT_RADIUS {
             if checkpoint.index > run.current_checkpoint {
                 run.current_checkpoint = checkpoint.index;
+                run.focus_room = run.focus_room.max(checkpoint.index);
                 let spawn = run.checkpoint_position(checkpoint.index);
                 spawn_marker.translation = spawn;
                 spawn_marker.rotation =
@@ -829,11 +729,23 @@ fn stream_world_chunks(
 
     let focus_room = players
         .single()
-        .map(|player| stream_focus_room(&run.blueprint, run.current_checkpoint, player.translation))
-        .unwrap_or(run.current_checkpoint);
+        .map(|player| {
+            stream_focus_room(
+                &run.blueprint,
+                run.current_checkpoint,
+                run.focus_room,
+                player.translation,
+            )
+        })
+        .unwrap_or(run.focus_room.max(run.current_checkpoint));
     ensure_blueprint_ahead(&mut run, focus_room);
-    run.death_plane = checkpoint_death_plane(&run.blueprint, run.current_checkpoint, focus_room);
-    let desired_order = desired_chunk_window(&run.blueprint, focus_room);
+    run.focus_room = focus_room.max(run.current_checkpoint);
+    run.death_plane = run.death_plane.min(checkpoint_death_plane(
+        &run.blueprint,
+        run.current_checkpoint,
+        run.focus_room,
+    ));
+    let desired_order = desired_chunk_window(&run.blueprint, run.focus_room);
     let desired_chunks = desired_order.iter().copied().collect::<HashSet<_>>();
     if desired_chunks == run.spawned_chunks {
         return;
@@ -923,6 +835,9 @@ fn process_run_request(
                 &mut asset_cache,
             );
             run.spawned_chunks = snapshot.active_chunks;
+            run.focus_room = run.current_checkpoint.min(run.blueprint.rooms.len().saturating_sub(1));
+            run.death_plane =
+                checkpoint_death_plane(&run.blueprint, run.current_checkpoint, run.focus_room);
         }
         RunRequestKind::RestartSameSeed | RunRequestKind::RestartNewSeed => {
             for entity in &generated {
@@ -934,6 +849,7 @@ fn process_run_request(
             run.finished = false;
             run.deaths = 0;
             run.current_checkpoint = 0;
+            run.focus_room = 0;
 
             let snapshot = spawn_run_world(
                 &blueprint,
@@ -998,6 +914,7 @@ fn tune_player_camera(mut cameras: Query<&mut Projection, With<Camera3d>>) {
         if let Projection::Perspective(perspective) = &mut *projection {
             perspective.near = 0.03;
             perspective.fov = 82.0_f32.to_radians();
+            perspective.far = 2_400.0;
         }
     }
 }
@@ -1040,22 +957,9 @@ struct AtmosphereCamera;
 #[derive(Component, Clone, Copy)]
 enum AtmosphereMaterialKind {
     SkyDome,
-    UpperHaze,
-    HorizonGlow,
-    Nebula,
-    NebulaRibbon,
-    Aurora,
     CloudDeck,
-    LightShaft,
-    DustField,
     Celestial,
     Megastructure,
-}
-
-#[derive(Component, Clone, Copy)]
-enum AtmosphereLightKind {
-    MoonKey,
-    StarlightFill,
 }
 
 #[derive(Component, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1172,6 +1076,7 @@ struct RunState {
     blueprint: RunBlueprint,
     death_plane: f32,
     current_checkpoint: usize,
+    focus_room: usize,
     deaths: u32,
     timer: Stopwatch,
     finished: bool,
@@ -1184,6 +1089,7 @@ impl RunState {
             blueprint: blueprint.clone(),
             death_plane: checkpoint_death_plane(blueprint, 0, 0),
             current_checkpoint: 0,
+            focus_room: 0,
             deaths: 0,
             timer: Stopwatch::new(),
             finished: false,
@@ -1195,14 +1101,22 @@ impl RunState {
         self.blueprint = blueprint.clone();
         self.spawned_chunks = snapshot.active_chunks;
         self.current_checkpoint = self.current_checkpoint.min(self.last_checkpoint_index());
+        self.focus_room = self.current_checkpoint.min(self.blueprint.rooms.len().saturating_sub(1));
         self.death_plane =
-            checkpoint_death_plane(&self.blueprint, self.current_checkpoint, self.current_checkpoint);
+            checkpoint_death_plane(&self.blueprint, self.current_checkpoint, self.focus_room);
     }
 
     fn sync_generated_geometry(&mut self) {
         self.current_checkpoint = self.current_checkpoint.min(self.last_checkpoint_index());
-        self.death_plane =
-            checkpoint_death_plane(&self.blueprint, self.current_checkpoint, self.current_checkpoint);
+        self.focus_room = self
+            .focus_room
+            .max(self.current_checkpoint)
+            .min(self.blueprint.rooms.len().saturating_sub(1));
+        self.death_plane = self.death_plane.min(checkpoint_death_plane(
+            &self.blueprint,
+            self.current_checkpoint,
+            self.focus_room,
+        ));
     }
 
     fn checkpoint_count(&self) -> usize {
@@ -1906,12 +1820,15 @@ enum SolidBody {
 #[derive(Clone, Copy)]
 enum ExtraKind {
     None,
-    Checkpoint { index: usize },
     SummitGoal,
 }
 
 #[derive(Clone)]
 enum FeatureSpec {
+    CheckpointPad {
+        center: Vec3,
+        index: usize,
+    },
     WindZone {
         center: Vec3,
         size: Vec3,
@@ -1932,6 +1849,7 @@ enum PaintStyle {
     ThemeFloor(Theme),
     ThemeAccent(Theme),
     ThemeShadow(Theme),
+    SectionPlatform(Theme),
     Summit,
     Checkpoint,
     Hazard,
@@ -2108,13 +2026,13 @@ fn choose_landmark_kind(
         ZoneSignature::GiantCorkscrew => LandmarkKind::CorkscrewTower,
         ZoneSignature::BraidLanes => rng.weighted_choice(&[
             (LandmarkKind::BrokenRing, 3_u32),
-            (LandmarkKind::ImpossibleBridge, 4),
+            (LandmarkKind::MovingMegastructure, 4),
         ]),
         ZoneSignature::WaveRamps => rng.weighted_choice(&[
             (LandmarkKind::BrokenRing, 3_u32),
             (LandmarkKind::MovingMegastructure, 4),
         ]),
-        ZoneSignature::SplitTransfer => LandmarkKind::ImpossibleBridge,
+        ZoneSignature::SplitTransfer => LandmarkKind::MovingMegastructure,
         ZoneSignature::PillarForest => LandmarkKind::FloatingMonolithCluster,
         ZoneSignature::ShapeGarden => rng.weighted_choice(&[
             (LandmarkKind::FloatingMonolithCluster, 4_u32),
@@ -4342,6 +4260,7 @@ fn spawn_run_world(
     materials: &mut Assets<StandardMaterial>,
     asset_cache: &mut WorldAssetCache,
 ) -> RunSnapshot {
+    spawn_world_light_rig(blueprint, commands);
     spawn_sky_backdrop(blueprint, commands, meshes, materials);
     spawn_floating_spheres(blueprint, commands, meshes, materials);
     spawn_macro_spectacle(blueprint, commands, meshes, materials);
@@ -4352,6 +4271,136 @@ fn spawn_run_world(
     }
 
     build_run_snapshot(chunk_order.into_iter().collect())
+}
+
+fn spawn_world_light_rig(blueprint: &RunBlueprint, commands: &mut Commands) {
+    let (center, course_radius) = course_visual_center_and_radius(blueprint);
+    let course_min_y = blueprint
+        .rooms
+        .iter()
+        .map(|room| room.top.y)
+        .fold(f32::INFINITY, f32::min);
+    let course_max_y = blueprint
+        .rooms
+        .iter()
+        .map(|room| room.top.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let course_mid_y = lerp(course_min_y, course_max_y, 0.5);
+    let entry_heading = if blueprint.rooms.len() > 1 {
+        let mut heading = blueprint.rooms[1].top - blueprint.rooms[0].top;
+        heading.y = 0.0;
+        heading.normalize_or_zero()
+    } else {
+        Vec3::new(0.0, 0.0, -1.0)
+    };
+    let entry_right = Vec3::new(-entry_heading.z, 0.0, entry_heading.x).normalize_or_zero();
+    let target = center + Vec3::Y * 26.0;
+
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Moon Key"),
+        Transform::from_translation(
+            center
+                + entry_heading * (course_radius * 0.58 + 220.0)
+                + entry_right * (course_radius * 0.2 + 140.0)
+                + Vec3::Y * (course_mid_y + 260.0),
+        )
+        .looking_at(target, Vec3::Y),
+        DirectionalLight {
+            shadows_enabled: true,
+            illuminance: 24_000.0,
+            color: Color::srgb(0.98, 0.94, 0.88),
+            ..default()
+        },
+        CascadeShadowConfigBuilder {
+            first_cascade_far_bound: 36.0,
+            maximum_distance: 260.0,
+            overlap_proportion: 0.24,
+            ..default()
+        }
+        .build(),
+    ));
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Sky Fill"),
+        Transform::from_translation(
+            center
+                - entry_heading * (course_radius * 0.46 + 180.0)
+                - entry_right * (course_radius * 0.24 + 180.0)
+                + Vec3::Y * (course_mid_y + 250.0),
+        )
+        .looking_at(target + entry_heading * 26.0, Vec3::Y),
+        DirectionalLight {
+            shadows_enabled: false,
+            illuminance: 14_000.0,
+            color: Color::srgb(0.46, 0.58, 0.88),
+            ..default()
+        },
+    ));
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Lift Bounce"),
+        Transform::from_translation(
+            center
+                + entry_right * (course_radius * 0.26 + 120.0)
+                - entry_heading * (course_radius * 0.18 + 80.0)
+                + Vec3::Y * (course_min_y + 180.0),
+        )
+        .looking_at(target - entry_right * 20.0, Vec3::Y),
+        DirectionalLight {
+            shadows_enabled: false,
+            illuminance: 9_500.0,
+            color: Color::srgb(0.94, 0.58, 0.48),
+            ..default()
+        },
+    ));
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Ridge Rim"),
+        Transform::from_translation(
+            center
+                - entry_right * (course_radius * 0.16 + 90.0)
+                + entry_heading * (course_radius * 0.14 + 60.0)
+                + Vec3::Y * (course_max_y + 140.0),
+        )
+        .looking_at(target + Vec3::Y * 22.0, Vec3::Y),
+        DirectionalLight {
+            shadows_enabled: false,
+            illuminance: 7_500.0,
+            color: Color::srgb(0.44, 0.84, 0.76),
+            ..default()
+        },
+    ));
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Prism Fill"),
+        Transform::from_translation(
+            center
+                + entry_heading * (course_radius * 0.22 + 110.0)
+                - entry_right * (course_radius * 0.34 + 180.0)
+                + Vec3::Y * (course_mid_y + 110.0),
+        )
+        .looking_at(target - entry_heading * 34.0, Vec3::Y),
+        DirectionalLight {
+            shadows_enabled: false,
+            illuminance: 5_400.0,
+            color: Color::srgb(0.78, 0.58, 1.0),
+            ..default()
+        },
+    ));
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Course Lantern"),
+        PointLight {
+            intensity: 6_200_000.0,
+            range: course_radius * 2.6 + 640.0,
+            radius: 28.0,
+            color: Color::srgb(0.74, 0.82, 1.0),
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_translation(center + Vec3::Y * (course_mid_y + 180.0)),
+    ));
 }
 
 fn respawn_active_chunks(
@@ -4374,6 +4423,17 @@ fn build_run_snapshot(active_chunks: HashSet<WorldChunkKey>) -> RunSnapshot {
     RunSnapshot { active_chunks }
 }
 
+fn closest_point_on_line_segment(point: Vec3, start: Vec3, end: Vec3) -> (Vec3, f32) {
+    let delta = end - start;
+    let length_squared = delta.length_squared();
+    if length_squared <= f32::EPSILON {
+        return (start, 0.0);
+    }
+
+    let t = ((point - start).dot(delta) / length_squared).clamp(0.0, 1.0);
+    (start + delta * t, t)
+}
+
 #[derive(Clone, Copy)]
 struct StreamWindow {
     start_room: usize,
@@ -4383,29 +4443,60 @@ struct StreamWindow {
 fn stream_focus_room(
     blueprint: &RunBlueprint,
     checkpoint_index: usize,
+    previous_focus_room: usize,
     player_position: Vec3,
 ) -> usize {
     let last_room = blueprint.rooms.len().saturating_sub(1);
     let checkpoint_index = checkpoint_index.min(last_room);
-    let search_start = checkpoint_index.saturating_sub(1);
-    let search_end =
-        (checkpoint_index + STREAM_AHEAD_ROOMS + INFINITE_APPEND_TRIGGER_ROOMS + 8).min(last_room);
-    let mut best_room = checkpoint_index;
+    let previous_focus_room = previous_focus_room
+        .max(checkpoint_index)
+        .min(last_room);
+    let search_start = checkpoint_index
+        .min(previous_focus_room)
+        .saturating_sub(STREAM_BEHIND_ROOMS + 2);
+    let search_end = previous_focus_room
+        .max(checkpoint_index)
+        .saturating_add(STREAM_AHEAD_ROOMS + INFINITE_APPEND_TRIGGER_ROOMS + 10)
+        .min(last_room);
+    let mut best_room = previous_focus_room.max(checkpoint_index);
     let mut best_score = f32::INFINITY;
 
     for room in &blueprint.rooms[search_start..=search_end] {
         let offset = room.top - player_position;
         let horizontal = offset.xz().length();
-        let vertical = offset.y.abs() * 0.3;
-        let progression_bias = (room.index.saturating_sub(checkpoint_index)) as f32 * 1.8;
-        let score = horizontal + vertical + progression_bias;
+        let vertical = offset.y.abs() * 0.24;
+        let progression_bias = (room.index.saturating_sub(checkpoint_index)) as f32 * 1.25;
+        let focus_bias = (previous_focus_room.abs_diff(room.index) as f32) * 0.85;
+        let score = horizontal * 0.86 + vertical + progression_bias + focus_bias;
         if score < best_score {
             best_score = score;
             best_room = room.index;
         }
     }
 
-    best_room.max(checkpoint_index)
+    let segment_start = search_start.min(blueprint.segments.len());
+    let segment_end = search_end.min(blueprint.segments.len().saturating_sub(1));
+    if !blueprint.segments.is_empty() && segment_start <= segment_end {
+        for segment in &blueprint.segments[segment_start..=segment_end] {
+            let from = blueprint.rooms[segment.from].top;
+            let to = blueprint.rooms[segment.to].top;
+            let (closest, t) = closest_point_on_line_segment(player_position, from, to);
+            let offset = player_position - closest;
+            let horizontal = offset.xz().length();
+            let vertical = offset.y.abs() * 0.2;
+            let progression_bias = (segment.to.saturating_sub(checkpoint_index)) as f32 * 1.05;
+            let focus_bias = (previous_focus_room.abs_diff(segment.to) as f32) * 0.75;
+            let along_bonus = from.distance(to) * t * 0.12;
+            let score = horizontal * 0.62 + vertical + progression_bias + focus_bias - along_bonus;
+            let candidate_room = if t >= 0.38 { segment.to } else { segment.from };
+            if score < best_score {
+                best_score = score;
+                best_room = candidate_room;
+            }
+        }
+    }
+
+    best_room.max(checkpoint_index).max(previous_focus_room.saturating_sub(1))
 }
 
 fn stream_window(blueprint: &RunBlueprint, focus_room: usize) -> StreamWindow {
@@ -4493,97 +4584,27 @@ fn spawn_sky_backdrop(
         Vec3::new(0.0, 0.0, -1.0)
     };
     let moon_right = Vec3::new(-moon_heading.z, 0.0, moon_heading.x).normalize_or_zero();
-
     let sky_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.08, 0.09, 0.17),
-        emissive: LinearRgba::rgb(0.22, 0.2, 0.34),
+        base_color: Color::srgb(0.12, 0.14, 0.22),
+        emissive: LinearRgba::rgb(0.1, 0.12, 0.2),
         unlit: true,
         cull_mode: None,
-        ..default()
-    });
-    let upper_haze_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.24, 0.22, 0.38, 0.06),
-        emissive: LinearRgba::rgb(0.18, 0.16, 0.32),
-        unlit: true,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
-    });
-    let horizon_glow_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.32, 0.24, 0.34, 0.1),
-        emissive: LinearRgba::rgb(0.52, 0.32, 0.46),
-        unlit: true,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
-    });
-    let nebula_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.22, 0.18, 0.32, 0.05),
-        emissive: LinearRgba::rgb(0.34, 0.22, 0.36),
-        unlit: true,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
-    });
-    let nebula_ribbon_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.22, 0.16, 0.3, 0.04),
-        emissive: LinearRgba::rgb(0.28, 0.18, 0.38),
-        unlit: true,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
-    });
-    let aurora_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.18, 0.7, 0.74, 0.03),
-        emissive: LinearRgba::rgb(0.18, 0.78, 0.86),
-        unlit: true,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
         ..default()
     });
     let cloud_deck_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.12, 0.1, 0.14, 0.1),
-        emissive: LinearRgba::rgb(0.06, 0.05, 0.08),
+        base_color: Color::srgb(0.09, 0.1, 0.14),
+        emissive: LinearRgba::rgb(0.03, 0.04, 0.06),
         unlit: true,
         cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
-    });
-    let light_shaft_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.44, 0.62, 0.92, 0.035),
-        emissive: LinearRgba::rgb(0.18, 0.28, 0.42),
-        unlit: true,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
-    });
-    let dust_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.28, 0.32, 0.42, 0.025),
-        emissive: LinearRgba::rgb(0.06, 0.08, 0.14),
-        unlit: true,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
-    });
-    let cloud_puff_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.14, 0.12, 0.18, 0.07),
-        emissive: LinearRgba::rgb(0.07, 0.06, 0.11),
-        unlit: true,
-        cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
         ..default()
     });
     let star_mesh = meshes.add(Sphere::new(0.8).mesh().ico(3).unwrap());
     let dome_mesh = meshes.add(Sphere::new(1.0).mesh().ico(6).unwrap());
     let cloud_mesh = meshes.add(Sphere::new(1.0).mesh().ico(4).unwrap());
     let comet_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
-    let aurora_ring_mesh = meshes.add(Torus {
-        minor_radius: 0.075,
-        major_radius: 1.0,
-    });
     let star_material = materials.add(StandardMaterial {
         base_color: Color::WHITE,
-        emissive: LinearRgba::rgb(2.8, 3.1, 4.2),
+        emissive: LinearRgba::rgb(2.8, 3.0, 3.8),
         unlit: true,
         ..default()
     });
@@ -4600,81 +4621,6 @@ fn spawn_sky_backdrop(
     ));
     commands.spawn((
         GeneratedWorld,
-        AtmosphereMaterialKind::UpperHaze,
-        Name::new("Upper Haze"),
-        Mesh3d(dome_mesh),
-        MeshMaterial3d(upper_haze_material),
-        Transform::from_translation(center + Vec3::Y * 80.0)
-            .with_scale(Vec3::splat(SKY_RADIUS * 0.82)),
-        NotShadowCaster,
-        NotShadowReceiver,
-    ));
-    commands.spawn((
-        GeneratedWorld,
-        AtmosphereMaterialKind::HorizonGlow,
-        Name::new("Horizon Glow"),
-        Mesh3d(meshes.add(Sphere::new(1.0).mesh().ico(5).unwrap())),
-        MeshMaterial3d(horizon_glow_material),
-        Transform::from_translation(center + Vec3::new(0.0, 42.0, 0.0)).with_scale(Vec3::new(
-            SKY_RADIUS * 0.92,
-            SKY_RADIUS * 0.28,
-            SKY_RADIUS * 0.92,
-        )),
-        NotShadowCaster,
-        NotShadowReceiver,
-    ));
-    commands.spawn((
-        GeneratedWorld,
-        AtmosphereMaterialKind::Nebula,
-        Name::new("Nebula Veil"),
-        Mesh3d(meshes.add(Sphere::new(1.0).mesh().ico(5).unwrap())),
-        MeshMaterial3d(nebula_material),
-        Transform::from_translation(center + Vec3::new(-140.0, 210.0, 190.0))
-            .with_rotation(Quat::from_rotation_z(-0.34) * Quat::from_rotation_x(0.08))
-            .with_scale(Vec3::new(
-                SKY_RADIUS * 0.78,
-                SKY_RADIUS * 0.2,
-                SKY_RADIUS * 0.64,
-            )),
-        NotShadowCaster,
-        NotShadowReceiver,
-    ));
-    commands.spawn((
-        GeneratedWorld,
-        AtmosphereMaterialKind::Aurora,
-        Name::new("Aurora Arc"),
-        Mesh3d(aurora_ring_mesh.clone()),
-        MeshMaterial3d(aurora_material),
-        Transform::from_translation(center + Vec3::new(0.0, 190.0, 0.0))
-            .with_rotation(
-                Quat::from_rotation_x(1.1)
-                    * Quat::from_rotation_y(0.35)
-                    * Quat::from_rotation_z(0.12),
-            )
-            .with_scale(Vec3::new(
-                course_radius + 540.0,
-                42.0,
-                course_radius + 540.0,
-            )),
-        NotShadowCaster,
-        NotShadowReceiver,
-        SkyDrift {
-            anchor: center + Vec3::new(0.0, 190.0, 0.0),
-            primary_axis: Vec3::new(1.0, 0.0, 0.25).normalize_or_zero(),
-            secondary_axis: Vec3::new(-0.2, 0.0, 1.0).normalize_or_zero(),
-            primary_amplitude: 18.0,
-            secondary_amplitude: 10.0,
-            vertical_amplitude: 6.0,
-            speed: 0.025,
-            rotation_speed: 0.004,
-            phase: sky_rng.range_f32(0.0, TAU),
-            base_rotation: Quat::from_rotation_x(1.1)
-                * Quat::from_rotation_y(0.35)
-                * Quat::from_rotation_z(0.12),
-        },
-    ));
-    commands.spawn((
-        GeneratedWorld,
         AtmosphereMaterialKind::CloudDeck,
         Name::new("Cloud Sea"),
         Mesh3d(cloud_mesh.clone()),
@@ -4684,157 +4630,6 @@ fn spawn_sky_backdrop(
         NotShadowCaster,
         NotShadowReceiver,
     ));
-    for cloud_index in 0..CLOUD_PUFF_COUNT {
-        let angle =
-            TAU * (cloud_index as f32 / CLOUD_PUFF_COUNT as f32) + sky_rng.range_f32(-0.35, 0.35);
-        let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
-        let tangent = Vec3::new(-radial.z, 0.0, radial.x);
-        let anchor = Vec3::new(
-            center.x,
-            blueprint.death_plane - sky_rng.range_f32(16.0, 110.0),
-            center.z,
-        ) + radial * sky_rng.range_f32(course_radius * 0.2, course_radius * 1.8);
-        let scale = Vec3::new(
-            sky_rng.range_f32(26.0, 72.0),
-            sky_rng.range_f32(5.0, 14.0),
-            sky_rng.range_f32(20.0, 58.0),
-        );
-        commands.spawn((
-            GeneratedWorld,
-            AtmosphereMaterialKind::CloudDeck,
-            Name::new("Cloud Puff"),
-            Mesh3d(cloud_mesh.clone()),
-            MeshMaterial3d(cloud_puff_material.clone()),
-            Transform::from_translation(anchor)
-                .with_rotation(Quat::from_rotation_y(sky_rng.range_f32(0.0, TAU)))
-                .with_scale(scale),
-            NotShadowCaster,
-            NotShadowReceiver,
-            SkyDrift {
-                anchor,
-                primary_axis: tangent,
-                secondary_axis: radial,
-                primary_amplitude: sky_rng.range_f32(7.0, 22.0),
-                secondary_amplitude: sky_rng.range_f32(3.0, 9.0),
-                vertical_amplitude: sky_rng.range_f32(0.8, 2.4),
-                speed: sky_rng.range_f32(0.02, 0.06),
-                rotation_speed: sky_rng.range_f32(-0.008, 0.008),
-                phase: sky_rng.range_f32(0.0, TAU),
-                base_rotation: Quat::from_rotation_y(sky_rng.range_f32(0.0, TAU)),
-            },
-        ));
-    }
-
-    for ribbon_index in 0..5 {
-        let angle = TAU * (ribbon_index as f32 / 5.0) + sky_rng.range_f32(-0.28, 0.28);
-        let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
-        let tangent = Vec3::new(-radial.z, 0.0, radial.x);
-        let anchor = center
-            + radial * sky_rng.range_f32(course_radius * 0.5, course_radius * 1.15)
-            + Vec3::Y * sky_rng.range_f32(180.0, 420.0);
-        commands.spawn((
-            GeneratedWorld,
-            AtmosphereMaterialKind::NebulaRibbon,
-            Name::new("Nebula Ribbon"),
-            Mesh3d(cloud_mesh.clone()),
-            MeshMaterial3d(nebula_ribbon_material.clone()),
-            Transform::from_translation(anchor)
-                .with_rotation(Quat::from_rotation_y(angle + PI * 0.5))
-                .with_scale(Vec3::new(
-                    sky_rng.range_f32(180.0, 320.0),
-                    sky_rng.range_f32(20.0, 36.0),
-                    sky_rng.range_f32(52.0, 92.0),
-                )),
-            NotShadowCaster,
-            NotShadowReceiver,
-            SkyDrift {
-                anchor,
-                primary_axis: tangent,
-                secondary_axis: radial,
-                primary_amplitude: sky_rng.range_f32(18.0, 36.0),
-                secondary_amplitude: sky_rng.range_f32(6.0, 14.0),
-                vertical_amplitude: sky_rng.range_f32(3.0, 8.0),
-                speed: sky_rng.range_f32(0.012, 0.03),
-                rotation_speed: sky_rng.range_f32(-0.006, 0.006),
-                phase: sky_rng.range_f32(0.0, TAU),
-                base_rotation: Quat::from_rotation_y(angle + PI * 0.5),
-            },
-        ));
-    }
-
-    for shaft_index in 0..8 {
-        let angle = TAU * (shaft_index as f32 / 8.0) + sky_rng.range_f32(-0.18, 0.18);
-        let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
-        let tangent = Vec3::new(-radial.z, 0.0, radial.x);
-        let anchor = center
-            + radial * sky_rng.range_f32(course_radius * 0.24, course_radius * 0.92)
-            + Vec3::Y * sky_rng.range_f32(120.0, 320.0);
-        commands.spawn((
-            GeneratedWorld,
-            AtmosphereMaterialKind::LightShaft,
-            Name::new("Light Shaft"),
-            Mesh3d(comet_mesh.clone()),
-            MeshMaterial3d(light_shaft_material.clone()),
-            Transform::from_translation(anchor)
-                .with_rotation(Quat::from_rotation_y(angle + sky_rng.range_f32(-0.2, 0.2)))
-                .with_scale(Vec3::new(
-                    sky_rng.range_f32(42.0, 88.0),
-                    sky_rng.range_f32(420.0, 720.0),
-                    sky_rng.range_f32(8.0, 18.0),
-                )),
-            NotShadowCaster,
-            NotShadowReceiver,
-            SkyDrift {
-                anchor,
-                primary_axis: tangent,
-                secondary_axis: radial,
-                primary_amplitude: sky_rng.range_f32(10.0, 18.0),
-                secondary_amplitude: sky_rng.range_f32(2.0, 6.0),
-                vertical_amplitude: sky_rng.range_f32(4.0, 10.0),
-                speed: sky_rng.range_f32(0.008, 0.02),
-                rotation_speed: sky_rng.range_f32(-0.003, 0.003),
-                phase: sky_rng.range_f32(0.0, TAU),
-                base_rotation: Quat::from_rotation_y(angle),
-            },
-        ));
-    }
-
-    for dust_index in 0..14 {
-        let angle = TAU * (dust_index as f32 / 14.0) + sky_rng.range_f32(-0.26, 0.26);
-        let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
-        let tangent = Vec3::new(-radial.z, 0.0, radial.x);
-        let anchor = center
-            + radial * sky_rng.range_f32(course_radius * 0.3, course_radius * 1.2)
-            + Vec3::Y * sky_rng.range_f32(-120.0, 260.0);
-        commands.spawn((
-            GeneratedWorld,
-            AtmosphereMaterialKind::DustField,
-            Name::new("Drifting Dust"),
-            Mesh3d(comet_mesh.clone()),
-            MeshMaterial3d(dust_material.clone()),
-            Transform::from_translation(anchor)
-                .with_rotation(Quat::from_rotation_y(angle + sky_rng.range_f32(-0.3, 0.3)))
-                .with_scale(Vec3::new(
-                    sky_rng.range_f32(140.0, 280.0),
-                    sky_rng.range_f32(12.0, 24.0),
-                    sky_rng.range_f32(36.0, 74.0),
-                )),
-            NotShadowCaster,
-            NotShadowReceiver,
-            SkyDrift {
-                anchor,
-                primary_axis: tangent,
-                secondary_axis: radial,
-                primary_amplitude: sky_rng.range_f32(20.0, 42.0),
-                secondary_amplitude: sky_rng.range_f32(8.0, 18.0),
-                vertical_amplitude: sky_rng.range_f32(2.0, 6.0),
-                speed: sky_rng.range_f32(0.014, 0.034),
-                rotation_speed: sky_rng.range_f32(-0.004, 0.004),
-                phase: sky_rng.range_f32(0.0, TAU),
-                base_rotation: Quat::from_rotation_y(angle),
-            },
-        ));
-    }
 
     let mut starfield = ColoredMeshBuilder::default();
     for star_index in 0..STAR_COUNT {
@@ -4933,7 +4728,7 @@ fn spawn_sky_backdrop(
             base_color: comet_tint.with_alpha(0.08),
             emissive: LinearRgba::from(comet_tint) * 0.5,
             unlit: true,
-            alpha_mode: AlphaMode::Blend,
+            alpha_mode: AlphaMode::AlphaToCoverage,
             cull_mode: None,
             ..default()
         });
@@ -5002,47 +4797,6 @@ fn spawn_sky_backdrop(
 
     commands.spawn((
         GeneratedWorld,
-        Name::new("Moonlight"),
-        AtmosphereLightKind::MoonKey,
-        Transform::from_xyz(
-            blueprint.summit.x - 80.0,
-            blueprint.summit.y + 140.0,
-            blueprint.summit.z + 90.0,
-        )
-        .looking_at(center + Vec3::Y * 10.0, Vec3::Y),
-        DirectionalLight {
-            shadows_enabled: true,
-            illuminance: 22_000.0,
-            color: Color::srgb(0.76, 0.82, 1.0),
-            ..default()
-        },
-        CascadeShadowConfigBuilder {
-            first_cascade_far_bound: 32.0,
-            maximum_distance: 240.0,
-            overlap_proportion: 0.22,
-            ..default()
-        }
-        .build(),
-    ));
-    commands.spawn((
-        GeneratedWorld,
-        Name::new("Starlight Fill"),
-        AtmosphereLightKind::StarlightFill,
-        Transform::from_xyz(
-            blueprint.spawn.x + 40.0,
-            blueprint.spawn.y + 120.0,
-            blueprint.spawn.z - 60.0,
-        )
-        .looking_at(center + Vec3::Y * 20.0, Vec3::Y),
-        DirectionalLight {
-            shadows_enabled: false,
-            illuminance: 8_000.0,
-            color: Color::srgb(0.48, 0.6, 0.94),
-            ..default()
-        },
-    ));
-    commands.spawn((
-        GeneratedWorld,
         AtmosphereMaterialKind::Celestial,
         Name::new("Hero Moon"),
         Mesh3d(meshes.add(Sphere::new(1.0).mesh().ico(6).unwrap())),
@@ -5054,34 +4808,11 @@ fn spawn_sky_backdrop(
         })),
         Transform::from_translation(
             center
-                + moon_heading * (course_radius + 1_780.0)
-                + moon_right * 740.0
-                + Vec3::Y * 520.0,
+                + moon_heading * (course_radius + 1_160.0)
+                + moon_right * 360.0
+                + Vec3::Y * 440.0,
         )
         .with_scale(Vec3::splat(64.0 * manual_moon_scale)),
-        NotShadowCaster,
-        NotShadowReceiver,
-    ));
-    commands.spawn((
-        GeneratedWorld,
-        AtmosphereMaterialKind::Celestial,
-        Name::new("Hero Moon Halo"),
-        Mesh3d(meshes.add(Sphere::new(1.0).mesh().ico(5).unwrap())),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(0.7, 0.82, 1.0, 0.1),
-            emissive: LinearRgba::rgb(2.8, 3.4, 5.0),
-            unlit: true,
-            alpha_mode: AlphaMode::Blend,
-            cull_mode: None,
-            ..default()
-        })),
-        Transform::from_translation(
-            center
-                + moon_heading * (course_radius + 1_780.0)
-                + moon_right * 740.0
-                + Vec3::Y * 520.0,
-        )
-        .with_scale(Vec3::splat(82.0 * manual_moon_scale)),
         NotShadowCaster,
         NotShadowReceiver,
     ));
@@ -5097,9 +4828,9 @@ fn spawn_sky_backdrop(
             ..default()
         })),
         Transform::from_xyz(
-            center.x - course_radius - 1_420.0,
-            center.y + 520.0,
-            center.z + course_radius + 1_180.0,
+            center.x - course_radius - 980.0,
+            center.y + 420.0,
+            center.z + course_radius + 860.0,
         )
         .with_scale(Vec3::splat(34.0 * manual_moon_scale)),
         NotShadowCaster,
@@ -5117,9 +4848,9 @@ fn spawn_sky_backdrop(
             ..default()
         })),
         Transform::from_xyz(
-            center.x + course_radius + 1_640.0,
-            center.y + 440.0,
-            center.z - course_radius - 1_360.0,
+            center.x + course_radius + 1_120.0,
+            center.y + 380.0,
+            center.z - course_radius - 940.0,
         )
         .with_scale(Vec3::splat(18.0 * manual_moon_scale)),
         NotShadowCaster,
@@ -5137,9 +4868,9 @@ fn spawn_sky_backdrop(
             ..default()
         })),
         Transform::from_translation(
-            center - moon_right * (course_radius + 1_520.0)
-                + moon_heading * 620.0
-                + Vec3::Y * 600.0,
+            center - moon_right * (course_radius + 1_060.0)
+                + moon_heading * 420.0
+                + Vec3::Y * 520.0,
         )
         .with_scale(Vec3::splat(22.0 * manual_moon_scale)),
         NotShadowCaster,
@@ -5157,8 +4888,8 @@ fn spawn_sky_backdrop(
             ..default()
         })),
         Transform::from_translation(
-            center + moon_right * (course_radius + 1_940.0) - moon_heading * 820.0
-                + Vec3::Y * 460.0,
+            center + moon_right * (course_radius + 1_280.0) - moon_heading * 520.0
+                + Vec3::Y * 400.0,
         )
         .with_scale(Vec3::splat(14.0 * manual_moon_scale)),
         NotShadowCaster,
@@ -5307,42 +5038,32 @@ fn spawn_floating_celestial_entity(
     let mesh = shape.mesh(mesh_library);
     let ring_mesh = mesh_library.torus.clone();
     let shape_scale = shape.scale(radius);
-    let emits_light = glows && ringed;
-    let glow_range = (radius * 1.2).clamp(140.0, 420.0);
-    let glow_intensity = (90_000.0 + radius * 5_000.0).min(900_000.0);
     let shell_material = materials.add(StandardMaterial {
         base_color: tint,
-        emissive: LinearRgba::from(tint) * 0.18,
-        reflectance: 0.7,
+        emissive: LinearRgba::from(tint) * 0.14,
+        reflectance: 0.68,
         specular_tint: tint,
-        clearcoat: 0.55,
+        clearcoat: 0.56,
         clearcoat_perceptual_roughness: 0.24,
-        metallic: 0.04,
-        perceptual_roughness: 0.42,
-        ..default()
-    });
-    let atmosphere_material = materials.add(StandardMaterial {
-        base_color: tint.with_alpha(0.07),
-        emissive: LinearRgba::from(tint) * 0.24,
-        unlit: true,
-        alpha_mode: AlphaMode::Blend,
-        cull_mode: None,
+        metallic: 0.02,
+        perceptual_roughness: 0.34,
         ..default()
     });
     let core_material = materials.add(StandardMaterial {
         base_color: tint,
-        emissive: LinearRgba::from(tint) * 0.34,
-        reflectance: 0.92,
-        metallic: 0.08,
-        perceptual_roughness: 0.18,
+        emissive: LinearRgba::from(tint) * 0.24,
+        reflectance: 0.82,
+        metallic: 0.04,
+        perceptual_roughness: 0.22,
         ..default()
     });
     let ring_material = materials.add(StandardMaterial {
-        base_color: tint.with_alpha(0.18),
-        emissive: LinearRgba::from(tint) * 0.5,
-        unlit: true,
-        alpha_mode: AlphaMode::Blend,
-        cull_mode: None,
+        base_color: brighten(tint, 0.08),
+        emissive: LinearRgba::from(tint) * 0.16,
+        reflectance: 0.62,
+        clearcoat: 0.44,
+        clearcoat_perceptual_roughness: 0.22,
+        perceptual_roughness: 0.3,
         ..default()
     });
     let mut entity = commands.spawn((
@@ -5379,15 +5100,6 @@ fn spawn_floating_celestial_entity(
                 NotShadowCaster,
                 NotShadowReceiver,
             ));
-            parent.spawn((
-                Name::new("Floating Celestial Atmosphere"),
-                AtmosphereMaterialKind::Celestial,
-                Mesh3d(mesh.clone()),
-                MeshMaterial3d(atmosphere_material),
-                Transform::from_scale(shape.halo_scale() + Vec3::splat(radius / 220.0)),
-                NotShadowCaster,
-                NotShadowReceiver,
-            ));
         }
 
         if ringed {
@@ -5400,20 +5112,6 @@ fn spawn_floating_celestial_entity(
                     .with_scale(Vec3::new(radius * 1.75, radius * 0.3, radius * 1.75)),
                 NotShadowCaster,
                 NotShadowReceiver,
-            ));
-        }
-
-        if emits_light {
-            parent.spawn((
-                Name::new("Floating Celestial Light"),
-                PointLight {
-                    intensity: glow_intensity,
-                    range: glow_range,
-                    color: tint,
-                    shadows_enabled: false,
-                    ..default()
-                },
-                Transform::default(),
             ));
         }
     });
@@ -5495,14 +5193,14 @@ fn disperse_celestial_anchor(
         };
     let radial_shift = depth_bias
         * if major {
-            170.0 + radius * 0.12
+            120.0 + radius * 0.09
         } else {
-            110.0 + radius * 0.08
+            86.0 + radius * 0.06
         };
     let minimum_clearance = if major {
-        170.0 + radius * 0.08
+        154.0 + radius * 0.06
     } else {
-        130.0 + radius * 0.05
+        126.0 + radius * 0.04
     };
     let mut displaced = anchor
         + Vec3::Y * (vertical_bias * vertical_span)
@@ -5510,21 +5208,23 @@ fn disperse_celestial_anchor(
         + radial * radial_shift;
     let clearance = celestial_course_clearance(blueprint, displaced, radius);
     if clearance < minimum_clearance {
-        displaced += radial * (minimum_clearance - clearance + 24.0);
+        displaced += celestial_course_escape_direction(blueprint, displaced)
+            * (minimum_clearance - clearance + 24.0);
     } else if depth_bias < 0.0 {
         let inward_budget = (clearance - minimum_clearance)
             .min(if major {
-                120.0 + radius * 0.06
+                190.0 + radius * 0.09
             } else {
-                84.0 + radius * 0.04
+                110.0 + radius * 0.05
             })
             .max(0.0);
-        displaced -= radial * (inward_budget * depth_bias.abs() * 0.35);
+        displaced -= radial * (inward_budget * depth_bias.abs() * 0.48);
     }
-    let final_minimum_clearance = if major { 140.0 } else { 118.0 };
+    let final_minimum_clearance = if major { 132.0 } else { 120.0 };
     let final_clearance = celestial_course_clearance(blueprint, displaced, radius);
     if final_clearance < final_minimum_clearance {
-        displaced += radial * (final_minimum_clearance - final_clearance + 12.0);
+        displaced += celestial_course_escape_direction(blueprint, displaced)
+            * (final_minimum_clearance - final_clearance + 16.0);
     }
     displaced
 }
@@ -5576,14 +5276,14 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
     ];
     let major_count = major_shapes.len();
     let moon_count = moon_shapes.len();
-    let decor_count = 34;
+    let decor_count = 24;
     let mut bodies = Vec::with_capacity(major_count + moon_count + decor_count);
 
     for body_index in 0..major_count {
         let angle = TAU * (body_index as f32 / major_count as f32) + rng.range_f32(-0.28, 0.28);
         let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
         let tangent = Vec3::new(-radial.z, 0.0, radial.x);
-        let radius = rng.range_f32(12.0, 24.0) * MAJOR_CELESTIAL_RADIUS_MULTIPLIER;
+        let radius = rng.range_f32(18.0, 38.0) * MAJOR_CELESTIAL_RADIUS_MULTIPLIER;
         let shape = major_shapes[body_index];
         let clearance_radius = radius * shape.clearance_multiplier();
         let vertical_bias = celestial_vertical_bias(&mut rng, body_index, major_count);
@@ -5619,17 +5319,17 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             radius,
             drift_primary: tangent,
             drift_secondary,
-            primary_amplitude: rng.range_f32(6.0, 16.0),
-            secondary_amplitude: rng.range_f32(2.5, 7.0),
-            vertical_amplitude: 1.6 + radius * 0.1,
-            speed: rng.range_f32(0.02, 0.05),
-            rotation_speed: rng.range_f32(-0.006, 0.006),
+            primary_amplitude: rng.range_f32(3.5, 8.5),
+            secondary_amplitude: rng.range_f32(1.2, 3.6),
+            vertical_amplitude: 1.2 + radius * 0.04,
+            speed: rng.range_f32(0.012, 0.026),
+            rotation_speed: rng.range_f32(-0.0025, 0.0025),
             phase: rng.range_f32(0.0, TAU),
             base_rotation: Quat::from_rotation_y(rng.range_f32(0.0, TAU)),
             tint: floating_sphere_color(body_index),
-            glows: body_index % 4 == 0 || rng.range_f32(0.0, 1.0) > 0.84,
+            glows: body_index % 2 == 0 || rng.range_f32(0.0, 1.0) > 0.64,
             ringed: shape != CelestialShapeKind::Torus
-                && (body_index % 4 == 0 || rng.range_f32(0.0, 1.0) > 0.78),
+                && (body_index % 3 == 0 || rng.range_f32(0.0, 1.0) > 0.7),
         });
     }
 
@@ -5637,8 +5337,11 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
         let angle = TAU * (moon_index as f32 / moon_count as f32) + rng.range_f32(-0.36, 0.36);
         let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
         let tangent = Vec3::new(-radial.z, 0.0, radial.x);
-        let radius = rng.range_f32(5.5, 10.5) * MOON_CELESTIAL_RADIUS_MULTIPLIER;
-        let shape = moon_shapes[moon_index];
+        let radius = rng.range_f32(8.5, 16.5) * MOON_CELESTIAL_RADIUS_MULTIPLIER;
+        let mut shape = moon_shapes[moon_index];
+        if shape == CelestialShapeKind::Sphere && radius >= 800.0 {
+            shape = CelestialShapeKind::Capsule;
+        }
         let clearance_radius = radius * shape.clearance_multiplier();
         let vertical_bias = celestial_vertical_bias(&mut rng, moon_index, moon_count);
         let depth_bias = celestial_depth_bias(&mut rng, moon_index, moon_count, false);
@@ -5673,20 +5376,20 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             radius,
             drift_primary: tangent,
             drift_secondary,
-            primary_amplitude: rng.range_f32(4.0, 10.0),
-            secondary_amplitude: rng.range_f32(1.8, 4.4),
-            vertical_amplitude: 1.0 + radius * 0.12,
-            speed: rng.range_f32(0.03, 0.07),
-            rotation_speed: rng.range_f32(-0.008, 0.008),
+            primary_amplitude: rng.range_f32(2.6, 6.4),
+            secondary_amplitude: rng.range_f32(1.0, 2.8),
+            vertical_amplitude: 0.9 + radius * 0.045,
+            speed: rng.range_f32(0.014, 0.03),
+            rotation_speed: rng.range_f32(-0.003, 0.003),
             phase: rng.range_f32(0.0, TAU),
             base_rotation: Quat::from_rotation_y(rng.range_f32(0.0, TAU)),
-            tint: Color::srgb(
-                rng.range_f32(0.58, 0.84),
-                rng.range_f32(0.68, 0.9),
-                rng.range_f32(0.88, 1.0),
+            tint: mix_color(
+                floating_sphere_color(moon_index + 37),
+                Color::WHITE,
+                rng.range_f32(0.08, 0.24),
             ),
-            glows: moon_index % 6 == 0 || rng.range_f32(0.0, 1.0) > 0.9,
-            ringed: shape != CelestialShapeKind::Torus && rng.range_f32(0.0, 1.0) > 0.9,
+            glows: moon_index % 2 == 0 || rng.range_f32(0.0, 1.0) > 0.72,
+            ringed: shape != CelestialShapeKind::Torus && rng.range_f32(0.0, 1.0) > 0.8,
         });
     }
 
@@ -5704,7 +5407,7 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
         let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
         let tangent = Vec3::new(-radial.z, 0.0, radial.x);
         let shape = decor_shapes[decor_index % decor_shapes.len()];
-        let radius = rng.range_f32(4.0, 12.0) * DECOR_CELESTIAL_RADIUS_MULTIPLIER;
+        let radius = rng.range_f32(5.5, 14.5) * DECOR_CELESTIAL_RADIUS_MULTIPLIER;
         let clearance_radius = radius * shape.clearance_multiplier();
         let vertical_bias = celestial_vertical_bias(&mut rng, decor_index, decor_count);
         let depth_bias = celestial_depth_bias(&mut rng, decor_index, decor_count, false);
@@ -5744,11 +5447,11 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             radius,
             drift_primary: tangent,
             drift_secondary,
-            primary_amplitude: rng.range_f32(8.0, 24.0),
-            secondary_amplitude: rng.range_f32(4.0, 12.0),
-            vertical_amplitude: rng.range_f32(1.8, 6.4),
-            speed: rng.range_f32(0.03, 0.08),
-            rotation_speed: rng.range_f32(0.12, 0.38)
+            primary_amplitude: rng.range_f32(3.8, 9.0),
+            secondary_amplitude: rng.range_f32(1.6, 4.0),
+            vertical_amplitude: rng.range_f32(1.2, 3.2),
+            speed: rng.range_f32(0.016, 0.034),
+            rotation_speed: rng.range_f32(0.04, 0.12)
                 * if decor_index % 2 == 0 { 1.0 } else { -1.0 },
             phase: rng.range_f32(0.0, TAU),
             base_rotation: Quat::from_euler(
@@ -5758,7 +5461,7 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
                 rng.range_f32(0.0, TAU),
             ),
             tint: floating_sphere_color(decor_index + major_count + moon_count),
-            glows: decor_index % 7 == 0 || rng.range_f32(0.0, 1.0) > 0.93,
+            glows: decor_index % 2 == 0 || rng.range_f32(0.0, 1.0) > 0.76,
             ringed: false,
         });
     }
@@ -5772,6 +5475,9 @@ fn spawn_macro_spectacle(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) {
+    if !ENABLE_MACRO_SPECTACLE {
+        return;
+    }
     if blueprint.rooms.len() < 2 {
         return;
     }
@@ -5847,7 +5553,7 @@ fn spawn_macro_spectacle(
                 base_color: Color::WHITE,
                 emissive: LinearRgba::rgb(0.26, 0.24, 0.42),
                 cull_mode: None,
-                alpha_mode: AlphaMode::Blend,
+                alpha_mode: AlphaMode::AlphaToCoverage,
                 perceptual_roughness: 0.28,
                 reflectance: 0.56,
                 ..default()
@@ -5910,7 +5616,7 @@ fn spawn_macro_spectacle(
                 base_color: Color::WHITE,
                 emissive: LinearRgba::rgb(0.34, 0.2, 0.44),
                 cull_mode: None,
-                alpha_mode: AlphaMode::Blend,
+                alpha_mode: AlphaMode::AlphaToCoverage,
                 perceptual_roughness: 0.26,
                 reflectance: 0.62,
                 ..default()
@@ -5983,7 +5689,7 @@ fn spawn_macro_spectacle(
                 base_color: Color::WHITE,
                 emissive: LinearRgba::rgb(0.22, 0.18, 0.36),
                 cull_mode: None,
-                alpha_mode: AlphaMode::Blend,
+                alpha_mode: AlphaMode::AlphaToCoverage,
                 perceptual_roughness: 0.34,
                 reflectance: 0.48,
                 ..default()
@@ -6017,7 +5723,7 @@ fn spawn_macro_spectacle(
             MeshMaterial3d(materials.add(StandardMaterial {
                 base_color: gate_color.with_alpha(0.15),
                 emissive: LinearRgba::from(gate_color) * 0.26,
-                alpha_mode: AlphaMode::Blend,
+                alpha_mode: AlphaMode::AlphaToCoverage,
                 cull_mode: None,
                 unlit: true,
                 ..default()
@@ -6039,7 +5745,7 @@ fn spawn_macro_spectacle(
         base_color: Color::WHITE,
         emissive: LinearRgba::rgb(0.22, 0.18, 0.36),
         cull_mode: None,
-        alpha_mode: AlphaMode::Blend,
+        alpha_mode: AlphaMode::AlphaToCoverage,
         perceptual_roughness: 0.3,
         reflectance: 0.52,
         ..default()
@@ -6301,24 +6007,24 @@ fn find_safe_celestial_anchor(
     depth_bias: f32,
 ) -> Vec3 {
     let near_orbit_min = if major {
-        course_radius + 96.0 + radius * 0.42
+        course_radius + 56.0 + radius * 0.24
     } else {
-        course_radius + 84.0 + radius * 0.34
+        course_radius + 68.0 + radius * 0.26
     };
     let near_orbit_max = if major {
-        course_radius + 220.0 + radius * 0.66
+        course_radius + 150.0 + radius * 0.46
     } else {
-        course_radius + 170.0 + radius * 0.52
+        course_radius + 140.0 + radius * 0.4
     };
     let far_orbit_min = if major {
-        course_radius + 250.0 + radius * 0.84
+        course_radius + 160.0 + radius * 0.58
     } else {
-        course_radius + 210.0 + radius * 0.64
+        course_radius + 170.0 + radius * 0.46
     };
     let far_orbit_max = if major {
-        course_radius + 560.0 + radius * 1.24
+        course_radius + 380.0 + radius * 0.9
     } else {
-        course_radius + 390.0 + radius * 0.92
+        course_radius + 300.0 + radius * 0.72
     };
     let orbit_min = if depth_bias < -0.35 {
         near_orbit_min
@@ -6346,19 +6052,19 @@ fn find_safe_celestial_anchor(
         96.0 + radius * 0.06
     };
     let tangential_span = if major {
-        220.0 + radius * 0.03
+        180.0 + radius * 0.025
     } else {
-        140.0 + radius * 0.025
+        120.0 + radius * 0.02
     };
     let desired_clearance = if major {
-        190.0 + radius * 0.08
+        164.0 + radius * 0.055
     } else {
-        145.0 + radius * 0.05
+        134.0 + radius * 0.04
     };
     let desired_view_clearance = if major {
-        220.0 + radius * 0.06
+        196.0 + radius * 0.05
     } else {
-        120.0 + radius * 0.04
+        110.0 + radius * 0.035
     };
 
     let mut best = center + radial * orbit_max + Vec3::Y * altitude_center;
@@ -6458,6 +6164,39 @@ fn celestial_course_clearance(blueprint: &RunBlueprint, point: Vec3, radius: f32
     room_clearance.min(spawn_clearance).min(summit_clearance)
 }
 
+fn celestial_course_escape_direction(blueprint: &RunBlueprint, point: Vec3) -> Vec3 {
+    let mut best_clearance = f32::INFINITY;
+    let mut best_direction = Vec3::Y;
+
+    for room in &blueprint.rooms {
+        let room_radius = room.size.max_element() * 0.9 + ROOM_CLEARANCE_HEIGHT * 0.5;
+        let delta = point - room.top;
+        let clearance = delta.length() - room_radius;
+        if clearance < best_clearance {
+            best_clearance = clearance;
+            best_direction = delta.normalize_or_zero();
+        }
+    }
+
+    for (source, source_radius) in [
+        (blueprint.spawn, PLAYER_SPAWN_CLEARANCE + 32.0),
+        (blueprint.summit, SUMMIT_RADIUS + 28.0),
+    ] {
+        let delta = point - source;
+        let clearance = delta.length() - source_radius;
+        if clearance < best_clearance {
+            best_clearance = clearance;
+            best_direction = delta.normalize_or_zero();
+        }
+    }
+
+    if best_direction == Vec3::ZERO {
+        Vec3::Y
+    } else {
+        best_direction
+    }
+}
+
 fn spawn_layout(
     layout: &ModuleLayout,
     chunk: Option<WorldChunkKey>,
@@ -6489,6 +6228,9 @@ fn spawn_layout(
             MeshMaterial3d(cached_game_material(asset_cache, materials, material_key)),
             Transform::default(),
         ));
+        if material_key.surf {
+            entity.insert(NotShadowCaster);
+        }
         if let Some(chunk) = chunk {
             entity.insert(ChunkMember(chunk));
         }
@@ -6496,6 +6238,17 @@ fn spawn_layout(
 
     for feature in &layout.features {
         match feature {
+            FeatureSpec::CheckpointPad { center, index } => {
+                let mut entity = commands.spawn((
+                    GeneratedWorld,
+                    Name::new("Checkpoint Pad"),
+                    Transform::from_translation(*center),
+                    CheckpointPad { index: *index },
+                ));
+                if let Some(chunk) = chunk {
+                    entity.insert(ChunkMember(chunk));
+                }
+            }
             FeatureSpec::WindZone {
                 center,
                 size,
@@ -6509,7 +6262,7 @@ fn spawn_layout(
                     Mesh3d(cached_cuboid_mesh(asset_cache, meshes, *size)),
                     MeshMaterial3d(materials.add(StandardMaterial {
                         base_color: Color::srgba(0.4, 0.75, 1.0, 0.14),
-                        alpha_mode: AlphaMode::Blend,
+                        alpha_mode: AlphaMode::AlphaToCoverage,
                         unlit: true,
                         ..default()
                     })),
@@ -6724,9 +6477,6 @@ fn spawn_box_spec(
 
     match spec.extra {
         ExtraKind::None => {}
-        ExtraKind::Checkpoint { index } => {
-            entity.insert(CheckpointPad { index });
-        }
         ExtraKind::SummitGoal => {
             entity.insert(SummitGoal);
         }
@@ -6800,10 +6550,7 @@ fn dim_linear(color: Color, scale: f32, alpha: f32) -> Color {
 
 fn is_batchable_static_render(spec: &SolidSpec) -> bool {
     matches!(spec.extra, ExtraKind::None)
-        && matches!(
-            &spec.body,
-            SolidBody::Static | SolidBody::StaticSurfWedge { .. }
-        )
+        && matches!(&spec.body, SolidBody::Static | SolidBody::StaticSurfWedge { .. })
 }
 
 fn is_collider_only_static(spec: &SolidSpec) -> bool {
@@ -7057,7 +6804,6 @@ fn append_surf_wedge_render_geometry(
     let underside = deepen(base_color, 0.28).with_alpha(0.28);
     let side_shadow = deepen(base_color, 0.18).with_alpha(0.3);
 
-    builder.push_quad(a, b, d, c, ridge_face);
     builder.push_quad(e, g, h, f, underside);
     builder.push_quad(a, c, g, e, outer_face);
     builder.push_quad(b, f, h, d, side_shadow);
@@ -7068,50 +6814,66 @@ fn append_surf_wedge_render_geometry(
     let back_ridge = b;
     let front_outer = c;
     let back_outer = d;
-    let mut surface_normal = (back_ridge - front_ridge)
-        .cross(front_outer - front_ridge)
-        .normalize_or_zero();
-    if surface_normal.y < 0.0 {
-        surface_normal = -surface_normal;
+
+    let stripe_core = mix_color(ridge_face, stripe_color.with_alpha(0.64), 0.82);
+    let stripe_glow = mix_color(ridge_face, dim_linear(stripe_color, 0.52, 0.5), 0.52);
+    let stripe_specs: [(f32, f32, f32); 2] = [(0.18, 0.16, 0.32), (0.64, 0.11, 0.22)];
+    let mut band_breaks = vec![0.0_f32, 1.0_f32];
+    for &(t, stripe_width, glow_width) in &stripe_specs {
+        band_breaks.push((t - glow_width * 0.5_f32).clamp(0.0_f32, 1.0_f32));
+        band_breaks.push((t - stripe_width * 0.5_f32).clamp(0.0_f32, 1.0_f32));
+        band_breaks.push((t + stripe_width * 0.5_f32).clamp(0.0_f32, 1.0_f32));
+        band_breaks.push((t + glow_width * 0.5_f32).clamp(0.0_f32, 1.0_f32));
     }
+    band_breaks.sort_by(|a, b| a.total_cmp(b));
+    band_breaks.dedup_by(|a, b| (*a - *b).abs() < 0.001);
 
-    let stripe_core = stripe_color.with_alpha(0.94);
-    let stripe_glow = dim_linear(stripe_color, 0.42, 0.24);
-
-    for &(t, stripe_width, glow_width, lift) in
-        &[(0.18, 0.16, 0.32, 0.022), (0.64, 0.11, 0.22, 0.018)]
-    {
-        let front_center = front_ridge.lerp(front_outer, t);
-        let back_center = back_ridge.lerp(back_outer, t);
-        let front_face_dir = (front_outer - front_ridge).normalize_or_zero();
-        let back_face_dir = (back_outer - back_ridge).normalize_or_zero();
-        let glow_quad = [
-            front_center - front_face_dir * (glow_width * 0.5) + surface_normal * lift,
-            back_center - back_face_dir * (glow_width * 0.5) + surface_normal * lift,
-            back_center + back_face_dir * (glow_width * 0.5) + surface_normal * lift,
-            front_center + front_face_dir * (glow_width * 0.5) + surface_normal * lift,
-        ];
-        let stripe_quad = [
-            front_center - front_face_dir * (stripe_width * 0.5) + surface_normal * (lift + 0.012),
-            back_center - back_face_dir * (stripe_width * 0.5) + surface_normal * (lift + 0.012),
-            back_center + back_face_dir * (stripe_width * 0.5) + surface_normal * (lift + 0.012),
-            front_center + front_face_dir * (stripe_width * 0.5) + surface_normal * (lift + 0.012),
-        ];
-        builder.push_quad(
-            glow_quad[0],
-            glow_quad[1],
-            glow_quad[2],
-            glow_quad[3],
+    for pair in band_breaks.windows(2) {
+        let start_t = pair[0];
+        let end_t = pair[1];
+        if end_t - start_t < 0.001 {
+            continue;
+        }
+        let mid_t = (start_t + end_t) * 0.5;
+        let band_color = surf_wedge_stripe_band_color(
+            mid_t,
+            ridge_face,
             stripe_glow,
+            stripe_core,
+            &stripe_specs,
         );
         builder.push_quad(
-            stripe_quad[0],
-            stripe_quad[1],
-            stripe_quad[2],
-            stripe_quad[3],
-            stripe_core,
+            front_ridge.lerp(front_outer, start_t),
+            back_ridge.lerp(back_outer, start_t),
+            back_ridge.lerp(back_outer, end_t),
+            front_ridge.lerp(front_outer, end_t),
+            band_color,
         );
     }
+}
+
+fn surf_wedge_stripe_band_color(
+    t: f32,
+    base_color: Color,
+    glow_color: Color,
+    stripe_color: Color,
+    stripe_specs: &[(f32, f32, f32)],
+) -> Color {
+    for &(stripe_t, stripe_width, glow_width) in stripe_specs {
+        let stripe_min = stripe_t - stripe_width * 0.5;
+        let stripe_max = stripe_t + stripe_width * 0.5;
+        if (stripe_min..=stripe_max).contains(&t) {
+            return stripe_color;
+        }
+
+        let glow_min = stripe_t - glow_width * 0.5;
+        let glow_max = stripe_t + glow_width * 0.5;
+        if (glow_min..=glow_max).contains(&t) {
+            return glow_color;
+        }
+    }
+
+    base_color
 }
 
 fn trapezoid_points(size: Vec3, top_scale: f32) -> Vec<Vec3> {
@@ -7233,15 +6995,16 @@ fn cached_game_material(
         material.base_color = Color::WHITE;
     }
     if key.surf {
+        material.base_color = material.base_color.with_alpha(0.34);
         material.cull_mode = None;
-        material.perceptual_roughness = 0.04;
-        material.reflectance = 0.72;
-        material.clearcoat = 1.0;
-        material.clearcoat_perceptual_roughness = 0.02;
+        material.perceptual_roughness = 0.12;
+        material.reflectance = 0.76;
+        material.clearcoat = 0.88;
+        material.clearcoat_perceptual_roughness = 0.08;
         material.metallic = 0.0;
-        material.specular_tint = paint_stripe_color(key.paint);
+        material.specular_tint = brighten(paint_base_color(key.paint, key.ghost), 0.12);
         material.emissive = LinearRgba::BLACK;
-        material.alpha_mode = AlphaMode::Opaque;
+        material.alpha_mode = AlphaMode::Blend;
         material.specular_transmission = 0.0;
         material.diffuse_transmission = 0.0;
         material.thickness = 0.0;
@@ -7328,11 +7091,18 @@ fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
         label: format!("Room {}", room.index),
         center: top_to_center(room.top, ROOM_HEIGHT),
         size,
-        paint: PaintStyle::ThemeFloor(room.theme),
+        paint: PaintStyle::SectionPlatform(room.theme),
         body: SolidBody::Static,
         friction: None,
         extra: ExtraKind::None,
     });
+
+    if let Some(index) = room.checkpoint_slot {
+        layout.features.push(FeatureSpec::CheckpointPad {
+            center: room.top,
+            index,
+        });
+    }
 
     match room.section {
         RoomSectionKind::OpenPad => {}
@@ -7346,7 +7116,7 @@ fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
                         0.4,
                     ),
                     size: Vec3::new(room.size.x * 0.34, 0.4, room.size.y * 0.46),
-                    paint: PaintStyle::ThemeAccent(room.theme),
+                    paint: PaintStyle::SectionPlatform(room.theme),
                     body: SolidBody::Static,
                     friction: None,
                     extra: ExtraKind::None,
@@ -7357,7 +7127,7 @@ fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
                 label: "Split Rest Spine".into(),
                 center: top_to_center(room.top + Vec3::Y * 0.22, 0.28),
                 size: Vec3::new(room.size.x * 0.18, 0.28, room.size.y * 0.74),
-                paint: PaintStyle::ThemeShadow(room.theme),
+                paint: PaintStyle::SectionPlatform(room.theme),
                 body: SolidBody::Static,
                 friction: None,
                 extra: ExtraKind::None,
@@ -7381,7 +7151,7 @@ fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
                 label: "Terrace Shelf".into(),
                 center: top_to_center(room.top + offset + Vec3::Y * 0.34, 0.5),
                 size: terrace_size,
-                paint: PaintStyle::ThemeAccent(room.theme),
+                paint: PaintStyle::SectionPlatform(room.theme),
                 body: SolidBody::Static,
                 friction: None,
                 extra: ExtraKind::None,
@@ -7399,7 +7169,7 @@ fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
                             0.34,
                         ),
                         size: Vec3::new(room.size.x * 0.24, 0.34, room.size.y * 0.24),
-                        paint: PaintStyle::ThemeAccent(room.theme),
+                        paint: PaintStyle::SectionPlatform(room.theme),
                         body: SolidBody::Static,
                         friction: None,
                         extra: ExtraKind::None,
@@ -7407,19 +7177,6 @@ fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
                 }
             }
         }
-    }
-
-    if let Some(index) = room.checkpoint_slot {
-        layout.solids.push(SolidSpec {
-            owner,
-            label: format!("Checkpoint {}", room.index),
-            center: top_to_center(room.top + Vec3::Y * 0.18, 0.18),
-            size: Vec3::new(2.9, 0.18, 2.9),
-            paint: PaintStyle::Checkpoint,
-            body: SolidBody::Decoration,
-            friction: None,
-            extra: ExtraKind::Checkpoint { index },
-        });
     }
 
     layout.clearances.push(ClearanceProbe {
@@ -9764,11 +9521,30 @@ fn material_for_paint(paint: PaintStyle, ghost: bool) -> StandardMaterial {
         },
         PaintStyle::ThemeShadow(theme) => StandardMaterial {
             base_color: theme_shadow_color(theme),
-            emissive: LinearRgba::from(theme_glow_color(theme)) * 0.04,
-            reflectance: 0.1,
-            perceptual_roughness: 0.94,
+            emissive: LinearRgba::from(theme_glow_color(theme)) * 0.065,
+            reflectance: 0.18,
+            specular_tint: theme_glow_color(theme),
+            clearcoat: 0.08,
+            clearcoat_perceptual_roughness: 0.72,
+            perceptual_roughness: 0.86,
             ..default()
         },
+        PaintStyle::SectionPlatform(theme) => {
+            let pane_color = mix_color(theme_floor_color(theme), theme_glow_color(theme), 0.38)
+                .with_alpha(if ghost { 0.08 } else { 0.16 });
+            StandardMaterial {
+                base_color: pane_color,
+                alpha_mode: AlphaMode::AlphaToCoverage,
+                emissive: LinearRgba::from(theme_glow_color(theme)) * 0.12,
+                reflectance: 0.84,
+                specular_tint: brighten(theme_glow_color(theme), 0.08),
+                clearcoat: 0.82,
+                clearcoat_perceptual_roughness: 0.14,
+                perceptual_roughness: 0.18,
+                metallic: 0.0,
+                ..default()
+            }
+        }
         PaintStyle::Summit => StandardMaterial {
             base_color: Color::srgb(0.7, 0.64, 0.38),
             emissive: LinearRgba::rgb(0.52, 0.4, 0.16),
@@ -9804,7 +9580,7 @@ fn material_for_paint(paint: PaintStyle, ghost: bool) -> StandardMaterial {
                 Color::srgb(0.2, 0.66, 0.9)
             },
             alpha_mode: if ghost {
-                AlphaMode::Blend
+                AlphaMode::AlphaToCoverage
             } else {
                 AlphaMode::Opaque
             },
@@ -9817,7 +9593,7 @@ fn material_for_paint(paint: PaintStyle, ghost: bool) -> StandardMaterial {
         },
         PaintStyle::Ice => StandardMaterial {
             base_color: Color::srgba(0.56, 0.78, 0.94, 0.7),
-            alpha_mode: AlphaMode::Blend,
+            alpha_mode: AlphaMode::AlphaToCoverage,
             emissive: LinearRgba::rgb(0.1, 0.2, 0.26),
             reflectance: 0.94,
             clearcoat: 1.0,
@@ -9827,7 +9603,7 @@ fn material_for_paint(paint: PaintStyle, ghost: bool) -> StandardMaterial {
         },
         PaintStyle::Water => StandardMaterial {
             base_color: Color::srgba(0.02, 0.16, 0.34, 0.5),
-            alpha_mode: AlphaMode::Blend,
+            alpha_mode: AlphaMode::AlphaToCoverage,
             emissive: LinearRgba::rgb(0.06, 0.16, 0.24),
             reflectance: 1.0,
             clearcoat: 1.0,
@@ -9846,37 +9622,37 @@ fn theme_for(index: usize, total: usize, offset: usize) -> Theme {
 
 fn theme_floor_color(theme: Theme) -> Color {
     match theme {
-        Theme::Stone => Color::srgb(0.16, 0.18, 0.3),
-        Theme::Overgrown => Color::srgb(0.08, 0.2, 0.26),
-        Theme::Frost => Color::srgb(0.18, 0.24, 0.38),
-        Theme::Ember => Color::srgb(0.28, 0.16, 0.28),
+        Theme::Stone => Color::srgb(0.2, 0.22, 0.29),
+        Theme::Overgrown => Color::srgb(0.09, 0.18, 0.15),
+        Theme::Frost => Color::srgb(0.15, 0.22, 0.32),
+        Theme::Ember => Color::srgb(0.24, 0.13, 0.17),
     }
 }
 
 fn theme_accent_color(theme: Theme) -> Color {
     match theme {
-        Theme::Stone => Color::srgb(0.32, 0.36, 0.66),
-        Theme::Overgrown => Color::srgb(0.12, 0.54, 0.62),
-        Theme::Frost => Color::srgb(0.28, 0.62, 0.88),
-        Theme::Ember => Color::srgb(0.78, 0.32, 0.66),
+        Theme::Stone => Color::srgb(0.52, 0.58, 0.84),
+        Theme::Overgrown => Color::srgb(0.24, 0.62, 0.48),
+        Theme::Frost => Color::srgb(0.32, 0.72, 0.94),
+        Theme::Ember => Color::srgb(0.92, 0.42, 0.5),
     }
 }
 
 fn theme_shadow_color(theme: Theme) -> Color {
     match theme {
-        Theme::Stone => Color::srgb(0.04, 0.05, 0.11),
-        Theme::Overgrown => Color::srgb(0.03, 0.07, 0.1),
-        Theme::Frost => Color::srgb(0.04, 0.07, 0.14),
-        Theme::Ember => Color::srgb(0.08, 0.03, 0.09),
+        Theme::Stone => Color::srgb(0.08, 0.09, 0.15),
+        Theme::Overgrown => Color::srgb(0.04, 0.08, 0.06),
+        Theme::Frost => Color::srgb(0.06, 0.1, 0.16),
+        Theme::Ember => Color::srgb(0.1, 0.04, 0.07),
     }
 }
 
 fn theme_glow_color(theme: Theme) -> Color {
     match theme {
-        Theme::Stone => Color::srgb(0.56, 0.7, 1.0),
-        Theme::Overgrown => Color::srgb(0.28, 0.96, 0.9),
-        Theme::Frost => Color::srgb(0.64, 0.92, 1.0),
-        Theme::Ember => Color::srgb(1.0, 0.46, 0.84),
+        Theme::Stone => Color::srgb(0.72, 0.8, 1.0),
+        Theme::Overgrown => Color::srgb(0.46, 0.98, 0.74),
+        Theme::Frost => Color::srgb(0.76, 0.96, 1.0),
+        Theme::Ember => Color::srgb(1.0, 0.64, 0.72),
     }
 }
 
@@ -9884,7 +9660,8 @@ fn paint_stripe_color(paint: PaintStyle) -> Color {
     match paint {
         PaintStyle::ThemeFloor(theme)
         | PaintStyle::ThemeAccent(theme)
-        | PaintStyle::ThemeShadow(theme) => {
+        | PaintStyle::ThemeShadow(theme)
+        | PaintStyle::SectionPlatform(theme) => {
             let glow = LinearRgba::from(theme_glow_color(theme));
             Color::linear_rgb(glow.red * 1.1, glow.green * 1.1, glow.blue * 1.1)
         }
@@ -9951,12 +9728,15 @@ fn course_visual_center_and_radius(blueprint: &RunBlueprint) -> (Vec3, f32) {
 }
 
 fn floating_sphere_color(index: usize) -> Color {
-    match index % 5 {
-        0 => Color::srgb(0.34, 0.58, 1.0),
-        1 => Color::srgb(0.26, 0.72, 0.62),
-        2 => Color::srgb(0.7, 0.48, 0.94),
-        3 => Color::srgb(0.94, 0.48, 0.3),
-        _ => Color::srgb(0.78, 0.84, 1.0),
+    match index % 8 {
+        0 => Color::srgb(0.38, 0.62, 1.0),
+        1 => Color::srgb(0.28, 0.82, 0.62),
+        2 => Color::srgb(0.8, 0.5, 0.98),
+        3 => Color::srgb(1.0, 0.58, 0.34),
+        4 => Color::srgb(0.98, 0.82, 0.42),
+        5 => Color::srgb(0.36, 0.9, 0.94),
+        6 => Color::srgb(0.96, 0.44, 0.72),
+        _ => Color::srgb(0.86, 0.9, 1.0),
     }
 }
 
@@ -10050,6 +9830,213 @@ mod tests {
         assert!(!room_layout.solids.is_empty());
         assert!(!segment_layout.solids.is_empty());
         assert!(!summit_layout.solids.is_empty());
+    }
+
+    #[test]
+    fn room_layout_uses_glass_section_platform_without_checkpoint_marker_solid() {
+        let room = test_room(3, IVec2::new(0, 0), Vec3::new(0.0, 32.0, 0.0), 77);
+        let layout = build_room_layout(&room);
+
+        let room_platform = layout
+            .solids
+            .iter()
+            .find(|solid| solid.label == "Room 3")
+            .expect("room platform should exist");
+
+        assert!(matches!(
+            room_platform.paint,
+            PaintStyle::SectionPlatform(Theme::Frost)
+        ));
+        assert!(matches!(room_platform.extra, ExtraKind::None));
+        assert!(is_batchable_static_render(room_platform));
+        assert!(
+            layout.solids.iter().all(|solid| solid.label != "Checkpoint 3"),
+            "checkpoint marker slab should no longer be spawned"
+        );
+        assert!(
+            layout.features.iter().any(|feature| matches!(
+                feature,
+                FeatureSpec::CheckpointPad { index, .. } if *index == 3
+            )),
+            "checkpoint tracking should be preserved as a non-rendered feature"
+        );
+    }
+
+    #[test]
+    fn section_platform_material_is_translucent_glass() {
+        let material = material_for_paint(PaintStyle::SectionPlatform(Theme::Stone), false);
+
+        assert!(matches!(material.alpha_mode, AlphaMode::AlphaToCoverage));
+        assert!(material.base_color.alpha() < 1.0);
+        assert!(material.reflectance >= 0.8);
+        assert!(material.clearcoat >= 0.8);
+    }
+
+    #[test]
+    fn surf_material_is_transparent_and_glossy() {
+        let mut cache = WorldAssetCache::default();
+        let mut materials = Assets::<StandardMaterial>::default();
+        let handle = cached_game_material(
+            &mut cache,
+            &mut materials,
+            GameMaterialKey {
+                paint: PaintStyle::ThemeFloor(Theme::Frost),
+                ghost: false,
+                surf: true,
+                vertex_colored: true,
+            },
+        );
+        let material = materials
+            .get(&handle)
+            .expect("cached surf material should exist");
+
+        assert!(matches!(material.alpha_mode, AlphaMode::Blend));
+        assert!(material.base_color.alpha() < 1.0);
+        assert!(material.clearcoat >= 0.85);
+        assert!(material.cull_mode.is_none());
+    }
+
+    #[test]
+    fn surf_wedge_render_restores_internal_stripe_geometry() {
+        let points = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(6.0, 0.0, 0.0),
+            Vec3::new(0.0, -1.2, 4.0),
+            Vec3::new(6.0, -1.2, 4.0),
+            Vec3::new(0.0, -0.24, 0.0),
+            Vec3::new(6.0, -0.24, 0.0),
+            Vec3::new(0.0, -1.44, 4.0),
+            Vec3::new(6.0, -1.44, 4.0),
+        ];
+        let mut builder = ColoredMeshBuilder::default();
+        append_surf_wedge_render_geometry(
+            &mut builder,
+            Vec3::ZERO,
+            &points,
+            Color::srgb(0.2, 0.3, 0.5),
+            Color::srgb(0.9, 0.9, 1.0),
+        );
+
+        assert_eq!(builder.positions.len(), 84);
+    }
+
+    #[test]
+    fn surf_wedge_stripes_stay_within_wedge_bounds() {
+        let points = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(8.0, 0.0, 0.0),
+            Vec3::new(0.0, -2.1, 5.8),
+            Vec3::new(8.0, -1.6, 5.8),
+            Vec3::new(0.0, -0.16, 0.0),
+            Vec3::new(8.0, -0.16, 0.0),
+            Vec3::new(0.0, -2.26, 5.8),
+            Vec3::new(8.0, -1.76, 5.8),
+        ];
+        let mut builder = ColoredMeshBuilder::default();
+        append_surf_wedge_render_geometry(
+            &mut builder,
+            Vec3::ZERO,
+            &points,
+            Color::srgb(0.2, 0.3, 0.5),
+            Color::srgb(0.9, 0.9, 1.0),
+        );
+
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for point in &points {
+            min = min.min(*point);
+            max = max.max(*point);
+        }
+
+        for vertex in &builder.positions {
+            let point = Vec3::new(vertex[0], vertex[1], vertex[2]);
+            assert!(
+                point.x >= min.x - 0.001
+                    && point.x <= max.x + 0.001
+                    && point.y >= min.y - 0.001
+                    && point.y <= max.y + 0.001
+                    && point.z >= min.z - 0.001
+                    && point.z <= max.z + 0.001,
+                "generated stripe vertex {:?} escaped wedge bounds {:?}..{:?}",
+                point,
+                min,
+                max
+            );
+        }
+    }
+
+    #[test]
+    fn surf_wedges_are_batchable_static_render() {
+        let surf = SolidSpec {
+            owner: OwnerTag::Segment(0),
+            label: "Surf".into(),
+            center: Vec3::ZERO,
+            size: Vec3::new(6.0, 2.0, 4.0),
+            paint: PaintStyle::ThemeFloor(Theme::Frost),
+            body: SolidBody::StaticSurfWedge {
+                wall_side: 1.0,
+                render_points: vec![
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(6.0, 0.0, 0.0),
+                    Vec3::new(0.0, -1.2, 4.0),
+                    Vec3::new(6.0, -1.2, 4.0),
+                    Vec3::new(0.0, -0.24, 0.0),
+                    Vec3::new(6.0, -0.24, 0.0),
+                    Vec3::new(0.0, -1.44, 4.0),
+                    Vec3::new(6.0, -1.44, 4.0),
+                ],
+            },
+            friction: Some(0.0),
+            extra: ExtraKind::None,
+        };
+
+        assert!(is_batchable_static_render(&surf));
+    }
+
+    #[test]
+    fn theme_palette_stays_varied() {
+        let floors = [
+            theme_floor_color(Theme::Stone),
+            theme_floor_color(Theme::Overgrown),
+            theme_floor_color(Theme::Frost),
+            theme_floor_color(Theme::Ember),
+        ];
+        let glows = [
+            theme_glow_color(Theme::Stone),
+            theme_glow_color(Theme::Overgrown),
+            theme_glow_color(Theme::Frost),
+            theme_glow_color(Theme::Ember),
+        ];
+
+        for pair in floors.windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
+        for pair in glows.windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
+    }
+
+    #[test]
+    fn landmark_selection_avoids_parallel_bridge_variant() {
+        for seed in 0_u64..32 {
+            let mut rng = RunRng::new(seed);
+            assert!(
+                !matches!(
+                    choose_landmark_kind(&mut rng, ZoneRole::Technical, ZoneSignature::BraidLanes),
+                    LandmarkKind::ImpossibleBridge
+                )
+            );
+            assert!(
+                !matches!(
+                    choose_landmark_kind(
+                        &mut rng,
+                        ZoneRole::Technical,
+                        ZoneSignature::SplitTransfer
+                    ),
+                    LandmarkKind::ImpossibleBridge
+                )
+            );
+        }
     }
 
     #[test]
@@ -10168,6 +10155,25 @@ mod tests {
     }
 
     #[test]
+    fn seed_12_celestials_keep_clear_of_the_course() {
+        let blueprint = build_run_blueprint(12);
+        for body in build_celestial_body_plans(&blueprint) {
+            let clearance = celestial_course_clearance(
+                &blueprint,
+                body.anchor,
+                body.radius * body.shape.clearance_multiplier(),
+            );
+            assert!(
+                clearance >= 115.0,
+                "seed 12 celestial body at {:?} radius {} only had clearance {}",
+                body.anchor,
+                body.radius * body.shape.clearance_multiplier(),
+                clearance
+            );
+        }
+    }
+
+    #[test]
     fn generated_celestials_avoid_the_entry_view_corridor() {
         for seed in 0_u64..256 {
             let blueprint = build_run_blueprint(seed);
@@ -10188,6 +10194,27 @@ mod tests {
                     body.radius,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn seed_0_celestials_avoid_the_entry_view_corridor() {
+        let blueprint = build_run_blueprint(0);
+        for body in build_celestial_body_plans(&blueprint) {
+            let view_clearance = celestial_entry_view_clearance(&blueprint, body.anchor, body.radius);
+            let minimum = if body.radius >= 800.0 { 220.0 } else { 100.0 };
+            assert!(
+                view_clearance >= minimum,
+                "seed 0 celestial body {:?} radius {} intruded into entry view corridor with clearance {}",
+                body.anchor,
+                body.radius,
+                view_clearance,
+            );
+            assert!(
+                !(body.radius >= 800.0 && body.shape == CelestialShapeKind::Sphere),
+                "seed 0 generated a giant central-prone sphere with radius {}",
+                body.radius,
+            );
         }
     }
 
@@ -10232,8 +10259,30 @@ mod tests {
             );
         }
         assert!(
-            closest_clearance_seen <= 700.0,
-            "sample never brought a giant body within 700 units of the course; closest was {closest_clearance_seen}"
+            closest_clearance_seen <= 580.0,
+            "sample never brought a giant body within 580 units of the course; closest was {closest_clearance_seen}"
+        );
+    }
+
+    #[test]
+    fn celestial_budget_restores_dense_sky() {
+        let blueprint = build_run_blueprint(42);
+        let bodies = build_celestial_body_plans(&blueprint);
+        let average_radius =
+            bodies.iter().map(|body| body.radius).sum::<f32>() / bodies.len().max(1) as f32;
+
+        assert!(
+            bodies.len() >= 50,
+            "celestial density regressed to {} bodies",
+            bodies.len()
+        );
+        assert!(
+            average_radius >= 700.0,
+            "average celestial radius dropped to {average_radius}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.radius >= 2_000.0),
+            "expected at least one very large ambient shape"
         );
     }
 
@@ -10878,13 +10927,54 @@ mod tests {
         let checkpoint = 4.min(blueprint.rooms.len().saturating_sub(3));
         let ahead_room = (checkpoint + 3).min(blueprint.rooms.len() - 1);
         let player_position = blueprint.rooms[ahead_room].top + Vec3::new(0.0, 1.0, 0.0);
-        let focus = stream_focus_room(&blueprint, checkpoint, player_position);
+        let focus = stream_focus_room(&blueprint, checkpoint, checkpoint, player_position);
 
         assert!(
             focus >= ahead_room.saturating_sub(1),
             "focus room {} should advance toward the player's actual route position {}",
             focus,
             ahead_room
+        );
+    }
+
+    #[test]
+    fn stream_focus_handles_wide_lateral_turns() {
+        let blueprint = build_run_blueprint(0x5ea7_cafe_u64);
+        let checkpoint = 5.min(blueprint.rooms.len().saturating_sub(4));
+        let segment_index = (checkpoint + 2).min(blueprint.segments.len().saturating_sub(1));
+        let segment = &blueprint.segments[segment_index];
+        let from = blueprint.rooms[segment.from].top;
+        let to = blueprint.rooms[segment.to].top;
+        let forward = direction_from_delta(to - from);
+        let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
+        let player_position = from.lerp(to, 0.68) + right * 140.0 + Vec3::Y * 6.0;
+        let focus = stream_focus_room(&blueprint, checkpoint, segment.to, player_position);
+
+        assert!(
+            focus >= segment.to.saturating_sub(1),
+            "wide lateral position near segment {} -> {} regressed focus room to {}",
+            segment.from,
+            segment.to,
+            focus
+        );
+    }
+
+    #[test]
+    fn sync_generated_geometry_does_not_raise_death_plane() {
+        let blueprint = build_run_blueprint(0x51de_7001_u64);
+        let mut run = RunState::new(&blueprint, build_run_snapshot(HashSet::new()));
+        run.focus_room = 6.min(run.blueprint.rooms.len().saturating_sub(1));
+        run.death_plane =
+            checkpoint_death_plane(&run.blueprint, run.current_checkpoint, run.focus_room) - 72.0;
+        let prior_death_plane = run.death_plane;
+
+        run.sync_generated_geometry();
+
+        assert!(
+            run.death_plane <= prior_death_plane,
+            "sync raised death plane from {} to {}",
+            prior_death_plane,
+            run.death_plane
         );
     }
 }
