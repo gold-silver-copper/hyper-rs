@@ -58,10 +58,8 @@ const WALL_RUN_DURATION: f32 = 0.95;
 const WALL_RUN_COOLDOWN: f32 = 0.2;
 const WALL_SHAFT_BOOST_SPEED: f32 = 8.8;
 const WALL_SHAFT_REPEAT: f32 = 0.11;
-const TREASURE_PICKUP_RADIUS: f32 = 1.8;
 const CHECKPOINT_RADIUS: f32 = 2.8;
 const SUMMIT_RADIUS: f32 = 4.5;
-const SHORTCUT_TRIGGER_RADIUS: f32 = 2.0;
 const SKY_RADIUS: f32 = 950.0;
 const STAR_SIZE_MULTIPLIER: f32 = 12.0;
 const STAR_CLUSTER_SIZE_MULTIPLIER: f32 = 12.0;
@@ -97,9 +95,6 @@ const CHECKPOINT_DEATH_MARGIN: f32 = 180.0;
 const ATMOSPHERE_PROGRESS_DEPTH: f32 = 1800.0;
 const ROUTE_LINE_LATERAL_SPAN: f32 = 7.6;
 const ROUTE_LINE_TRICK_VERTICAL_BIAS: f32 = 1.1;
-const ROUTE_LINE_SAFE_WIDTH_SCALE: f32 = 1.18;
-const ROUTE_LINE_SPEED_WIDTH_SCALE: f32 = 1.0;
-const ROUTE_LINE_TRICK_WIDTH_SCALE: f32 = 0.9;
 const ROUTE_LINE_MIN_CORRIDOR_GAP: f32 = 4.2;
 const ROUTE_LINE_EDGE_TAPER: f32 = 0.92;
 const ENABLE_PARALLEL_ROUTE_GEOMETRY: bool = false;
@@ -112,6 +107,91 @@ const SOCKET_MANTLE_ENTRY: SocketMask = 1 << 1;
 const SOCKET_WALLRUN_READY: SocketMask = 1 << 2;
 const SOCKET_HAZARD_BRANCH: SocketMask = 1 << 3;
 const SOCKET_SHORTCUT_ANCHOR: SocketMask = 1 << 4;
+
+#[derive(SystemSet, Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum BasicGameUpdateSet {
+    Input,
+    Progress,
+    Streaming,
+    Presentation,
+    Requests,
+}
+
+#[derive(SystemSet, Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum BasicGameFixedSet {
+    Environment,
+}
+
+struct BasicGamePlugin;
+
+impl Plugin for BasicGamePlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(ClearColor(Color::srgb(0.07, 0.078, 0.15)))
+            .insert_resource(RunDirector::default())
+            .insert_resource(WorldAssetCache::default())
+            .insert_resource(SubstepCount(PHYSICS_SUBSTEPS))
+            .insert_resource(NarrowPhaseConfig {
+                default_speculative_margin: 0.0,
+                contact_tolerance: 0.001,
+                match_contacts: true,
+            })
+            .configure_sets(
+                Update,
+                (
+                    BasicGameUpdateSet::Input,
+                    BasicGameUpdateSet::Progress,
+                    BasicGameUpdateSet::Streaming,
+                    BasicGameUpdateSet::Presentation,
+                    BasicGameUpdateSet::Requests,
+                )
+                    .chain(),
+            )
+            .configure_sets(Update, BasicGameUpdateSet::Requests.after(BasicGameUpdateSet::Input))
+            .configure_sets(FixedUpdate, BasicGameFixedSet::Environment)
+            .add_systems(Startup, (setup_scene, setup_hud).chain())
+            .add_systems(
+                PostStartup,
+                (tune_player_camera, configure_controls_overlay).chain(),
+            )
+            .add_systems(
+                Update,
+                (
+                    capture_cursor
+                        .run_if(input_just_pressed(MouseButton::Left))
+                        .in_set(BasicGameUpdateSet::Input),
+                    release_cursor
+                        .run_if(input_just_pressed(KeyCode::Escape))
+                        .in_set(BasicGameUpdateSet::Input),
+                    tick_run_timer.in_set(BasicGameUpdateSet::Progress),
+                    queue_run_controls.in_set(BasicGameUpdateSet::Input),
+                    activate_checkpoints.in_set(BasicGameUpdateSet::Progress),
+                    detect_summit_completion.in_set(BasicGameUpdateSet::Progress),
+                    detect_failures.in_set(BasicGameUpdateSet::Progress),
+                    animate_sky_decor.in_set(BasicGameUpdateSet::Presentation),
+                    evolve_atmosphere_with_progress.in_set(BasicGameUpdateSet::Presentation),
+                    stream_world_chunks.in_set(BasicGameUpdateSet::Streaming),
+                    update_hud.in_set(BasicGameUpdateSet::Presentation),
+                    process_run_request.in_set(BasicGameUpdateSet::Requests),
+                ),
+            )
+            .add_systems(
+                FixedUpdate,
+                (
+                    move_movers,
+                    update_crumbling_platforms,
+                    apply_wind,
+                )
+                    .in_set(BasicGameFixedSet::Environment),
+            )
+            .add_systems(
+                FixedPostUpdate,
+                (
+                    normalize_surfing_motion.before(AhoySystems::MoveCharacters),
+                    apply_wall_run.after(AhoySystems::MoveCharacters),
+                ),
+            );
+    }
+}
 
 fn main() -> AppExit {
     App::new()
@@ -137,50 +217,9 @@ fn main() -> AppExit {
             EnhancedInputPlugin,
             AhoyPlugins::default(),
             ExampleUtilPlugin,
+            BasicGamePlugin,
         ))
         .add_input_context::<PlayerInput>()
-        .insert_resource(ClearColor(Color::srgb(0.07, 0.078, 0.15)))
-        .insert_resource(RunDirector::default())
-        .insert_resource(WorldAssetCache::default())
-        .insert_resource(SubstepCount(PHYSICS_SUBSTEPS))
-        .insert_resource(NarrowPhaseConfig {
-            default_speculative_margin: 0.0,
-            contact_tolerance: 0.001,
-            match_contacts: true,
-        })
-        .add_systems(Startup, (setup_scene, setup_hud).chain())
-        .add_systems(
-            PostStartup,
-            (tune_player_camera, configure_controls_overlay).chain(),
-        )
-        .add_systems(
-            Update,
-            (
-                capture_cursor.run_if(input_just_pressed(MouseButton::Left)),
-                release_cursor.run_if(input_just_pressed(KeyCode::Escape)),
-                tick_run_timer,
-                queue_run_controls,
-                activate_checkpoints,
-                detect_summit_completion,
-                detect_failures,
-                animate_sky_decor,
-                evolve_atmosphere_with_progress,
-                stream_world_chunks,
-                update_hud,
-                process_run_request,
-            ),
-        )
-        .add_systems(
-            FixedUpdate,
-            (move_movers, update_crumbling_platforms, apply_wind),
-        )
-        .add_systems(
-            FixedPostUpdate,
-            (
-                normalize_surfing_motion.before(AhoySystems::MoveCharacters),
-                apply_wall_run.after(AhoySystems::MoveCharacters),
-            ),
-        )
         .run()
 }
 
@@ -252,8 +291,6 @@ fn setup_scene(
     let initial_look = respawn_look_for_checkpoint(&blueprint, 0);
     let snapshot = spawn_run_world(
         &blueprint,
-        &HashSet::default(),
-        &HashSet::default(),
         0,
         &mut commands,
         &mut meshes,
@@ -396,11 +433,7 @@ fn update_hud(
 
     let current_height = player.translation.y;
     let speed = velocity.length();
-    let start_height = run
-        .checkpoints
-        .first()
-        .map(|checkpoint| checkpoint.y)
-        .unwrap_or(current_height);
+    let start_height = run.start_height();
     let descended = (start_height - current_height).max(0.0);
     let elapsed = run.timer.elapsed_secs();
 
@@ -412,28 +445,25 @@ fn update_hud(
          Speed: {speed:.1} u/s\n\
          Time: {elapsed:.1}s | Deaths: {deaths}\n\
          Gen: attempts {attempts}, repairs {repairs}, overlaps {overlaps}, clearance {clearance}, reach {reach}",
-        seed = run.seed,
-        floors = run.floors,
+        seed = run.blueprint.seed,
+        floors = run.blueprint.rooms.len(),
         checkpoint = run.current_checkpoint + 1,
-        checkpoint_total = run.checkpoints.len(),
+        checkpoint_total = run.checkpoint_count(),
         height = current_height,
         descended = descended,
         speed = speed,
         elapsed = elapsed,
         deaths = run.deaths,
-        attempts = run.stats.attempts,
-        repairs = run.stats.repairs,
-        overlaps = run.stats.overlap_issues,
-        clearance = run.stats.clearance_issues,
-        reach = run.stats.reachability_issues,
+        attempts = run.blueprint.stats.attempts,
+        repairs = run.blueprint.stats.repairs,
+        overlaps = run.blueprint.stats.overlap_issues,
+        clearance = run.blueprint.stats.clearance_issues,
+        reach = run.blueprint.stats.reachability_issues,
     );
 }
 
 fn run_descent_progress(run: &RunState, current_height: f32) -> f32 {
-    let start_height = run
-        .checkpoints
-        .first()
-        .map_or(current_height, |checkpoint| checkpoint.y);
+    let start_height = run.start_height().max(current_height);
     ((start_height - current_height) / ATMOSPHERE_PROGRESS_DEPTH).clamp(0.0, 1.0)
 }
 
@@ -666,7 +696,7 @@ fn queue_run_controls(
     if keys.just_pressed(KeyCode::F5) {
         director.pending = Some(RunRequest {
             kind: RunRequestKind::RestartSameSeed,
-            seed: run.seed,
+            seed: run.blueprint.seed,
         });
     } else if keys.just_pressed(KeyCode::KeyN) {
         director.pending = Some(RunRequest {
@@ -694,73 +724,13 @@ fn activate_checkpoints(
         if delta.y.abs() < 2.0 && delta.xz().length() <= CHECKPOINT_RADIUS {
             if checkpoint.index > run.current_checkpoint {
                 run.current_checkpoint = checkpoint.index;
-                if let Some(spawn) = run.checkpoints.get(checkpoint.index).copied() {
-                    spawn_marker.translation = spawn;
-                    spawn_marker.rotation =
-                        respawn_look_for_checkpoint(&run.blueprint, checkpoint.index).to_quat();
-                }
-                run.death_plane = checkpoint_death_plane(
-                    &run.blueprint,
-                    &run.checkpoints,
-                    checkpoint.index,
-                    checkpoint.index,
-                );
+                let spawn = run.checkpoint_position(checkpoint.index);
+                spawn_marker.translation = spawn;
+                spawn_marker.rotation =
+                    respawn_look_for_checkpoint(&run.blueprint, checkpoint.index).to_quat();
+                run.death_plane =
+                    checkpoint_death_plane(&run.blueprint, checkpoint.index, checkpoint.index);
             }
-        }
-    }
-}
-
-fn collect_treasures(
-    mut commands: Commands,
-    players: Query<&Transform, With<Player>>,
-    treasures: Query<(Entity, &Transform, &TreasurePickup)>,
-    mut run: ResMut<RunState>,
-) {
-    let Ok(player) = players.single() else {
-        return;
-    };
-
-    for (entity, transform, pickup) in &treasures {
-        if run.collected_treasures.contains(&pickup.id) {
-            continue;
-        }
-        if transform.translation.distance(player.translation) <= TREASURE_PICKUP_RADIUS {
-            run.collected_treasures.insert(pickup.id);
-            commands.entity(entity).despawn();
-        }
-    }
-}
-
-fn activate_shortcuts(
-    players: Query<&Transform, With<Player>>,
-    triggers: Query<(&Transform, &ShortcutTrigger)>,
-    mut run: ResMut<RunState>,
-) {
-    let Ok(player) = players.single() else {
-        return;
-    };
-
-    for (transform, trigger) in &triggers {
-        if run.unlocked_shortcuts.contains(&trigger.id) {
-            continue;
-        }
-        if transform.translation.distance(player.translation) <= SHORTCUT_TRIGGER_RADIUS {
-            run.unlocked_shortcuts.insert(trigger.id);
-        }
-    }
-}
-
-fn sync_shortcut_bridges(
-    mut commands: Commands,
-    run: Res<RunState>,
-    bridges: Query<(Entity, &ShortcutBridge, Option<&Collider>)>,
-) {
-    for (entity, bridge, collider) in &bridges {
-        if run.unlocked_shortcuts.contains(&bridge.id) && collider.is_none() {
-            commands.entity(entity).insert((
-                Collider::cuboid(bridge.size.x, bridge.size.y, bridge.size.z),
-                CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
-            ));
         }
     }
 }
@@ -804,7 +774,7 @@ fn detect_failures(
     if transform.translation.y < run.death_plane {
         director.pending = Some(RunRequest {
             kind: RunRequestKind::Respawn,
-            seed: run.seed,
+            seed: run.blueprint.seed,
         });
         return;
     }
@@ -816,23 +786,18 @@ fn detect_failures(
     {
         director.pending = Some(RunRequest {
             kind: RunRequestKind::Respawn,
-            seed: run.seed,
+            seed: run.blueprint.seed,
         });
     }
 }
 
 fn checkpoint_death_plane(
     blueprint: &RunBlueprint,
-    checkpoints: &[Vec3],
     checkpoint_index: usize,
     focus_room: usize,
 ) -> f32 {
     let Some(last_room) = blueprint.rooms.len().checked_sub(1) else {
-        return checkpoints
-            .get(checkpoint_index)
-            .or_else(|| checkpoints.last())
-            .map(|checkpoint| checkpoint.y - CHECKPOINT_DEATH_MARGIN)
-            .unwrap_or(-CHECKPOINT_DEATH_MARGIN);
+        return blueprint.spawn.y - CHECKPOINT_DEATH_MARGIN;
     };
 
     let checkpoint_room = checkpoint_index.min(last_room);
@@ -867,12 +832,7 @@ fn stream_world_chunks(
         .map(|player| stream_focus_room(&run.blueprint, run.current_checkpoint, player.translation))
         .unwrap_or(run.current_checkpoint);
     ensure_blueprint_ahead(&mut run, focus_room);
-    run.death_plane = checkpoint_death_plane(
-        &run.blueprint,
-        &run.checkpoints,
-        run.current_checkpoint,
-        focus_room,
-    );
+    run.death_plane = checkpoint_death_plane(&run.blueprint, run.current_checkpoint, focus_room);
     let desired_order = desired_chunk_window(&run.blueprint, focus_room);
     let desired_chunks = desired_order.iter().copied().collect::<HashSet<_>>();
     if desired_chunks == run.spawned_chunks {
@@ -890,8 +850,6 @@ fn stream_world_chunks(
             spawn_chunk(
                 chunk,
                 &run.blueprint,
-                &run.collected_treasures,
-                &run.unlocked_shortcuts,
                 &mut commands,
                 &mut meshes,
                 &mut materials,
@@ -958,8 +916,6 @@ fn process_run_request(
             }
             let snapshot = respawn_active_chunks(
                 &run.blueprint,
-                &run.collected_treasures,
-                &run.unlocked_shortcuts,
                 run.current_checkpoint,
                 &mut commands,
                 &mut meshes,
@@ -974,18 +930,13 @@ fn process_run_request(
             }
 
             let blueprint = build_run_blueprint(request.seed);
-            run.seed = request.seed;
             run.timer = Stopwatch::new();
             run.finished = false;
             run.deaths = 0;
             run.current_checkpoint = 0;
-            run.collected_treasures.clear();
-            run.unlocked_shortcuts.clear();
 
             let snapshot = spawn_run_world(
                 &blueprint,
-                &run.collected_treasures,
-                &run.unlocked_shortcuts,
                 0,
                 &mut commands,
                 &mut meshes,
@@ -997,11 +948,7 @@ fn process_run_request(
         }
     }
 
-    let spawn = run
-        .checkpoints
-        .get(run.current_checkpoint)
-        .copied()
-        .unwrap_or(run.blueprint.spawn);
+    let spawn = run.checkpoint_position(run.current_checkpoint);
     let respawn_look = respawn_look_for_checkpoint(&run.blueprint, run.current_checkpoint);
     spawn_marker.translation = spawn;
     spawn_marker.rotation = respawn_look.to_quat();
@@ -1126,22 +1073,6 @@ struct CheckpointPad {
 struct SummitGoal;
 
 #[derive(Component)]
-struct TreasurePickup {
-    id: u64,
-}
-
-#[derive(Component)]
-struct ShortcutTrigger {
-    id: u64,
-}
-
-#[derive(Component)]
-struct ShortcutBridge {
-    id: u64,
-    size: Vec3,
-}
-
-#[derive(Component)]
 struct WindZone {
     size: Vec3,
     direction: Vec3,
@@ -1202,7 +1133,6 @@ enum RunRequestKind {
 enum WorldChunkKey {
     Room(usize),
     Segment(usize),
-    Branch(usize),
     Summit,
 }
 
@@ -1239,91 +1169,67 @@ struct WorldAssetCache {
 
 #[derive(Resource)]
 struct RunState {
-    seed: u64,
     blueprint: RunBlueprint,
-    floors: usize,
-    summit: Vec3,
     death_plane: f32,
-    checkpoints: Vec<Vec3>,
     current_checkpoint: usize,
     deaths: u32,
     timer: Stopwatch,
     finished: bool,
-    total_treasures: usize,
-    collected_treasures: HashSet<u64>,
-    unlocked_shortcuts: HashSet<u64>,
     spawned_chunks: HashSet<WorldChunkKey>,
-    stats: GenerationStats,
 }
 
 impl RunState {
     fn new(blueprint: &RunBlueprint, snapshot: RunSnapshot) -> Self {
-        let mut state = Self {
-            seed: blueprint.seed,
+        Self {
             blueprint: blueprint.clone(),
-            floors: blueprint.rooms.len(),
-            summit: blueprint.summit,
-            death_plane: checkpoint_death_plane(blueprint, &snapshot.checkpoints, 0, 0),
-            checkpoints: snapshot.checkpoints,
+            death_plane: checkpoint_death_plane(blueprint, 0, 0),
             current_checkpoint: 0,
             deaths: 0,
             timer: Stopwatch::new(),
             finished: false,
-            total_treasures: snapshot.total_treasures,
-            collected_treasures: HashSet::default(),
-            unlocked_shortcuts: HashSet::default(),
             spawned_chunks: snapshot.active_chunks,
-            stats: blueprint.stats.clone(),
-        };
-        if state.checkpoints.is_empty() {
-            state.checkpoints.push(blueprint.spawn);
-            state.death_plane = checkpoint_death_plane(blueprint, &state.checkpoints, 0, 0);
         }
-        state
     }
 
     fn apply_blueprint(&mut self, blueprint: &RunBlueprint, snapshot: RunSnapshot) {
-        self.seed = blueprint.seed;
         self.blueprint = blueprint.clone();
-        self.floors = blueprint.rooms.len();
-        self.summit = blueprint.summit;
-        self.checkpoints = snapshot.checkpoints;
-        self.total_treasures = snapshot.total_treasures;
         self.spawned_chunks = snapshot.active_chunks;
-        self.stats = blueprint.stats.clone();
-        if self.current_checkpoint >= self.checkpoints.len() {
-            self.current_checkpoint = self.checkpoints.len().saturating_sub(1);
-        }
-        self.death_plane = checkpoint_death_plane(
-            &self.blueprint,
-            &self.checkpoints,
-            self.current_checkpoint,
-            self.current_checkpoint,
-        );
+        self.current_checkpoint = self.current_checkpoint.min(self.last_checkpoint_index());
+        self.death_plane =
+            checkpoint_death_plane(&self.blueprint, self.current_checkpoint, self.current_checkpoint);
     }
 
     fn sync_generated_geometry(&mut self) {
-        self.floors = self.blueprint.rooms.len();
-        self.summit = self.blueprint.summit;
-        self.checkpoints = self
-            .blueprint
+        self.current_checkpoint = self.current_checkpoint.min(self.last_checkpoint_index());
+        self.death_plane =
+            checkpoint_death_plane(&self.blueprint, self.current_checkpoint, self.current_checkpoint);
+    }
+
+    fn checkpoint_count(&self) -> usize {
+        self.blueprint
             .rooms
             .iter()
             .filter(|room| room.checkpoint_slot.is_some())
+            .count()
+            .max(1)
+    }
+
+    fn checkpoint_position(&self, checkpoint_index: usize) -> Vec3 {
+        self.blueprint
+            .rooms
+            .iter()
+            .filter(|room| room.checkpoint_slot.is_some())
+            .nth(checkpoint_index)
             .map(|room| room.top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0))
-            .collect();
-        if self.checkpoints.is_empty() {
-            self.checkpoints.push(self.blueprint.spawn);
-        }
-        self.current_checkpoint = self
-            .current_checkpoint
-            .min(self.checkpoints.len().saturating_sub(1));
-        self.death_plane = checkpoint_death_plane(
-            &self.blueprint,
-            &self.checkpoints,
-            self.current_checkpoint,
-            self.current_checkpoint,
-        );
+            .unwrap_or(self.blueprint.spawn)
+    }
+
+    fn last_checkpoint_index(&self) -> usize {
+        self.checkpoint_count().saturating_sub(1)
+    }
+
+    fn start_height(&self) -> f32 {
+        self.checkpoint_position(0).y
     }
 }
 
@@ -1699,12 +1605,19 @@ fn animate_sky_decor(time: Res<Time>, mut decor: Query<(&mut Transform, &SkyDrif
 }
 
 #[derive(Clone)]
-struct RunBlueprint {
+struct CourseGraph {
     seed: u64,
-    floors: usize,
     rooms: Vec<RoomPlan>,
     segments: Vec<SegmentPlan>,
-    branches: Vec<BranchPlan>,
+    zones: Vec<ZonePlan>,
+    zone_edges: Vec<ZoneEdge>,
+}
+
+#[derive(Clone)]
+struct RunBlueprint {
+    seed: u64,
+    rooms: Vec<RoomPlan>,
+    segments: Vec<SegmentPlan>,
     zones: Vec<ZonePlan>,
     zone_edges: Vec<ZoneEdge>,
     spawn: Vec3,
@@ -1744,21 +1657,7 @@ struct SegmentPlan {
     flow: FlowFieldProfile,
     route_lines: Vec<RouteLine>,
     zone_local_t: f32,
-    shortcut_id: Option<u64>,
     exit_socket: SocketMask,
-}
-
-#[derive(Clone)]
-struct BranchPlan {
-    room_index: usize,
-    dir: Vec3,
-    top: Vec3,
-    size: Vec2,
-    theme: Theme,
-    kind: BranchKind,
-    seed: u64,
-    treasure_id: Option<u64>,
-    shortcut_id: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -1766,7 +1665,6 @@ struct GenerationStats {
     attempts: u32,
     repairs: u32,
     downgraded_segments: u32,
-    pruned_branches: u32,
     overlap_issues: usize,
     clearance_issues: usize,
     reachability_issues: usize,
@@ -1789,14 +1687,6 @@ enum ModuleKind {
     WindTunnel,
     IceSpine,
     WaterGarden,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BranchKind {
-    TreasureAlcove,
-    PropCache,
-    ShortcutLever,
-    RiskDetour,
 }
 
 #[derive(Clone, Copy)]
@@ -1871,7 +1761,6 @@ struct ModuleTemplate {
     max_rise: f32,
     min_gap: f32,
     max_gap: f32,
-    shortcut_eligible: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1950,7 +1839,6 @@ struct ZonePlan {
     exit_connector: ConnectorKind,
     landmark: LandmarkKind,
     route_lines: Vec<RouteLine>,
-    branch_targets: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -1965,7 +1853,6 @@ struct ZoneEdge {
 enum OwnerTag {
     Room(usize),
     Segment(usize),
-    Branch(usize),
     Summit,
 }
 
@@ -2014,10 +1901,6 @@ enum SolidBody {
         delay: f32,
         sink_speed: f32,
     },
-    ShortcutBridge {
-        id: u64,
-        active: bool,
-    },
 }
 
 #[derive(Clone, Copy)]
@@ -2025,8 +1908,6 @@ enum ExtraKind {
     None,
     Checkpoint { index: usize },
     SummitGoal,
-    Treasure { id: u64 },
-    ShortcutTrigger { id: u64 },
 }
 
 #[derive(Clone)]
@@ -2051,10 +1932,8 @@ enum PaintStyle {
     ThemeFloor(Theme),
     ThemeAccent(Theme),
     ThemeShadow(Theme),
-    Prop(Theme),
     Summit,
     Checkpoint,
-    Treasure,
     Hazard,
     Shortcut,
     Ice,
@@ -2076,8 +1955,6 @@ struct ModuleLayout {
 }
 
 struct RunSnapshot {
-    checkpoints: Vec<Vec3>,
-    total_treasures: usize,
     active_chunks: HashSet<WorldChunkKey>,
 }
 
@@ -2135,7 +2012,7 @@ fn biome_theme(biome: BiomeStyle, fallback_index: usize, total: usize, offset: u
     }
 }
 
-fn choose_zone_role(rng: &mut RunRng, zone_index: usize, previous: Option<ZoneRole>) -> ZoneRole {
+fn choose_zone_role(_rng: &mut RunRng, zone_index: usize, _previous: Option<ZoneRole>) -> ZoneRole {
     if zone_index == 0 {
         return ZoneRole::Accelerator;
     }
@@ -2146,34 +2023,7 @@ fn choose_zone_role(rng: &mut RunRng, zone_index: usize, previous: Option<ZoneRo
         ZoneRole::Recovery,
         ZoneRole::Spectacle,
     ];
-    let base = cycle[zone_index % cycle.len()];
-    let alternatives = match base {
-        ZoneRole::Accelerator => vec![
-            (ZoneRole::Accelerator, 8_u32),
-            (ZoneRole::Spectacle, 2),
-            (ZoneRole::Technical, 1),
-        ],
-        ZoneRole::Technical => vec![
-            (ZoneRole::Technical, 8_u32),
-            (ZoneRole::Accelerator, 2),
-            (ZoneRole::Recovery, 2),
-        ],
-        ZoneRole::Recovery => vec![
-            (ZoneRole::Recovery, 8_u32),
-            (ZoneRole::Spectacle, 2),
-            (ZoneRole::Accelerator, 1),
-        ],
-        ZoneRole::Spectacle => vec![
-            (ZoneRole::Spectacle, 8_u32),
-            (ZoneRole::Accelerator, 2),
-            (ZoneRole::Recovery, 1),
-        ],
-    };
-    let mut role = rng.weighted_choice(&alternatives);
-    if previous == Some(role) && rng.chance(0.45) {
-        role = base;
-    }
-    role
+    cycle[zone_index % cycle.len()]
 }
 
 fn choose_zone_signature(
@@ -2774,7 +2624,6 @@ fn push_zone_plan(
         exit_connector,
         landmark: choose_landmark_kind(rng, role, signature),
         route_lines: major_zone_route_lines(role, signature),
-        branch_targets: Vec::new(),
     });
     index
 }
@@ -2785,24 +2634,6 @@ fn finalize_zone_ranges(zones: &mut [ZonePlan], segment_len: usize) {
     };
     for zone in zones {
         zone.end_segment = zone.end_segment.min(last_segment);
-    }
-}
-
-fn populate_zone_branch_targets(
-    zones: &mut [ZonePlan],
-    rooms: &[RoomPlan],
-    branches: &[BranchPlan],
-) {
-    for zone in zones.iter_mut() {
-        zone.branch_targets.clear();
-    }
-    for branch in branches {
-        let Some(room) = rooms.get(branch.room_index) else {
-            continue;
-        };
-        if let Some(zone) = zones.get_mut(room.zone_index) {
-            zone.branch_targets.push(branch.room_index);
-        }
     }
 }
 
@@ -3258,7 +3089,8 @@ fn build_run_blueprint(seed: u64) -> RunBlueprint {
 
     for attempt in 0..18 {
         let mut rng = RunRng::new(seed ^ (attempt as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let mut blueprint = draft_run_blueprint(seed, &mut rng);
+        let graph = draft_course_graph(seed, &mut rng);
+        let mut blueprint = compile_course_graph(graph);
         let repair_stats = repair_run_blueprint(&mut blueprint, &mut rng);
         force_first_segment_to_surf(&mut blueprint);
         let validation = validate_run_blueprint(&blueprint);
@@ -3266,18 +3098,13 @@ fn build_run_blueprint(seed: u64) -> RunBlueprint {
         blueprint.stats.attempts = attempt + 1;
         blueprint.stats.repairs = repair_stats.repairs;
         blueprint.stats.downgraded_segments = repair_stats.downgraded_segments;
-        blueprint.stats.pruned_branches = repair_stats.pruned_branches;
         blueprint.stats.overlap_issues = validation.overlap_issues;
         blueprint.stats.clearance_issues = validation.clearance_issues;
         blueprint.stats.reachability_issues = validation.reachability_issues;
 
         let score = validation.overlap_issues * 10
             + validation.clearance_issues * 8
-            + validation.reachability_issues * 6
-            + blueprint
-                .branches
-                .len()
-                .saturating_sub(repair_stats.pruned_branches as usize);
+            + validation.reachability_issues * 6;
 
         if validation.overlap_issues == 0
             && validation.clearance_issues == 0
@@ -3299,17 +3126,15 @@ fn build_run_blueprint(seed: u64) -> RunBlueprint {
 struct RepairStats {
     repairs: u32,
     downgraded_segments: u32,
-    pruned_branches: u32,
 }
 
-fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
+fn draft_course_graph(seed: u64, rng: &mut RunRng) -> CourseGraph {
     let floors = rng.range_usize(34, 49);
     let mut rooms = Vec::with_capacity(floors);
     let mut segments = Vec::with_capacity(floors.saturating_sub(1));
     let mut zones = Vec::new();
     let mut zone_edges = Vec::new();
     let mut occupied_rooms: HashSet<IVec2> = HashSet::default();
-    let mut occupied_branches = HashSet::default();
     let theme_offset = (rng.next_u64() % 4) as usize;
 
     let mut current_socket = SOCKET_SAFE_REST;
@@ -3496,7 +3321,6 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
             seed: rng.next_u64(),
             zone_role: active_zone.role,
             zone_signature: active_zone.signature,
-            shortcut_id: None,
             exit_socket: template.exit,
             zone_index: active_zone_index,
             biome: active_zone.biome,
@@ -3515,28 +3339,34 @@ fn draft_run_blueprint(seed: u64, rng: &mut RunRng) -> RunBlueprint {
     }
 
     finalize_zone_ranges(&mut zones, segments.len());
-    let branches =
-        generate_side_branches(seed, rng, &rooms, &segments, &zones, &mut occupied_branches);
-    let spawn = rooms[0].top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, rooms[0].size.y * 0.18);
-    let summit = rooms.last().unwrap().top + Vec3::new(0.0, 1.4, 0.0);
-    let death_plane = rooms.last().unwrap().top.y - 90.0;
-
-    let mut blueprint = RunBlueprint {
+    CourseGraph {
         seed,
-        floors,
         rooms,
         segments,
-        branches,
-        spawn,
-        summit,
-        death_plane,
-        stats: GenerationStats::default(),
         zones,
         zone_edges,
+    }
+}
+
+fn compile_course_graph(graph: CourseGraph) -> RunBlueprint {
+    let mut blueprint = RunBlueprint {
+        seed: graph.seed,
+        spawn: graph.rooms[0].top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, graph.rooms[0].size.y * 0.18),
+        summit: graph.rooms.last().unwrap().top + Vec3::new(0.0, 1.4, 0.0),
+        death_plane: graph.rooms.last().unwrap().top.y - 90.0,
+        rooms: graph.rooms,
+        segments: graph.segments,
+        zones: graph.zones,
+        zone_edges: graph.zone_edges,
+        stats: GenerationStats::default(),
     };
-    populate_zone_branch_targets(&mut blueprint.zones, &blueprint.rooms, &blueprint.branches);
     force_first_segment_to_surf(&mut blueprint);
     blueprint
+}
+
+fn build_course_graph(seed: u64) -> CourseGraph {
+    let mut rng = RunRng::new(seed ^ 0x9E37_79B9_7F4A_7C15);
+    draft_course_graph(seed, &mut rng)
 }
 
 fn repair_run_blueprint(blueprint: &mut RunBlueprint, rng: &mut RunRng) -> RepairStats {
@@ -3579,12 +3409,6 @@ fn repair_run_blueprint(blueprint: &mut RunBlueprint, rng: &mut RunRng) -> Repai
         }
 
         if let Some((a, b)) = validation.first_overlap.or(validation.first_clearance) {
-            if prune_branch_owner(blueprint, a) || prune_branch_owner(blueprint, b) {
-                stats.repairs += 1;
-                stats.pruned_branches += 1;
-                continue;
-            }
-
             if spread_room_owner(blueprint, a, 10.0) || spread_room_owner(blueprint, b, 10.0) {
                 stats.repairs += 1;
                 continue;
@@ -3618,8 +3442,8 @@ fn repair_run_blueprint(blueprint: &mut RunBlueprint, rng: &mut RunRng) -> Repai
 
 fn fallback_blueprint(seed: u64) -> RunBlueprint {
     let mut rng = RunRng::new(seed ^ 0xFEED_FACE_CAFE_BEEF);
-    let mut blueprint = draft_run_blueprint(seed, &mut rng);
-    blueprint.branches.clear();
+    let graph = draft_course_graph(seed, &mut rng);
+    let mut blueprint = compile_course_graph(graph);
     for segment in &mut blueprint.segments {
         segment.kind = if segment.difficulty > 0.55 {
             ModuleKind::SurfRamp
@@ -3627,7 +3451,6 @@ fn fallback_blueprint(seed: u64) -> RunBlueprint {
             ModuleKind::StairRun
         };
         segment.exit_socket = module_template(segment.kind).exit;
-        segment.shortcut_id = None;
     }
     force_first_segment_to_surf(&mut blueprint);
     let validation = validate_run_blueprint(&blueprint);
@@ -3644,7 +3467,6 @@ fn force_first_segment_to_surf(blueprint: &mut RunBlueprint) {
     };
     first_segment.kind = ModuleKind::SurfRamp;
     first_segment.exit_socket = module_template(ModuleKind::SurfRamp).exit;
-    first_segment.shortcut_id = None;
 
     if let Some(first_room) = blueprint.rooms.get_mut(0) {
         first_room.section = RoomSectionKind::OpenPad;
@@ -3702,11 +3524,6 @@ fn append_run_blueprint(blueprint: &mut RunBlueprint, additional_rooms: usize) {
         .rooms
         .iter()
         .map(|room| room.cell)
-        .collect::<HashSet<_>>();
-    let mut occupied_branches = blueprint
-        .branches
-        .iter()
-        .map(|branch| room_grid_cell(branch.top))
         .collect::<HashSet<_>>();
 
     let mut rng =
@@ -3878,7 +3695,6 @@ fn append_run_blueprint(blueprint: &mut RunBlueprint, additional_rooms: usize) {
             seed: rng.next_u64(),
             zone_role: active_zone.role,
             zone_signature: active_zone.signature,
-            shortcut_id: None,
             exit_socket: template.exit,
             zone_index: active_zone_index,
             biome: active_zone.biome,
@@ -3901,19 +3717,7 @@ fn append_run_blueprint(blueprint: &mut RunBlueprint, additional_rooms: usize) {
         blueprint.segments.push(segment);
     }
 
-    let new_branches = generate_side_branches_in_range(
-        &mut rng,
-        &blueprint.rooms,
-        &blueprint.segments,
-        &blueprint.zones,
-        &mut occupied_branches,
-        start_index,
-        blueprint.rooms.len().saturating_sub(1),
-    );
-    blueprint.branches.extend(new_branches);
     finalize_zone_ranges(&mut blueprint.zones, blueprint.segments.len());
-    populate_zone_branch_targets(&mut blueprint.zones, &blueprint.rooms, &blueprint.branches);
-    blueprint.floors = blueprint.rooms.len();
     if let Some(last_room) = blueprint.rooms.last() {
         blueprint.summit = last_room.top + Vec3::Y * 1.4;
         blueprint.death_plane = last_room.top.y - 90.0;
@@ -3942,39 +3746,6 @@ fn choose_room_section(
     }
 }
 
-fn generate_side_branches(
-    _seed: u64,
-    rng: &mut RunRng,
-    rooms: &[RoomPlan],
-    segments: &[SegmentPlan],
-    zones: &[ZonePlan],
-    occupied_branches: &mut HashSet<IVec2>,
-) -> Vec<BranchPlan> {
-    let _ = (rng, rooms, segments, zones, occupied_branches);
-    Vec::new()
-}
-
-fn generate_side_branches_in_range(
-    rng: &mut RunRng,
-    rooms: &[RoomPlan],
-    segments: &[SegmentPlan],
-    zones: &[ZonePlan],
-    occupied_branches: &mut HashSet<IVec2>,
-    start_room: usize,
-    end_room: usize,
-) -> Vec<BranchPlan> {
-    let _ = (
-        rng,
-        rooms,
-        segments,
-        zones,
-        occupied_branches,
-        start_room,
-        end_room,
-    );
-    Vec::new()
-}
-
 fn validate_run_blueprint(blueprint: &RunBlueprint) -> ValidationOutcome {
     let mut volumes = Vec::new();
     let mut clearances = Vec::new();
@@ -3986,12 +3757,7 @@ fn validate_run_blueprint(blueprint: &RunBlueprint) -> ValidationOutcome {
         collect_layout_validation(&layout, &mut volumes, &mut clearances);
     }
     for segment in &blueprint.segments {
-        let layout = build_segment_layout(segment, &blueprint.rooms, &HashSet::default());
-        collect_internal_route_line_overlaps(&layout, &mut outcome);
-        collect_layout_validation(&layout, &mut volumes, &mut clearances);
-    }
-    for (index, branch) in blueprint.branches.iter().enumerate() {
-        let layout = build_branch_layout(index, branch, &blueprint.rooms, &HashSet::default());
+        let layout = build_segment_layout(segment, &blueprint.rooms);
         collect_internal_route_line_overlaps(&layout, &mut outcome);
         collect_layout_validation(&layout, &mut volumes, &mut clearances);
     }
@@ -4102,8 +3868,7 @@ impl SolidSpec {
             | SolidBody::StaticSphere
             | SolidBody::StaticCylinder
             | SolidBody::StaticTrapezoid { .. }
-            | SolidBody::Crumbling { .. }
-            | SolidBody::ShortcutBridge { .. } => self.size,
+            | SolidBody::Crumbling { .. } => self.size,
             SolidBody::StaticSurfWedge { render_points, .. } => {
                 if render_points.is_empty() {
                     return None;
@@ -4153,17 +3918,6 @@ impl SolidSpec {
     }
 }
 
-fn prune_branch_owner(blueprint: &mut RunBlueprint, owner: OwnerTag) -> bool {
-    let OwnerTag::Branch(index) = owner else {
-        return false;
-    };
-    if index < blueprint.branches.len() {
-        blueprint.branches.remove(index);
-        return true;
-    }
-    false
-}
-
 fn downgrade_segment_owner(
     blueprint: &mut RunBlueprint,
     owner: OwnerTag,
@@ -4177,7 +3931,6 @@ fn downgrade_segment_owner(
     };
     segment.kind = safe_fallback_kind(segment.difficulty);
     segment.exit_socket = module_template(segment.kind).exit;
-    segment.shortcut_id = None;
     true
 }
 
@@ -4399,7 +4152,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 58.0,
             min_gap: 26.0,
             max_gap: 320.0,
-            shortcut_eligible: false,
         },
         ModuleKind::SurfRamp => ModuleTemplate {
             kind,
@@ -4412,7 +4164,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 150.0,
             min_gap: 40.0,
             max_gap: 520.0,
-            shortcut_eligible: false,
         },
         ModuleKind::WindowHop => ModuleTemplate {
             kind,
@@ -4425,7 +4176,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 34.0,
             min_gap: 20.0,
             max_gap: 88.0,
-            shortcut_eligible: false,
         },
         ModuleKind::PillarAirstrafe => ModuleTemplate {
             kind,
@@ -4438,7 +4188,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 48.0,
             min_gap: 24.0,
             max_gap: 128.0,
-            shortcut_eligible: false,
         },
         ModuleKind::HeadcheckRun => ModuleTemplate {
             kind,
@@ -4451,7 +4200,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 40.0,
             min_gap: 20.0,
             max_gap: 92.0,
-            shortcut_eligible: false,
         },
         ModuleKind::SpeedcheckRun => ModuleTemplate {
             kind,
@@ -4464,7 +4212,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 54.0,
             min_gap: 24.0,
             max_gap: 128.0,
-            shortcut_eligible: false,
         },
         ModuleKind::MovingPlatformRun => ModuleTemplate {
             kind,
@@ -4477,7 +4224,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 42.0,
             min_gap: 22.0,
             max_gap: 110.0,
-            shortcut_eligible: false,
         },
         ModuleKind::ShapeGauntlet => ModuleTemplate {
             kind,
@@ -4490,7 +4236,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 58.0,
             min_gap: 26.0,
             max_gap: 150.0,
-            shortcut_eligible: false,
         },
         ModuleKind::MantleStack => ModuleTemplate {
             kind,
@@ -4503,7 +4248,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 30.0,
             min_gap: 18.0,
             max_gap: 64.0,
-            shortcut_eligible: false,
         },
         ModuleKind::WallRunHall => ModuleTemplate {
             kind,
@@ -4516,7 +4260,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 40.0,
             min_gap: 20.0,
             max_gap: 90.0,
-            shortcut_eligible: true,
         },
         ModuleKind::LiftChasm => ModuleTemplate {
             kind,
@@ -4529,7 +4272,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 32.0,
             min_gap: 20.0,
             max_gap: 70.0,
-            shortcut_eligible: true,
         },
         ModuleKind::CrumbleBridge => ModuleTemplate {
             kind,
@@ -4542,7 +4284,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 40.0,
             min_gap: 18.0,
             max_gap: 96.0,
-            shortcut_eligible: true,
         },
         ModuleKind::WindTunnel => ModuleTemplate {
             kind,
@@ -4555,7 +4296,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 46.0,
             min_gap: 22.0,
             max_gap: 110.0,
-            shortcut_eligible: true,
         },
         ModuleKind::IceSpine => ModuleTemplate {
             kind,
@@ -4568,7 +4308,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 42.0,
             min_gap: 20.0,
             max_gap: 120.0,
-            shortcut_eligible: false,
         },
         ModuleKind::WaterGarden => ModuleTemplate {
             kind,
@@ -4581,7 +4320,6 @@ fn module_template(kind: ModuleKind) -> ModuleTemplate {
             max_rise: 26.0,
             min_gap: 18.0,
             max_gap: 52.0,
-            shortcut_eligible: false,
         },
     }
 }
@@ -4598,8 +4336,6 @@ fn safe_fallback_kind(difficulty: f32) -> ModuleKind {
 
 fn spawn_run_world(
     blueprint: &RunBlueprint,
-    collected_treasures: &HashSet<u64>,
-    unlocked_shortcuts: &HashSet<u64>,
     checkpoint_index: usize,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -4612,25 +4348,14 @@ fn spawn_run_world(
 
     let chunk_order = desired_chunk_window(blueprint, checkpoint_index);
     for chunk in &chunk_order {
-        spawn_chunk(
-            *chunk,
-            blueprint,
-            collected_treasures,
-            unlocked_shortcuts,
-            commands,
-            meshes,
-            materials,
-            asset_cache,
-        );
+        spawn_chunk(*chunk, blueprint, commands, meshes, materials, asset_cache);
     }
 
-    build_run_snapshot(blueprint, chunk_order.into_iter().collect())
+    build_run_snapshot(chunk_order.into_iter().collect())
 }
 
 fn respawn_active_chunks(
     blueprint: &RunBlueprint,
-    collected_treasures: &HashSet<u64>,
-    unlocked_shortcuts: &HashSet<u64>,
     checkpoint_index: usize,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -4639,35 +4364,14 @@ fn respawn_active_chunks(
 ) -> RunSnapshot {
     let chunk_order = desired_chunk_window(blueprint, checkpoint_index);
     for chunk in &chunk_order {
-        spawn_chunk(
-            *chunk,
-            blueprint,
-            collected_treasures,
-            unlocked_shortcuts,
-            commands,
-            meshes,
-            materials,
-            asset_cache,
-        );
+        spawn_chunk(*chunk, blueprint, commands, meshes, materials, asset_cache);
     }
 
-    build_run_snapshot(blueprint, chunk_order.into_iter().collect())
+    build_run_snapshot(chunk_order.into_iter().collect())
 }
 
-fn build_run_snapshot(
-    blueprint: &RunBlueprint,
-    active_chunks: HashSet<WorldChunkKey>,
-) -> RunSnapshot {
-    RunSnapshot {
-        checkpoints: blueprint
-            .rooms
-            .iter()
-            .filter(|room| room.checkpoint_slot.is_some())
-            .map(|room| room.top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0))
-            .collect(),
-        total_treasures: 0,
-        active_chunks,
-    }
+fn build_run_snapshot(active_chunks: HashSet<WorldChunkKey>) -> RunSnapshot {
+    RunSnapshot { active_chunks }
 }
 
 #[derive(Clone, Copy)]
@@ -4731,88 +4435,45 @@ fn desired_chunk_window(blueprint: &RunBlueprint, focus_room: usize) -> Vec<Worl
             chunks.push(WorldChunkKey::Segment(segment.index));
         }
     }
-    for (branch_index, branch) in blueprint.branches.iter().enumerate() {
-        if (window.start_room..=window.frontier_room).contains(&branch.room_index) {
-            chunks.push(WorldChunkKey::Branch(branch_index));
-        }
-    }
 
     chunks
+}
+
+fn build_chunk_layout(chunk: WorldChunkKey, blueprint: &RunBlueprint) -> Option<ModuleLayout> {
+    match chunk {
+        WorldChunkKey::Room(index) => blueprint.rooms.get(index).map(build_room_layout),
+        WorldChunkKey::Segment(index) => blueprint
+            .segments
+            .get(index)
+            .map(|segment| build_segment_layout(segment, &blueprint.rooms)),
+        WorldChunkKey::Summit => {
+            blueprint
+                .rooms
+                .last()
+                .map(|room| build_summit_layout(room, blueprint.summit))
+        }
+    }
 }
 
 fn spawn_chunk(
     chunk: WorldChunkKey,
     blueprint: &RunBlueprint,
-    collected_treasures: &HashSet<u64>,
-    unlocked_shortcuts: &HashSet<u64>,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     asset_cache: &mut WorldAssetCache,
 ) {
-    match chunk {
-        WorldChunkKey::Room(index) => {
-            if let Some(room) = blueprint.rooms.get(index) {
-                let layout = build_room_layout(room);
-                let _ = spawn_layout(
-                    &layout,
-                    collected_treasures,
-                    unlocked_shortcuts,
-                    Some(chunk),
-                    commands,
-                    meshes,
-                    materials,
-                    asset_cache,
-                );
-            }
-        }
-        WorldChunkKey::Segment(index) => {
-            if let Some(segment) = blueprint.segments.get(index) {
-                let layout = build_segment_layout(segment, &blueprint.rooms, unlocked_shortcuts);
-                let _ = spawn_layout(
-                    &layout,
-                    collected_treasures,
-                    unlocked_shortcuts,
-                    Some(chunk),
-                    commands,
-                    meshes,
-                    materials,
-                    asset_cache,
-                );
-            }
-        }
-        WorldChunkKey::Branch(index) => {
-            if let Some(branch) = blueprint.branches.get(index) {
-                let layout =
-                    build_branch_layout(index, branch, &blueprint.rooms, unlocked_shortcuts);
-                let _ = spawn_layout(
-                    &layout,
-                    collected_treasures,
-                    unlocked_shortcuts,
-                    Some(chunk),
-                    commands,
-                    meshes,
-                    materials,
-                    asset_cache,
-                );
-            }
-        }
-        WorldChunkKey::Summit => {
-            if let Some(room) = blueprint.rooms.last() {
-                let layout = build_summit_layout(room, blueprint.summit);
-                let _ = spawn_layout(
-                    &layout,
-                    collected_treasures,
-                    unlocked_shortcuts,
-                    Some(chunk),
-                    commands,
-                    meshes,
-                    materials,
-                    asset_cache,
-                );
-            }
-        }
-    }
+    let Some(layout) = build_chunk_layout(chunk, blueprint) else {
+        return;
+    };
+    spawn_layout(
+        &layout,
+        Some(chunk),
+        commands,
+        meshes,
+        materials,
+        asset_cache,
+    );
 }
 
 fn spawn_sky_backdrop(
@@ -5779,8 +5440,36 @@ struct CelestialBodyPlan {
 
 fn celestial_vertical_bias(rng: &mut RunRng, index: usize, count: usize) -> f32 {
     let phase = TAU * (index as f32 / count.max(1) as f32);
-    let wave = (phase * 1.7).sin() * 0.82 + (phase * 0.55 + 1.2).cos() * 0.34;
-    (wave + rng.range_f32(-0.4, 0.4)).clamp(-1.25, 1.25)
+    let band = match index % 4 {
+        0 => -1.9,
+        1 => -0.55,
+        2 => 0.62,
+        _ => 1.9,
+    };
+    let wave = (phase * 1.9).sin() * 0.46 + (phase * 0.7 + 1.1).cos() * 0.22;
+    (band + wave + rng.range_f32(-0.28, 0.28)).clamp(-2.35, 2.35)
+}
+
+fn celestial_depth_bias(rng: &mut RunRng, index: usize, count: usize, major: bool) -> f32 {
+    let phase = TAU * (index as f32 / count.max(1) as f32);
+    let band = if major {
+        match index % 4 {
+            0 => -1.15,
+            1 => -0.3,
+            2 => 0.42,
+            _ => 1.12,
+        }
+    } else {
+        match index % 4 {
+            0 => -0.9,
+            1 => -0.18,
+            2 => 0.28,
+            _ => 0.88,
+        }
+    };
+    let wave = (phase * 1.35 + 0.45).sin() * 0.2 + (phase * 2.1).cos() * 0.12;
+    let limit = if major { 1.35 } else { 1.1 };
+    (band + wave + rng.range_f32(-0.16, 0.16)).clamp(-limit, limit)
 }
 
 fn disperse_celestial_anchor(
@@ -5791,28 +5480,51 @@ fn disperse_celestial_anchor(
     radius: f32,
     major: bool,
     vertical_bias: f32,
+    depth_bias: f32,
 ) -> Vec3 {
     let vertical_span = if major {
-        360.0 + radius * 0.18
+        460.0 + radius * 0.28
     } else {
-        250.0 + radius * 0.14
+        320.0 + radius * 0.2
     };
     let tangential_shift = vertical_bias
         * if major {
-            140.0 + radius * 0.12
+            180.0 + radius * 0.14
         } else {
-            90.0 + radius * 0.08
+            120.0 + radius * 0.1
+        };
+    let radial_shift = depth_bias
+        * if major {
+            170.0 + radius * 0.12
+        } else {
+            110.0 + radius * 0.08
         };
     let minimum_clearance = if major {
-        140.0 + radius * 0.52
+        170.0 + radius * 0.08
     } else {
-        120.0 + radius * 0.4
+        130.0 + radius * 0.05
     };
-    let mut displaced =
-        anchor + Vec3::Y * (vertical_bias * vertical_span) + tangent * tangential_shift;
+    let mut displaced = anchor
+        + Vec3::Y * (vertical_bias * vertical_span)
+        + tangent * tangential_shift
+        + radial * radial_shift;
     let clearance = celestial_course_clearance(blueprint, displaced, radius);
     if clearance < minimum_clearance {
         displaced += radial * (minimum_clearance - clearance + 24.0);
+    } else if depth_bias < 0.0 {
+        let inward_budget = (clearance - minimum_clearance)
+            .min(if major {
+                120.0 + radius * 0.06
+            } else {
+                84.0 + radius * 0.04
+            })
+            .max(0.0);
+        displaced -= radial * (inward_budget * depth_bias.abs() * 0.35);
+    }
+    let final_minimum_clearance = if major { 140.0 } else { 118.0 };
+    let final_clearance = celestial_course_clearance(blueprint, displaced, radius);
+    if final_clearance < final_minimum_clearance {
+        displaced += radial * (final_minimum_clearance - final_clearance + 12.0);
     }
     displaced
 }
@@ -5874,6 +5586,8 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
         let radius = rng.range_f32(12.0, 24.0) * MAJOR_CELESTIAL_RADIUS_MULTIPLIER;
         let shape = major_shapes[body_index];
         let clearance_radius = radius * shape.clearance_multiplier();
+        let vertical_bias = celestial_vertical_bias(&mut rng, body_index, major_count);
+        let depth_bias = celestial_depth_bias(&mut rng, body_index, major_count, true);
         let anchor = find_safe_celestial_anchor(
             blueprint,
             &mut rng,
@@ -5883,6 +5597,8 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             tangent,
             clearance_radius,
             true,
+            vertical_bias,
+            depth_bias,
         );
         let anchor = disperse_celestial_anchor(
             blueprint,
@@ -5891,7 +5607,8 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             tangent,
             clearance_radius,
             true,
-            celestial_vertical_bias(&mut rng, body_index, major_count),
+            vertical_bias,
+            depth_bias,
         );
         let drift_secondary = (Vec3::Y * rng.range_f32(0.72, 1.0)
             + radial * rng.range_f32(-0.18, 0.18))
@@ -5923,6 +5640,8 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
         let radius = rng.range_f32(5.5, 10.5) * MOON_CELESTIAL_RADIUS_MULTIPLIER;
         let shape = moon_shapes[moon_index];
         let clearance_radius = radius * shape.clearance_multiplier();
+        let vertical_bias = celestial_vertical_bias(&mut rng, moon_index, moon_count);
+        let depth_bias = celestial_depth_bias(&mut rng, moon_index, moon_count, false);
         let anchor = find_safe_celestial_anchor(
             blueprint,
             &mut rng,
@@ -5932,6 +5651,8 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             tangent,
             clearance_radius,
             false,
+            vertical_bias,
+            depth_bias,
         );
         let anchor = disperse_celestial_anchor(
             blueprint,
@@ -5940,7 +5661,8 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             tangent,
             clearance_radius,
             false,
-            celestial_vertical_bias(&mut rng, moon_index, moon_count),
+            vertical_bias,
+            depth_bias,
         );
         let drift_secondary = (Vec3::Y * rng.range_f32(0.55, 0.95)
             + tangent * rng.range_f32(-0.25, 0.25))
@@ -5984,6 +5706,8 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
         let shape = decor_shapes[decor_index % decor_shapes.len()];
         let radius = rng.range_f32(4.0, 12.0) * DECOR_CELESTIAL_RADIUS_MULTIPLIER;
         let clearance_radius = radius * shape.clearance_multiplier();
+        let vertical_bias = celestial_vertical_bias(&mut rng, decor_index, decor_count);
+        let depth_bias = celestial_depth_bias(&mut rng, decor_index, decor_count, false);
         let mut anchor = find_safe_celestial_anchor(
             blueprint,
             &mut rng,
@@ -5993,6 +5717,8 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             tangent,
             clearance_radius,
             false,
+            vertical_bias,
+            depth_bias,
         );
         anchor = disperse_celestial_anchor(
             blueprint,
@@ -6001,7 +5727,8 @@ fn build_celestial_body_plans(blueprint: &RunBlueprint) -> Vec<CelestialBodyPlan
             tangent,
             clearance_radius,
             false,
-            celestial_vertical_bias(&mut rng, decor_index, decor_count),
+            vertical_bias,
+            depth_bias,
         ) + tangent * rng.range_f32(-72.0, 72.0);
         let decor_clearance = celestial_course_clearance(blueprint, anchor, clearance_radius);
         if decor_clearance < 120.0 {
@@ -6050,17 +5777,31 @@ fn spawn_macro_spectacle(
     }
 
     let (center, course_radius) = course_visual_center_and_radius(blueprint);
+    let center_xz = Vec3::new(center.x, 0.0, center.z);
     let mut rng = RunRng::new(blueprint.seed ^ 0xA11C_E5C4_7A51_D00D);
     let entry_heading = direction_from_delta(blueprint.rooms[1].top - blueprint.rooms[0].top);
     let entry_right = Vec3::new(-entry_heading.z, 0.0, entry_heading.x).normalize_or_zero();
-    let start_height = blueprint.rooms.first().unwrap().top.y + 180.0;
-    let end_height = blueprint.rooms.last().unwrap().top.y - 120.0;
+    let course_min_y = blueprint
+        .rooms
+        .iter()
+        .map(|room| room.top.y)
+        .fold(f32::INFINITY, f32::min);
+    let course_max_y = blueprint
+        .rooms
+        .iter()
+        .map(|room| room.top.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let course_height_span = (course_max_y - course_min_y).max(220.0);
+    let helix_start_height = course_min_y - rng.range_f32(180.0, 360.0);
+    let helix_end_height = course_max_y + rng.range_f32(140.0, 320.0);
+    let helix_vertical_wave = rng.range_f32(48.0, 160.0);
+    let helix_lateral_wave = rng.range_f32(24.0, 88.0);
 
     let mut helix_builder = ColoredMeshBuilder::default();
     let helix_turns = rng.range_f32(2.2, 3.4) * if rng.chance(0.5) { 1.0 } else { -1.0 };
     let helix_phase = rng.range_f32(0.0, TAU);
     let helix_samples = 96;
-    let helix_radius = course_radius + 165.0;
+    let helix_radius = course_radius + rng.range_f32(82.0, 176.0);
     for lane in 0..2 {
         let radius = helix_radius + lane as f32 * 42.0;
         let width = 11.0 - lane as f32 * 2.4;
@@ -6075,7 +5816,12 @@ fn spawn_macro_spectacle(
             let t = sample as f32 / helix_samples as f32;
             let angle = helix_phase + helix_turns * TAU * t + lane as f32 * PI;
             let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
-            let point = center + radial * radius + Vec3::Y * lerp(start_height, end_height, t);
+            let point = center_xz
+                + radial * radius
+                + entry_right * ((t * TAU * 1.6 + helix_phase).sin() * helix_lateral_wave)
+                + Vec3::Y
+                    * (lerp(helix_start_height, helix_end_height, t)
+                        + (t * TAU * 2.0 + helix_phase).sin() * helix_vertical_wave);
             if let Some(last) = previous {
                 append_beam_segment(
                     &mut helix_builder,
@@ -6113,8 +5859,15 @@ fn spawn_macro_spectacle(
     }
 
     let mut mobius_builder = ColoredMeshBuilder::default();
-    let mobius_center = center + Vec3::Y * ((start_height + end_height) * 0.5 + 120.0);
-    let major_radius = course_radius * 0.82 + 220.0;
+    let mobius_center = center_xz
+        + entry_right * rng.range_f32(-120.0, 120.0)
+        + entry_heading * rng.range_f32(-72.0, 72.0)
+        + Vec3::Y
+            * (lerp(course_min_y, course_max_y, rng.range_f32(0.18, 0.82))
+                + rng.range_f32(-course_height_span * 0.58, course_height_span * 0.78));
+    let major_radius = course_radius * rng.range_f32(0.56, 0.82) + rng.range_f32(120.0, 210.0);
+    let mobius_lateral_wave = major_radius * rng.range_f32(0.1, 0.22);
+    let mobius_vertical_wave = major_radius * rng.range_f32(0.12, 0.24);
     let mobius_samples = 84;
     let mut previous = None;
     for sample in 0..=mobius_samples {
@@ -6123,8 +5876,9 @@ fn spawn_macro_spectacle(
         let radial = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize_or_zero();
         let point = mobius_center
             + radial * major_radius
-            + entry_right * ((angle * 2.0).cos() * major_radius * 0.08)
-            + Vec3::Y * ((angle * 2.0).sin() * major_radius * 0.08);
+            + entry_right * ((angle * 2.0).cos() * mobius_lateral_wave)
+            + entry_heading * ((angle + 0.7).sin() * major_radius * 0.12)
+            + Vec3::Y * ((angle * 2.0).sin() * mobius_vertical_wave);
         let color = mix_color(
             Color::srgba(0.34, 0.92, 1.0, 0.18),
             Color::srgba(1.0, 0.42, 0.84, 0.18),
@@ -6168,11 +5922,15 @@ fn spawn_macro_spectacle(
     }
 
     let mut frame_builder = ColoredMeshBuilder::default();
-    let frame_center = center
-        + entry_right * (course_radius + 220.0)
-        + Vec3::Y * (blueprint.rooms[0].top.y + 140.0)
-        - entry_heading * 48.0;
-    let frame_normal = (center + Vec3::Y * 40.0 - frame_center).normalize_or_zero();
+    let frame_height = lerp(course_min_y, course_max_y, rng.range_f32(0.08, 0.52))
+        + rng.range_f32(-course_height_span * 0.62, course_height_span * 0.42);
+    let frame_center = center_xz
+        + entry_right * (course_radius + rng.range_f32(90.0, 196.0))
+        + entry_heading * rng.range_f32(-78.0, 48.0)
+        + Vec3::Y * frame_height;
+    let frame_normal =
+        (Vec3::new(center.x, frame_height + rng.range_f32(-40.0, 72.0), center.z) - frame_center)
+            .normalize_or_zero();
     append_rect_frame(
         &mut frame_builder,
         frame_center,
@@ -6303,9 +6061,23 @@ fn spawn_macro_spectacle(
         let zone_right = Vec3::new(-zone_forward.z, 0.0, zone_forward.x).normalize_or_zero();
         let zone_center = start_room.top.lerp(end_room.top, 0.5);
         let zone_span = start_room.top.distance(end_room.top).max(120.0);
+        let landmark_radius = LANDMARK_OFFSET_RADIUS
+            + zone_span * rng.range_f32(0.04, 0.18)
+            + match zone.index % 3 {
+                0 => -56.0,
+                1 => 12.0,
+                _ => 104.0,
+            };
+        let landmark_vertical_offset = match zone.index % 4 {
+            0 => LANDMARK_VERTICAL_OFFSET - 220.0,
+            1 => LANDMARK_VERTICAL_OFFSET - 36.0,
+            2 => LANDMARK_VERTICAL_OFFSET + 154.0,
+            _ => LANDMARK_VERTICAL_OFFSET + 332.0,
+        } + rng.range_f32(-56.0, 76.0);
         let anchor = zone_center
-            + zone_right * zone.flow.drift_sign * (LANDMARK_OFFSET_RADIUS + zone_span * 0.08)
-            + Vec3::Y * (LANDMARK_VERTICAL_OFFSET + zone.index as f32 * 8.0);
+            + zone_right * zone.flow.drift_sign * landmark_radius
+            + zone_forward * rng.range_f32(-48.0, 48.0)
+            + Vec3::Y * landmark_vertical_offset;
         let zone_color = match zone.role {
             ZoneRole::Accelerator => Color::srgba(0.26, 0.88, 1.0, 0.16),
             ZoneRole::Technical => Color::srgba(1.0, 0.42, 0.82, 0.16),
@@ -6525,60 +6297,102 @@ fn find_safe_celestial_anchor(
     tangent: Vec3,
     radius: f32,
     major: bool,
+    vertical_bias: f32,
+    depth_bias: f32,
 ) -> Vec3 {
-    let orbit_min = if major {
-        course_radius + 220.0 + radius * 0.82
+    let near_orbit_min = if major {
+        course_radius + 96.0 + radius * 0.42
     } else {
-        course_radius + 180.0 + radius * 0.64
+        course_radius + 84.0 + radius * 0.34
     };
-    let orbit_max = if major {
-        course_radius + 520.0 + radius * 1.28
+    let near_orbit_max = if major {
+        course_radius + 220.0 + radius * 0.66
     } else {
-        course_radius + 360.0 + radius * 0.94
+        course_radius + 170.0 + radius * 0.52
     };
-    let altitude_min = if major {
-        140.0 + radius * 0.28
+    let far_orbit_min = if major {
+        course_radius + 250.0 + radius * 0.84
     } else {
-        105.0 + radius * 0.22
+        course_radius + 210.0 + radius * 0.64
     };
-    let altitude_max = if major {
-        360.0 + radius * 0.48
+    let far_orbit_max = if major {
+        course_radius + 560.0 + radius * 1.24
     } else {
-        260.0 + radius * 0.34
+        course_radius + 390.0 + radius * 0.92
     };
-    let tangential_span = if major { 180.0 } else { 120.0 };
+    let orbit_min = if depth_bias < -0.35 {
+        near_orbit_min
+    } else if depth_bias > 0.45 {
+        far_orbit_min
+    } else {
+        lerp(near_orbit_min, far_orbit_min, 0.45)
+    };
+    let orbit_max = if depth_bias < -0.35 {
+        near_orbit_max
+    } else if depth_bias > 0.45 {
+        far_orbit_max
+    } else {
+        lerp(near_orbit_max, far_orbit_max, 0.58)
+    };
+    let altitude_center = vertical_bias
+        * if major {
+            320.0 + radius * 0.24
+        } else {
+            220.0 + radius * 0.18
+        };
+    let altitude_jitter = if major {
+        120.0 + radius * 0.08
+    } else {
+        96.0 + radius * 0.06
+    };
+    let tangential_span = if major {
+        220.0 + radius * 0.03
+    } else {
+        140.0 + radius * 0.025
+    };
     let desired_clearance = if major {
-        140.0 + radius * 0.72
+        190.0 + radius * 0.08
     } else {
-        120.0 + radius * 0.56
+        145.0 + radius * 0.05
     };
     let desired_view_clearance = if major {
-        220.0 + radius * 0.24
+        220.0 + radius * 0.06
     } else {
-        120.0 + radius * 0.12
+        120.0 + radius * 0.04
     };
 
-    let mut best = center + radial * orbit_max + Vec3::Y * altitude_min;
+    let mut best = center + radial * orbit_max + Vec3::Y * altitude_center;
     let mut best_clearance = f32::NEG_INFINITY;
     let mut best_view_clearance = f32::NEG_INFINITY;
     let mut best_score = f32::NEG_INFINITY;
+    let desired_orbit = lerp(orbit_min, orbit_max, (depth_bias * 0.5 + 0.5).clamp(0.0, 1.0));
 
-    for _ in 0..16 {
+    for _ in 0..24 {
         let orbit = rng.range_f32(orbit_min, orbit_max);
+        let altitude = altitude_center + rng.range_f32(-altitude_jitter, altitude_jitter);
         let candidate = center
             + radial * orbit
             + tangent * rng.range_f32(-tangential_span, tangential_span)
-            + Vec3::Y * rng.range_f32(altitude_min, altitude_max);
+            + Vec3::Y * altitude;
         let clearance = celestial_course_clearance(blueprint, candidate, radius);
         let view_clearance = celestial_entry_view_clearance(blueprint, candidate, radius);
-        let score = clearance.min(view_clearance);
+        let orbit_alignment = 1.0 - ((orbit - desired_orbit).abs() / (orbit_max - orbit_min).max(1.0));
+        let altitude_alignment =
+            1.0 - ((altitude - altitude_center).abs() / altitude_jitter.max(1.0));
+        let score = clearance.min(view_clearance)
+            + orbit_alignment.max(0.0) * 28.0
+            + altitude_alignment.max(0.0) * 22.0;
         if score > best_score {
             best = candidate;
             best_clearance = clearance;
             best_view_clearance = view_clearance;
             best_score = score;
         }
-        if clearance >= desired_clearance && view_clearance >= desired_view_clearance {
+        if clearance >= desired_clearance
+            && view_clearance >= desired_view_clearance
+            && orbit_alignment >= 0.3
+            && altitude_alignment >= 0.2
+        {
             return candidate;
         }
     }
@@ -6586,7 +6400,12 @@ fn find_safe_celestial_anchor(
     if best_clearance < desired_clearance {
         let push = desired_clearance - best_clearance + 18.0;
         best += radial * push;
-        best.y += push * 0.35;
+        let vertical_sign = if vertical_bias == 0.0 {
+            1.0
+        } else {
+            vertical_bias.signum()
+        };
+        best.y += push * 0.2 * vertical_sign;
     }
     if best_view_clearance < desired_view_clearance {
         let push = desired_view_clearance - best_view_clearance + 36.0;
@@ -6595,7 +6414,7 @@ fn find_safe_celestial_anchor(
             if sign == 0.0 { 1.0 } else { sign }
         };
         best += tangent * (push * tangential_sign) + radial * (push * 0.35);
-        best.y += push * 0.24;
+        best.y += push * 0.12;
     }
 
     best
@@ -6641,36 +6460,21 @@ fn celestial_course_clearance(blueprint: &RunBlueprint, point: Vec3, radius: f32
 
 fn spawn_layout(
     layout: &ModuleLayout,
-    collected_treasures: &HashSet<u64>,
-    unlocked_shortcuts: &HashSet<u64>,
     chunk: Option<WorldChunkKey>,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     asset_cache: &mut WorldAssetCache,
-) -> usize {
-    let mut treasure_count = 0;
+) {
     let mut render_batches = HashMap::<GameMaterialKey, ColoredMeshBuilder>::default();
     for solid in &layout.solids {
-        if matches!(solid.extra, ExtraKind::Treasure { .. }) {
-            treasure_count += 1;
-        }
         if is_batchable_static_render(solid) {
             append_static_render_geometry(&mut render_batches, solid);
             spawn_box_collider_spec(solid, commands, chunk);
         } else if is_collider_only_static(solid) {
             spawn_box_collider_spec(solid, commands, chunk);
         } else {
-            spawn_box_spec(
-                solid,
-                collected_treasures,
-                unlocked_shortcuts,
-                chunk,
-                commands,
-                meshes,
-                materials,
-                asset_cache,
-            );
+            spawn_box_spec(solid, chunk, commands, meshes, materials, asset_cache);
         }
     }
 
@@ -6745,14 +6549,10 @@ fn spawn_layout(
             }
         }
     }
-
-    treasure_count
 }
 
 fn spawn_box_spec(
     spec: &SolidSpec,
-    collected_treasures: &HashSet<u64>,
-    unlocked_shortcuts: &HashSet<u64>,
     chunk: Option<WorldChunkKey>,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -6768,19 +6568,10 @@ fn spawn_box_spec(
         return;
     }
 
-    if let ExtraKind::Treasure { id } = spec.extra {
-        if collected_treasures.contains(&id) {
-            return;
-        }
-    }
-
     let mesh = match &spec.body {
         SolidBody::StaticSurfWedge { render_points, .. } => meshes.add(build_surf_wedge_mesh(
             render_points,
-            paint_base_color(
-                spec.paint,
-                matches!(&spec.body, SolidBody::ShortcutBridge { active: false, .. }),
-            ),
+            paint_base_color(spec.paint, false),
             paint_stripe_color(spec.paint),
         )),
         SolidBody::StaticSphere => meshes.add(
@@ -6793,10 +6584,7 @@ fn spawn_box_spec(
         SolidBody::StaticTrapezoid { top_scale } => meshes.add(build_trapezoid_mesh(
             spec.size,
             *top_scale,
-            paint_base_color(
-                spec.paint,
-                matches!(&spec.body, SolidBody::ShortcutBridge { active: false, .. }),
-            ),
+            paint_base_color(spec.paint, false),
         )),
         _ => cached_cuboid_mesh(asset_cache, meshes, spec.size),
     };
@@ -6805,7 +6593,7 @@ fn spawn_box_spec(
         materials,
         GameMaterialKey {
             paint: spec.paint,
-            ghost: matches!(&spec.body, SolidBody::ShortcutBridge { active: false, .. }),
+            ghost: false,
             surf: matches!(&spec.body, SolidBody::StaticSurfWedge { .. }),
             vertex_colored: matches!(
                 &spec.body,
@@ -6928,22 +6716,6 @@ fn spawn_box_spec(
                 },
             ));
         }
-        SolidBody::ShortcutBridge { id, active } => {
-            let enabled = *active || unlocked_shortcuts.contains(id);
-            entity.insert((
-                RigidBody::Static,
-                ShortcutBridge {
-                    id: *id,
-                    size: spec.size,
-                },
-            ));
-            if enabled {
-                entity.insert((
-                    Collider::cuboid(spec.size.x, spec.size.y, spec.size.z),
-                    CollisionLayers::new(CollisionLayer::Default, LayerMask::ALL),
-                ));
-            }
-        }
     }
 
     if let Some(friction) = spec.friction {
@@ -6957,12 +6729,6 @@ fn spawn_box_spec(
         }
         ExtraKind::SummitGoal => {
             entity.insert(SummitGoal);
-        }
-        ExtraKind::Treasure { id } => {
-            entity.insert(TreasurePickup { id });
-        }
-        ExtraKind::ShortcutTrigger { id } => {
-            entity.insert(ShortcutTrigger { id });
         }
     }
 }
@@ -8406,11 +8172,7 @@ fn append_signature_route_choice(
     true
 }
 
-fn build_segment_layout(
-    segment: &SegmentPlan,
-    rooms: &[RoomPlan],
-    _unlocked_shortcuts: &HashSet<u64>,
-) -> ModuleLayout {
+fn build_segment_layout(segment: &SegmentPlan, rooms: &[RoomPlan]) -> ModuleLayout {
     let mut layout = ModuleLayout::default();
     let owner = OwnerTag::Segment(segment.index);
     let from = &rooms[segment.from];
@@ -9933,16 +9695,6 @@ fn append_descending_pad_sequence(
     }
 }
 
-fn build_branch_layout(
-    index: usize,
-    branch: &BranchPlan,
-    rooms: &[RoomPlan],
-    _unlocked_shortcuts: &HashSet<u64>,
-) -> ModuleLayout {
-    let _ = (index, branch, rooms);
-    ModuleLayout::default()
-}
-
 fn build_summit_layout(room: &RoomPlan, summit: Vec3) -> ModuleLayout {
     let mut layout = ModuleLayout::default();
     let owner = OwnerTag::Summit;
@@ -10017,16 +9769,6 @@ fn material_for_paint(paint: PaintStyle, ghost: bool) -> StandardMaterial {
             perceptual_roughness: 0.94,
             ..default()
         },
-        PaintStyle::Prop(theme) => StandardMaterial {
-            base_color: theme_prop_color(theme),
-            emissive: LinearRgba::from(theme_glow_color(theme)) * 0.07,
-            reflectance: 0.46,
-            specular_tint: theme_glow_color(theme),
-            clearcoat: 0.22,
-            clearcoat_perceptual_roughness: 0.34,
-            perceptual_roughness: 0.42,
-            ..default()
-        },
         PaintStyle::Summit => StandardMaterial {
             base_color: Color::srgb(0.7, 0.64, 0.38),
             emissive: LinearRgba::rgb(0.52, 0.4, 0.16),
@@ -10044,16 +9786,6 @@ fn material_for_paint(paint: PaintStyle, ghost: bool) -> StandardMaterial {
             clearcoat: 0.72,
             clearcoat_perceptual_roughness: 0.16,
             perceptual_roughness: 0.18,
-            ..default()
-        },
-        PaintStyle::Treasure => StandardMaterial {
-            base_color: Color::srgb(0.86, 0.68, 0.24),
-            emissive: LinearRgba::rgb(0.42, 0.26, 0.1),
-            reflectance: 0.82,
-            clearcoat: 0.84,
-            clearcoat_perceptual_roughness: 0.14,
-            perceptual_roughness: 0.14,
-            metallic: 0.26,
             ..default()
         },
         PaintStyle::Hazard => StandardMaterial {
@@ -10139,15 +9871,6 @@ fn theme_shadow_color(theme: Theme) -> Color {
     }
 }
 
-fn theme_prop_color(theme: Theme) -> Color {
-    match theme {
-        Theme::Stone => Color::srgb(0.28, 0.32, 0.46),
-        Theme::Overgrown => Color::srgb(0.14, 0.32, 0.36),
-        Theme::Frost => Color::srgb(0.26, 0.5, 0.74),
-        Theme::Ember => Color::srgb(0.52, 0.26, 0.48),
-    }
-}
-
 fn theme_glow_color(theme: Theme) -> Color {
     match theme {
         Theme::Stone => Color::srgb(0.56, 0.7, 1.0),
@@ -10161,14 +9884,12 @@ fn paint_stripe_color(paint: PaintStyle) -> Color {
     match paint {
         PaintStyle::ThemeFloor(theme)
         | PaintStyle::ThemeAccent(theme)
-        | PaintStyle::ThemeShadow(theme)
-        | PaintStyle::Prop(theme) => {
+        | PaintStyle::ThemeShadow(theme) => {
             let glow = LinearRgba::from(theme_glow_color(theme));
             Color::linear_rgb(glow.red * 1.1, glow.green * 1.1, glow.blue * 1.1)
         }
         PaintStyle::Summit => Color::linear_rgb(1.3, 0.98, 0.34),
         PaintStyle::Checkpoint => Color::linear_rgb(0.42, 1.2, 0.98),
-        PaintStyle::Treasure => Color::linear_rgb(1.26, 1.02, 0.4),
         PaintStyle::Hazard => Color::linear_rgb(1.18, 0.24, 0.34),
         PaintStyle::Shortcut => Color::linear_rgb(0.42, 1.1, 1.28),
         PaintStyle::Ice => Color::linear_rgb(0.66, 1.1, 1.3),
@@ -10273,7 +9994,6 @@ mod tests {
             seed,
             zone_role: ZoneRole::Accelerator,
             zone_signature: ZoneSignature::WaveRamps,
-            shortcut_id: None,
             exit_socket: module_template(kind).exit,
             zone_index: 0,
             biome: BiomeStyle::NeonCyber,
@@ -10298,16 +10018,46 @@ mod tests {
             exit_connector: ConnectorKind::Collector,
             landmark: LandmarkKind::BrokenRing,
             route_lines: vec![RouteLine::Safe, RouteLine::Speed, RouteLine::Trick],
-            branch_targets: Vec::new(),
         }
     }
 
     #[test]
-    fn zone_generation_cycles_roles_and_assigns_landmarks() {
-        let blueprint = build_run_blueprint(42);
-        assert!(blueprint.zones.len() >= 4);
+    fn graph_stage_generates_consistent_topology() {
+        let graph = build_course_graph(42);
+        assert!(graph.rooms.len() >= 2);
+        assert_eq!(graph.segments.len(), graph.rooms.len() - 1);
+        assert!(!graph.zones.is_empty());
+    }
 
-        let roles = blueprint
+    #[test]
+    fn compile_stage_derives_spawn_and_summit_from_graph() {
+        let graph = build_course_graph(42);
+        let blueprint = compile_course_graph(graph.clone());
+
+        assert!(blueprint.spawn.y > graph.rooms[0].top.y);
+        assert_eq!(blueprint.spawn.x, graph.rooms[0].top.x);
+        assert!(blueprint.summit.y > graph.rooms.last().unwrap().top.y);
+    }
+
+    #[test]
+    fn layout_stage_builds_room_segment_and_summit_chunks() {
+        let blueprint = build_run_blueprint(42);
+
+        let room_layout = build_chunk_layout(WorldChunkKey::Room(0), &blueprint).unwrap();
+        let segment_layout = build_chunk_layout(WorldChunkKey::Segment(0), &blueprint).unwrap();
+        let summit_layout = build_chunk_layout(WorldChunkKey::Summit, &blueprint).unwrap();
+
+        assert!(!room_layout.solids.is_empty());
+        assert!(!segment_layout.solids.is_empty());
+        assert!(!summit_layout.solids.is_empty());
+    }
+
+    #[test]
+    fn zone_generation_cycles_roles_and_assigns_landmarks() {
+        let graph = build_course_graph(42);
+        assert!(graph.zones.len() >= 4);
+
+        let roles = graph
             .zones
             .iter()
             .take(4)
@@ -10323,7 +10073,7 @@ mod tests {
             ]
         );
         assert!(
-            blueprint
+            graph
                 .zones
                 .iter()
                 .all(|zone| !zone.route_lines.is_empty()),
@@ -10357,7 +10107,7 @@ mod tests {
             let blueprint = build_run_blueprint(seed);
 
             for room in &blueprint.rooms {
-                let layout = build_room_layout(room);
+                let layout = build_chunk_layout(WorldChunkKey::Room(room.index), &blueprint).unwrap();
                 for solid in &layout.solids {
                     assert!(
                         validate_solid_spec(solid).is_ok(),
@@ -10370,7 +10120,8 @@ mod tests {
             }
 
             for segment in &blueprint.segments {
-                let layout = build_segment_layout(segment, &blueprint.rooms, &HashSet::default());
+                let layout =
+                    build_chunk_layout(WorldChunkKey::Segment(segment.index), &blueprint).unwrap();
                 for solid in &layout.solids {
                     assert!(
                         validate_solid_spec(solid).is_ok(),
@@ -10383,21 +10134,7 @@ mod tests {
                 }
             }
 
-            for (index, branch) in blueprint.branches.iter().enumerate() {
-                let layout =
-                    build_branch_layout(index, branch, &blueprint.rooms, &HashSet::default());
-                for solid in &layout.solids {
-                    assert!(
-                        validate_solid_spec(solid).is_ok(),
-                        "seed {seed} branch {} solid '{}' invalid: {}",
-                        index,
-                        solid.label,
-                        validate_solid_spec(solid).unwrap_err()
-                    );
-                }
-            }
-
-            let summit = build_summit_layout(blueprint.rooms.last().unwrap(), blueprint.summit);
+            let summit = build_chunk_layout(WorldChunkKey::Summit, &blueprint).unwrap();
             for solid in &summit.solids {
                 assert!(
                     validate_solid_spec(solid).is_ok(),
@@ -10455,6 +10192,52 @@ mod tests {
     }
 
     #[test]
+    fn giant_celestials_span_high_low_and_close_to_the_course() {
+        let mut closest_clearance_seen = f32::INFINITY;
+        for seed in 0_u64..16 {
+            let blueprint = build_run_blueprint(seed);
+            let (center, _) = course_visual_center_and_radius(&blueprint);
+            let giant_bodies: Vec<_> = build_celestial_body_plans(&blueprint)
+                .into_iter()
+                .filter(|body| body.radius >= 800.0)
+                .collect();
+
+            let highest = giant_bodies
+                .iter()
+                .map(|body| body.anchor.y - center.y)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let lowest = giant_bodies
+                .iter()
+                .map(|body| body.anchor.y - center.y)
+                .fold(f32::INFINITY, f32::min);
+            let closest_clearance = giant_bodies
+                .iter()
+                .map(|body| {
+                    celestial_course_clearance(
+                        &blueprint,
+                        body.anchor,
+                        body.radius * body.shape.clearance_multiplier(),
+                    )
+                })
+                .fold(f32::INFINITY, f32::min);
+            closest_clearance_seen = closest_clearance_seen.min(closest_clearance);
+
+            assert!(
+                highest >= 420.0,
+                "seed {seed} only reached highest giant offset {highest}"
+            );
+            assert!(
+                lowest <= -220.0,
+                "seed {seed} only reached lowest giant offset {lowest}"
+            );
+        }
+        assert!(
+            closest_clearance_seen <= 700.0,
+            "sample never brought a giant body within 700 units of the course; closest was {closest_clearance_seen}"
+        );
+    }
+
+    #[test]
     fn new_speed_modules_generate_valid_solids() {
         let rooms = vec![
             test_room(0, IVec2::ZERO, Vec3::new(0.0, 120.0, 0.0), 1),
@@ -10475,7 +10258,7 @@ mod tests {
         {
             let mut segment = test_segment(index, kind, 0xC0DE_BAAD_u64 ^ index as u64);
             segment.difficulty = 0.52;
-            let layout = build_segment_layout(&segment, &rooms, &HashSet::default());
+            let layout = build_segment_layout(&segment, &rooms);
             assert!(
                 !layout.solids.is_empty(),
                 "module {:?} should generate gameplay solids",
@@ -10536,7 +10319,7 @@ mod tests {
         {
             let mut segment = test_segment(index, kind, 0xA11C_7000_u64 ^ index as u64);
             segment.difficulty = 0.52;
-            let layout = build_segment_layout(&segment, &rooms, &HashSet::default());
+            let layout = build_segment_layout(&segment, &rooms);
             let closest_progress = layout
                 .solids
                 .iter()
@@ -10613,18 +10396,7 @@ mod tests {
         assert_eq!(blueprint.rooms.len(), original_room_count + 8);
         assert_eq!(blueprint.segments.len(), original_segment_count + 8);
         assert!(blueprint.rooms.last().unwrap().top.y < original_tail_y);
-        assert_eq!(blueprint.floors, blueprint.rooms.len());
-    }
-
-    #[test]
-    fn active_blueprints_do_not_generate_branch_platforms_or_cache_props() {
-        for seed in 0_u64..64 {
-            let blueprint = build_run_blueprint(seed);
-            assert!(
-                blueprint.branches.is_empty(),
-                "seed {seed} still generated side-branch clutter",
-            );
-        }
+        assert_eq!(blueprint.rooms.len(), blueprint.segments.len() + 1);
     }
 
     #[test]
@@ -10646,14 +10418,12 @@ mod tests {
     fn checkpoint_death_plane_looks_ahead_for_long_drops() {
         let blueprint = RunBlueprint {
             seed: 7,
-            floors: 3,
             rooms: vec![
                 test_room(0, IVec2::ZERO, Vec3::new(0.0, 420.0, 0.0), 1),
                 test_room(1, IVec2::new(3, 0), Vec3::new(120.0, 240.0, 0.0), 2),
                 test_room(2, IVec2::new(7, 0), Vec3::new(280.0, 40.0, 0.0), 3),
             ],
             segments: Vec::new(),
-            branches: Vec::new(),
             spawn: Vec3::new(0.0, 422.0, 0.0),
             summit: Vec3::new(280.0, 41.4, 0.0),
             death_plane: -999.0,
@@ -10661,13 +10431,7 @@ mod tests {
             zones: vec![test_zone(1)],
             zone_edges: Vec::new(),
         };
-        let checkpoints = blueprint
-            .rooms
-            .iter()
-            .map(|room| room.top + Vec3::Y * PLAYER_SPAWN_CLEARANCE)
-            .collect::<Vec<_>>();
-
-        let death_plane = checkpoint_death_plane(&blueprint, &checkpoints, 0, 0);
+        let death_plane = checkpoint_death_plane(&blueprint, 0, 0);
 
         assert!(
             death_plane < blueprint.rooms[1].top.y - 40.0,
@@ -10694,7 +10458,7 @@ mod tests {
         {
             let mut segment = test_segment(index, kind, 0x51DE_CAFE_u64 ^ index as u64);
             segment.difficulty = 0.62;
-            let layout = build_segment_layout(&segment, &rooms, &HashSet::default());
+            let layout = build_segment_layout(&segment, &rooms);
             let volumes = layout
                 .solids
                 .iter()
@@ -10720,7 +10484,7 @@ mod tests {
         for seed in 0_u64..24 {
             let blueprint = build_run_blueprint(seed);
             for segment in &blueprint.segments {
-                let layout = build_segment_layout(segment, &blueprint.rooms, &HashSet::default());
+                let layout = build_segment_layout(segment, &blueprint.rooms);
                 assert!(
                     !layout_has_internal_route_line_overlap(&layout),
                     "seed {seed} segment {} {:?} still had cross-line overlap",
