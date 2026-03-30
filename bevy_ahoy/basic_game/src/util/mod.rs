@@ -287,9 +287,9 @@ fn tweak_materials(
             })
             .is_some_and(|name| name.contains("water_01"))
         {
-            mat.base_color = Color::WHITE.with_alpha(0.85);
+            mat.base_color = Color::srgb(0.92, 0.94, 0.98);
             mat.perceptual_roughness = 0.2;
-            mat.alpha_mode = AlphaMode::Blend;
+            mat.alpha_mode = AlphaMode::Opaque;
         } else {
             mat.perceptual_roughness = 0.8;
         }
