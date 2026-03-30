@@ -10,7 +10,6 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions},
 };
 use bevy_ahoy::{CharacterControllerOutput, CharacterControllerState, prelude::*};
-use bevy_ecs::world::FilteredEntityRef;
 use bevy_enhanced_input::prelude::{Release, *};
 use bevy_fix_cursor_unlock_web::{FixPointerUnlockPlugin, ForceUnlockCursor};
 use bevy_framepace::FramepacePlugin;
@@ -37,7 +36,6 @@ impl Plugin for ExampleUtilPlugin {
                 apply_last_stable_ground.after(calculate_stable_ground),
             ),
         )
-        .add_observer(reset_player)
         .add_observer(toggle_debug)
         .add_observer(unlock_cursor_web)
         .insert_resource(DirectionalLightShadowMap { size: 4096 })
@@ -159,11 +157,6 @@ fn setup_ui(mut commands: Commands) {
         DebugInput,
         actions!(DebugInput[
             (
-                Action::<Reset>::new(),
-                bindings![KeyCode::KeyR, GamepadButton::Select],
-                Release::default(),
-            ),
-            (
                 Action::<ToggleDebug>::new(),
                 bindings![KeyCode::Backquote, GamepadButton::Start],
                 Release::default(),
@@ -177,15 +170,7 @@ struct DebugInput;
 
 #[derive(Debug, InputAction)]
 #[action_output(bool)]
-pub(super) struct Reset;
-
-#[derive(Debug, InputAction)]
-#[action_output(bool)]
 pub(super) struct ToggleDebug;
-
-fn reset_player(_fire: On<Fire<Reset>>, mut commands: Commands) {
-    commands.run_system_cached(reset_player_inner);
-}
 
 fn toggle_debug(
     _fire: On<Fire<ToggleDebug>>,
@@ -195,45 +180,6 @@ fn toggle_debug(
         Visibility::Hidden => Visibility::Inherited,
         _ => Visibility::Hidden,
     };
-}
-
-fn reset_player_inner(
-    world: &mut World,
-    // Mutating the player `Transform` breaks on web for some reason? I blame interpolation.
-    mut player: Local<QueryState<(&mut Position, &mut LinearVelocity), With<CharacterController>>>,
-    mut camera: Local<QueryState<&mut Transform, (With<Camera3d>, Without<CharacterController>)>>,
-    mut spawner: Local<QueryState<&Transform, (Without<CharacterController>, Without<Camera3d>)>>,
-) {
-    let component_id = {
-        let type_registry = world.resource::<AppTypeRegistry>().read();
-        let Some(registration) = type_registry.get_with_short_type_path("SpawnPlayer") else {
-            return;
-        };
-        let type_id = registration.type_id();
-        let Some(component_id) = world.components().get_id(type_id) else {
-            return;
-        };
-        component_id
-    };
-    let mut query = QueryBuilder::<FilteredEntityRef>::new(world)
-        .ref_id(component_id)
-        .build();
-    let Some(spawn_entity) = query.iter(world).map(|e| e.entity()).next() else {
-        return;
-    };
-    let Ok(spawner_transform) = spawner.get(world, spawn_entity).copied() else {
-        return;
-    };
-
-    let Ok((mut position, mut velocity)) = player.single_mut(world) else {
-        return;
-    };
-    **velocity = Vec3::ZERO;
-    position.0 = spawner_transform.translation;
-    let Ok(mut camera_transform) = camera.single_mut(world) else {
-        return;
-    };
-    camera_transform.rotation = spawner_transform.rotation;
 }
 
 fn unlock_cursor_web(
