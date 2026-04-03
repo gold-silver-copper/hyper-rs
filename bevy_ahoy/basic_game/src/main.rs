@@ -8,11 +8,32 @@ use std::{
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
+    camera::Exposure,
+    core_pipeline::{
+        core_3d::graph::Node3d,
+        fullscreen_material::{FullscreenMaterial, FullscreenMaterialPlugin},
+        tonemapping::Tonemapping,
+    },
     input::common_conditions::input_just_pressed,
-    math::primitives::Cuboid,
-    mesh::Indices,
+    light::CascadeShadowConfigBuilder,
+    math::primitives::{Cuboid, Sphere},
+    mesh::{Indices, MeshVertexBufferLayoutRef},
+    pbr::{
+        ExtendedMaterial, Material, MaterialExtension, MaterialPipeline, MaterialPipelineKey,
+        OpaqueRendererMethod,
+    },
+    post_process::bloom::Bloom,
     prelude::*,
-    render::render_resource::PrimitiveTopology,
+    reflect::TypePath,
+    render::{
+        extract_component::ExtractComponent,
+        render_graph::{InternedRenderLabel, RenderLabel},
+        render_resource::{
+            AsBindGroup, Face, PrimitiveTopology, RenderPipelineDescriptor, ShaderType,
+            SpecializedMeshPipelineError,
+        },
+    },
+    shader::ShaderRef,
     window::{CursorGrabMode, CursorOptions, WindowResolution},
 };
 use bevy_ahoy::{CharacterControllerOutput, CharacterLook, input::AccumulatedInput, prelude::*};
@@ -70,12 +91,201 @@ const SURF_ENTRY_MARGIN_MIN: f32 = 10.0;
 const SURF_ENTRY_MARGIN_MAX: f32 = 18.0;
 const SURF_EXIT_MARGIN_MIN: f32 = 9.0;
 const SURF_EXIT_MARGIN_MAX: f32 = 16.0;
+const SKY_DOME_RADIUS: f32 = 1_240.0;
+const WORLD_SURFACE_SHADER_ASSET_PATH: &str = "shaders/world_surface_material.wgsl";
+const NEBULA_SKY_SHADER_ASSET_PATH: &str = "shaders/nebula_sky.wgsl";
+const WORLD_POST_PROCESS_SHADER_ASSET_PATH: &str = "shaders/world_post_process.wgsl";
+
+type WorldSurfaceMaterial = ExtendedMaterial<StandardMaterial, WorldSurfaceExtension>;
+
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+struct WorldSurfaceExtension {
+    #[uniform(100)]
+    settings: WorldSurfaceSettings,
+}
+
+#[derive(ShaderType, Debug, Clone)]
+struct WorldSurfaceSettings {
+    accent: Vec4,
+    secondary: Vec4,
+    emissive: Vec4,
+    atmosphere: Vec4,
+    params_a: Vec4,
+    params_b: Vec4,
+    params_c: Vec4,
+    params_d: Vec4,
+}
+
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+struct NebulaSkyMaterial {
+    #[uniform(0)]
+    settings: NebulaSkySettings,
+}
+
+#[derive(ShaderType, Debug, Clone)]
+struct NebulaSkySettings {
+    zenith: Vec4,
+    horizon: Vec4,
+    nebula_a: Vec4,
+    nebula_b: Vec4,
+    star: Vec4,
+    halo: Vec4,
+    params_a: Vec4,
+    params_b: Vec4,
+    params_c: Vec4,
+}
+
+#[derive(Component, ExtractComponent, ShaderType, Clone, Copy, Default)]
+struct WorldPostProcessSettings {
+    params_a: Vec4,
+    params_b: Vec4,
+}
+
+impl MaterialExtension for WorldSurfaceExtension {
+    fn fragment_shader() -> ShaderRef {
+        WORLD_SURFACE_SHADER_ASSET_PATH.into()
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+}
+
+impl Material for NebulaSkyMaterial {
+    fn fragment_shader() -> ShaderRef {
+        NEBULA_SKY_SHADER_ASSET_PATH.into()
+    }
+
+    fn opaque_render_method(&self) -> OpaqueRendererMethod {
+        OpaqueRendererMethod::Forward
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn enable_shadows() -> bool {
+        false
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.primitive.cull_mode = Some(Face::Front);
+        if let Some(depth_stencil) = descriptor.depth_stencil.as_mut() {
+            depth_stencil.depth_write_enabled = false;
+        }
+        Ok(())
+    }
+}
+
+impl FullscreenMaterial for WorldPostProcessSettings {
+    fn fragment_shader() -> ShaderRef {
+        WORLD_POST_PROCESS_SHADER_ASSET_PATH.into()
+    }
+
+    fn node_edges() -> Vec<InternedRenderLabel> {
+        vec![
+            Node3d::Tonemapping.intern(),
+            Self::node_label().intern(),
+            Node3d::EndMainPassPostProcessing.intern(),
+        ]
+    }
+}
+
+fn color_to_vec4(color: Color) -> Vec4 {
+    let [r, g, b, a] = LinearRgba::from(color).to_f32_array();
+    Vec4::new(r, g, b, a)
+}
+
+fn visual_motion_factor(speed: f32) -> f32 {
+    ((speed - 120.0) / 780.0).clamp(0.0, 1.0)
+}
+
+fn world_post_process_settings() -> WorldPostProcessSettings {
+    WorldPostProcessSettings {
+        params_a: Vec4::new(0.16, 1.06, 0.76, 0.0022),
+        params_b: Vec4::new(0.14, 0.028, 0.0, 0.08),
+    }
+}
+
+fn bhop_world_material() -> WorldSurfaceMaterial {
+    WorldSurfaceMaterial {
+        base: StandardMaterial {
+            base_color: Color::srgb(0.035, 0.045, 0.06),
+            reflectance: 0.12,
+            clearcoat: 0.02,
+            clearcoat_perceptual_roughness: 0.72,
+            perceptual_roughness: 0.94,
+            opaque_render_method: OpaqueRendererMethod::Forward,
+            ..default()
+        },
+        extension: WorldSurfaceExtension {
+            settings: WorldSurfaceSettings {
+                accent: color_to_vec4(Color::linear_rgb(0.92, 0.96, 0.99)),
+                secondary: color_to_vec4(Color::linear_rgb(0.24, 0.58, 0.7)),
+                emissive: color_to_vec4(Color::linear_rgb(0.0, 0.05, 0.08)),
+                atmosphere: color_to_vec4(Color::linear_rgb(0.03, 0.08, 0.14)),
+                params_a: Vec4::new(0.0, 0.12, 0.16, 0.26),
+                params_b: Vec4::new(0.22, 0.0, 1.0, 2.1),
+                params_c: Vec4::new(160.0, 1_220.0, 0.04, 0.58),
+                params_d: Vec4::new(0.0, 0.12, 0.0, 0.0),
+            },
+        },
+    }
+}
+
+fn surf_world_material() -> WorldSurfaceMaterial {
+    WorldSurfaceMaterial {
+        base: StandardMaterial {
+            base_color: Color::srgb(0.2, 0.28, 0.4),
+            cull_mode: None,
+            reflectance: 0.54,
+            clearcoat: 0.92,
+            clearcoat_perceptual_roughness: 0.08,
+            perceptual_roughness: 0.24,
+            opaque_render_method: OpaqueRendererMethod::Forward,
+            ..default()
+        },
+        extension: WorldSurfaceExtension {
+            settings: WorldSurfaceSettings {
+                accent: color_to_vec4(Color::linear_rgb(0.98, 0.995, 1.0)),
+                secondary: color_to_vec4(Color::linear_rgb(0.0, 0.76, 0.96)),
+                emissive: color_to_vec4(Color::linear_rgb(0.08, 0.42, 0.62)),
+                atmosphere: color_to_vec4(Color::linear_rgb(0.08, 0.22, 0.34)),
+                params_a: Vec4::new(1.0, 0.12, 0.0, 0.28),
+                params_b: Vec4::new(0.68, 2.8, 24.0, 7.2),
+                params_c: Vec4::new(180.0, 1_260.0, 0.22, 0.18),
+                params_d: Vec4::new(0.0, 0.42, 0.0, 0.18),
+            },
+        },
+    }
+}
+
+fn nebula_sky_material() -> NebulaSkyMaterial {
+    NebulaSkyMaterial {
+        settings: NebulaSkySettings {
+            zenith: color_to_vec4(Color::linear_rgb(0.004, 0.01, 0.02)),
+            horizon: color_to_vec4(Color::linear_rgb(0.03, 0.12, 0.19)),
+            nebula_a: color_to_vec4(Color::linear_rgb(0.0, 0.42, 0.56)),
+            nebula_b: color_to_vec4(Color::linear_rgb(0.94, 0.54, 0.24)),
+            star: color_to_vec4(Color::linear_rgba(1.0, 0.985, 0.92, 1.2)),
+            halo: color_to_vec4(Color::linear_rgba(0.6, 0.84, 1.0, 0.34)),
+            params_a: Vec4::new(2.1, 1.3, 360.0, 28.0),
+            params_b: Vec4::new(0.0024, -0.0016, 0.34, 0.28),
+            params_c: Vec4::new(-0.46, 0.22, 0.86, 7.5),
+        },
+    }
+}
 
 struct BasicGamePlugin;
 
 impl Plugin for BasicGamePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ClearColor(Color::srgb(0.75, 0.78, 0.82)))
+        app.insert_resource(ClearColor(Color::srgb(0.01, 0.02, 0.04)))
             .insert_resource(RunDirector::default())
             .insert_resource(WorldAssetCache::default())
             .insert_resource(SubstepCount(PHYSICS_SUBSTEPS))
@@ -88,6 +298,10 @@ impl Plugin for BasicGamePlugin {
             .add_systems(
                 PostStartup,
                 (tune_player_camera, configure_controls_overlay).chain(),
+            )
+            .add_systems(
+                PostUpdate,
+                (sync_sky_dome_to_camera, update_render_dynamics).chain(),
             )
             .add_systems(
                 Update,
@@ -134,6 +348,9 @@ fn main() -> AppExit {
                     ..default()
                 }),
             PhysicsPlugins::default(),
+            MaterialPlugin::<WorldSurfaceMaterial>::default(),
+            MaterialPlugin::<NebulaSkyMaterial>::default(),
+            FullscreenMaterialPlugin::<WorldPostProcessSettings>::default(),
             EnhancedInputPlugin,
             AhoyPlugins::default(),
             ExampleUtilPlugin,
@@ -159,17 +376,24 @@ fn basic_game_asset_path() -> String {
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<WorldSurfaceMaterial>>,
+    mut sky_materials: ResMut<Assets<NebulaSkyMaterial>>,
     mut asset_cache: ResMut<WorldAssetCache>,
 ) {
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.72, 0.74, 0.77),
-        brightness: 16.0,
+        color: Color::srgb(0.06, 0.1, 0.16),
+        brightness: 30.0,
         affects_lightmapped_meshes: true,
     });
 
     let blueprint = build_run_blueprint(current_run_seed());
     let initial_look = spawn_look_for_blueprint(&blueprint);
+    spawn_nebula_sky(
+        &mut commands,
+        &mut meshes,
+        &mut sky_materials,
+        blueprint.spawn,
+    );
     spawn_world(
         &blueprint,
         &mut commands,
@@ -229,6 +453,19 @@ fn setup_scene(
         Camera3d::default(),
         CharacterControllerCameraOf::new(player),
         Transform::from_rotation(initial_look.to_quat()),
+        Tonemapping::AcesFitted,
+        Exposure { ev100: 9.0 },
+        Bloom::NATURAL,
+        world_post_process_settings(),
+        DistanceFog {
+            color: Color::srgba(0.022, 0.075, 0.12, 0.42),
+            directional_light_color: Color::srgba(0.66, 0.88, 1.0, 0.16),
+            directional_light_exponent: 14.0,
+            falloff: FogFalloff::Linear {
+                start: 250.0,
+                end: 1_420.0,
+            },
+        },
     ));
 }
 
@@ -236,7 +473,7 @@ fn spawn_world(
     blueprint: &RunBlueprint,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut Assets<WorldSurfaceMaterial>,
     asset_cache: &mut WorldAssetCache,
 ) {
     spawn_basic_lighting(commands);
@@ -249,7 +486,7 @@ fn spawn_world_range(
     segment_start: usize,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut Assets<WorldSurfaceMaterial>,
     asset_cache: &mut WorldAssetCache,
 ) {
     for room in &blueprint.rooms[room_start.min(blueprint.rooms.len())..] {
@@ -266,14 +503,87 @@ fn spawn_basic_lighting(commands: &mut Commands) {
     commands.spawn((
         GeneratedWorld,
         Name::new("Sun"),
-        Transform::from_xyz(80.0, 180.0, 60.0).looking_at(Vec3::new(0.0, 40.0, 0.0), Vec3::Y),
+        Transform::from_xyz(170.0, 260.0, -120.0).looking_at(Vec3::new(0.0, 40.0, 0.0), Vec3::Y),
         DirectionalLight {
             shadows_enabled: true,
-            illuminance: 18_000.0,
-            color: Color::srgb(1.0, 0.98, 0.95),
+            illuminance: 21_000.0,
+            color: Color::srgb(0.9, 0.97, 1.0),
+            shadow_depth_bias: 0.12,
+            shadow_normal_bias: 0.52,
+            ..default()
+        },
+        CascadeShadowConfigBuilder {
+            first_cascade_far_bound: 72.0,
+            maximum_distance: 760.0,
+            overlap_proportion: 0.18,
+            ..default()
+        }
+        .build(),
+    ));
+
+    commands.spawn((
+        GeneratedWorld,
+        Name::new("Fill Light"),
+        Transform::from_xyz(-150.0, 220.0, 150.0).looking_at(Vec3::new(0.0, 30.0, 0.0), Vec3::Y),
+        DirectionalLight {
+            shadows_enabled: false,
+            illuminance: 7_500.0,
+            color: Color::srgb(0.6, 0.78, 0.92),
             ..default()
         },
     ));
+}
+
+fn spawn_nebula_sky(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<NebulaSkyMaterial>,
+    center: Vec3,
+) {
+    commands.spawn((
+        Name::new("Nebula Sky"),
+        SkyDome,
+        Mesh3d(meshes.add(Sphere::new(SKY_DOME_RADIUS).mesh().uv(64, 32))),
+        MeshMaterial3d(materials.add(nebula_sky_material())),
+        Transform::from_translation(center),
+    ));
+}
+
+fn sync_sky_dome_to_camera(
+    camera: Query<&Transform, (With<Camera3d>, Without<SkyDome>)>,
+    mut sky: Query<&mut Transform, With<SkyDome>>,
+) {
+    let Ok(camera_transform) = camera.single() else {
+        return;
+    };
+
+    for mut sky_transform in &mut sky {
+        sky_transform.translation = camera_transform.translation;
+    }
+}
+
+fn update_render_dynamics(
+    players: Query<&LinearVelocity, With<Player>>,
+    asset_cache: Res<WorldAssetCache>,
+    mut materials: ResMut<Assets<WorldSurfaceMaterial>>,
+    mut post_process: Query<&mut WorldPostProcessSettings, With<Camera3d>>,
+) {
+    let speed = players
+        .single()
+        .map(|velocity| velocity.length())
+        .unwrap_or(0.0);
+    let motion = visual_motion_factor(speed);
+
+    for handle in asset_cache.materials.values() {
+        if let Some(material) = materials.get_mut(handle) {
+            material.extension.settings.params_d.x = motion;
+        }
+    }
+
+    for mut settings in &mut post_process {
+        settings.params_b.z = motion;
+        settings.params_b.w = 0.08 + motion * 0.04;
+    }
 }
 
 fn setup_hud(mut commands: Commands) {
@@ -336,10 +646,7 @@ fn tick_run_timer(time: Res<Time>, mut run: ResMut<RunState>) {
     run.timer.tick(time.delta());
 }
 
-fn queue_run_controls(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut director: ResMut<RunDirector>,
-) {
+fn queue_run_controls(keys: Res<ButtonInput<KeyCode>>, mut director: ResMut<RunDirector>) {
     if director.pending.is_some() {
         return;
     }
@@ -358,7 +665,7 @@ fn extend_course_ahead(
     mut run: ResMut<RunState>,
     players: Query<&Transform, With<Player>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<WorldSurfaceMaterial>>,
     mut asset_cache: ResMut<WorldAssetCache>,
 ) {
     if director.pending.is_some() {
@@ -422,7 +729,7 @@ fn process_run_request(
     >,
     mut camera: Query<&mut Transform, (With<Camera3d>, Without<Player>)>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<WorldSurfaceMaterial>>,
     mut asset_cache: ResMut<WorldAssetCache>,
 ) {
     let Some(request) = director.pending.take() else {
@@ -531,6 +838,9 @@ struct GeneratedWorld;
 
 #[derive(Component)]
 struct SurfRampSurface;
+
+#[derive(Component)]
+struct SkyDome;
 
 #[derive(Component, Default)]
 #[component(on_add = PlayerInput::on_add)]
@@ -790,13 +1100,13 @@ impl MeshSizeKey {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum MaterialKey {
     BhopPlatform,
-    SurfVertex,
+    SurfRamp,
 }
 
 #[derive(Resource, Default)]
 struct WorldAssetCache {
     cuboid_meshes: HashMap<MeshSizeKey, Handle<Mesh>>,
-    materials: HashMap<MaterialKey, Handle<StandardMaterial>>,
+    materials: HashMap<MaterialKey, Handle<WorldSurfaceMaterial>>,
 }
 
 #[derive(Clone)]
@@ -935,7 +1245,7 @@ fn spawn_layout(
     layout: &ModuleLayout,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut Assets<WorldSurfaceMaterial>,
     asset_cache: &mut WorldAssetCache,
 ) {
     for solid in &layout.solids {
@@ -947,7 +1257,7 @@ fn spawn_solid(
     spec: &SolidSpec,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut Assets<WorldSurfaceMaterial>,
     asset_cache: &mut WorldAssetCache,
 ) {
     if let Err(reason) = validate_solid_spec(spec) {
@@ -987,7 +1297,7 @@ fn spawn_solid(
                 MeshMaterial3d(cached_material(
                     asset_cache,
                     materials,
-                    MaterialKey::SurfVertex,
+                    MaterialKey::SurfRamp,
                 )),
                 Transform::from_translation(spec.center),
             ));
@@ -1039,31 +1349,16 @@ fn cached_cuboid_mesh(
 
 fn cached_material(
     cache: &mut WorldAssetCache,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut Assets<WorldSurfaceMaterial>,
     key: MaterialKey,
-) -> Handle<StandardMaterial> {
+) -> Handle<WorldSurfaceMaterial> {
     if let Some(handle) = cache.materials.get(&key) {
         return handle.clone();
     }
 
     let material = match key {
-        MaterialKey::BhopPlatform => StandardMaterial {
-            base_color: Color::srgb(0.48, 0.54, 0.62),
-            reflectance: 0.58,
-            clearcoat: 0.18,
-            clearcoat_perceptual_roughness: 0.5,
-            perceptual_roughness: 0.64,
-            ..default()
-        },
-        MaterialKey::SurfVertex => StandardMaterial {
-            base_color: Color::WHITE,
-            cull_mode: None,
-            reflectance: 0.76,
-            clearcoat: 0.88,
-            clearcoat_perceptual_roughness: 0.08,
-            perceptual_roughness: 0.12,
-            ..default()
-        },
+        MaterialKey::BhopPlatform => bhop_world_material(),
+        MaterialKey::SurfRamp => surf_world_material(),
     };
     let handle = materials.add(material);
     cache.materials.insert(key, handle.clone());
@@ -1073,21 +1368,21 @@ fn cached_material(
 fn material_key_for_paint(paint: PaintStyle) -> MaterialKey {
     match paint {
         PaintStyle::BhopPlatform => MaterialKey::BhopPlatform,
-        PaintStyle::SurfRamp => MaterialKey::SurfVertex,
+        PaintStyle::SurfRamp => MaterialKey::SurfRamp,
     }
 }
 
 fn paint_base_color(paint: PaintStyle) -> Color {
     match paint {
-        PaintStyle::BhopPlatform => Color::srgb(0.48, 0.54, 0.62),
-        PaintStyle::SurfRamp => Color::srgb(0.42, 0.58, 0.8),
+        PaintStyle::BhopPlatform => Color::srgb(0.22, 0.28, 0.36),
+        PaintStyle::SurfRamp => Color::srgb(0.26, 0.44, 0.7),
     }
 }
 
 fn paint_stripe_color(paint: PaintStyle) -> Color {
     match paint {
-        PaintStyle::BhopPlatform => Color::linear_rgb(0.82, 0.88, 0.96),
-        PaintStyle::SurfRamp => Color::linear_rgb(1.0, 1.0, 1.0),
+        PaintStyle::BhopPlatform => Color::linear_rgb(0.78, 0.92, 1.0),
+        PaintStyle::SurfRamp => Color::linear_rgb(0.96, 0.99, 1.0),
     }
 }
 
@@ -1458,27 +1753,73 @@ struct ColoredMeshBuilder {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     colors: Vec<[f32; 4]>,
+    uvs: Vec<[f32; 2]>,
 }
 
 impl ColoredMeshBuilder {
-    fn push_triangle(&mut self, a: Vec3, b: Vec3, c: Vec3, color: Color) {
-        let normal = (b - a).cross(c - a).normalize_or_zero();
-        let normal = if normal == Vec3::ZERO {
-            Vec3::Y
-        } else {
-            normal
-        };
+    fn push_triangle_uv_outward(
+        &mut self,
+        hull_center: Vec3,
+        a: Vec3,
+        b: Vec3,
+        c: Vec3,
+        uvs: [Vec2; 3],
+        color: Color,
+    ) {
+        let mut points = [(a, uvs[0]), (b, uvs[1]), (c, uvs[2])];
+        let mut normal = outward_triangle_normal(a, b, c, hull_center);
+        let triangle_center = (a + b + c) / 3.0;
+        if normal.dot(triangle_center - hull_center) < 0.0 {
+            points.swap(1, 2);
+            normal = outward_triangle_normal(points[0].0, points[1].0, points[2].0, hull_center);
+        }
+
         let color = LinearRgba::from(color).to_f32_array();
-        for point in [a, b, c] {
+        for (point, uv) in points {
             self.positions.push([point.x, point.y, point.z]);
             self.normals.push([normal.x, normal.y, normal.z]);
             self.colors.push(color);
+            self.uvs.push([uv.x, uv.y]);
         }
     }
 
-    fn push_quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: Color) {
-        self.push_triangle(a, b, c, color);
-        self.push_triangle(a, c, d, color);
+    fn push_quad_outward(
+        &mut self,
+        hull_center: Vec3,
+        a: Vec3,
+        b: Vec3,
+        c: Vec3,
+        d: Vec3,
+        color: Color,
+    ) {
+        self.push_quad_uv_outward(
+            hull_center,
+            a,
+            b,
+            c,
+            d,
+            [
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 0.0),
+                Vec2::new(1.0, 1.0),
+                Vec2::new(0.0, 1.0),
+            ],
+            color,
+        );
+    }
+
+    fn push_quad_uv_outward(
+        &mut self,
+        hull_center: Vec3,
+        a: Vec3,
+        b: Vec3,
+        c: Vec3,
+        d: Vec3,
+        uvs: [Vec2; 4],
+        color: Color,
+    ) {
+        self.push_triangle_uv_outward(hull_center, a, b, c, [uvs[0], uvs[1], uvs[2]], color);
+        self.push_triangle_uv_outward(hull_center, a, c, d, [uvs[0], uvs[2], uvs[3]], color);
     }
 
     fn build(self) -> Mesh {
@@ -1489,6 +1830,21 @@ impl ColoredMeshBuilder {
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs)
+    }
+}
+
+fn outward_triangle_normal(a: Vec3, b: Vec3, c: Vec3, hull_center: Vec3) -> Vec3 {
+    let normal = (b - a).cross(c - a).normalize_or_zero();
+    if normal != Vec3::ZERO {
+        return normal;
+    }
+
+    let fallback = ((a + b + c) / 3.0 - hull_center).normalize_or_zero();
+    if fallback == Vec3::ZERO {
+        Vec3::Y
+    } else {
+        fallback
     }
 }
 
@@ -1521,11 +1877,11 @@ fn append_surf_wedge_render_geometry(
     let underside = deepen(base_color, 0.28);
     let side_shadow = deepen(base_color, 0.18);
 
-    builder.push_quad(e, g, h, f, underside);
-    builder.push_quad(a, c, g, e, outer_face);
-    builder.push_quad(b, f, h, d, side_shadow);
-    builder.push_quad(a, e, f, b, deepen(base_color, 0.08));
-    builder.push_quad(c, d, h, g, deepen(base_color, 0.14));
+    builder.push_quad_outward(center, e, g, h, f, underside);
+    builder.push_quad_outward(center, a, c, g, e, outer_face);
+    builder.push_quad_outward(center, b, f, h, d, side_shadow);
+    builder.push_quad_outward(center, a, e, f, b, deepen(base_color, 0.08));
+    builder.push_quad_outward(center, c, d, h, g, deepen(base_color, 0.14));
 
     let front_ridge = a;
     let back_ridge = b;
@@ -1559,11 +1915,18 @@ fn append_surf_wedge_render_geometry(
             stripe_core,
             &stripe_specs,
         );
-        builder.push_quad(
+        builder.push_quad_uv_outward(
+            center,
             front_ridge.lerp(front_outer, start_t),
             back_ridge.lerp(back_outer, start_t),
             back_ridge.lerp(back_outer, end_t),
             front_ridge.lerp(front_outer, end_t),
+            [
+                Vec2::new(0.0, start_t),
+                Vec2::new(1.0, start_t),
+                Vec2::new(1.0, end_t),
+                Vec2::new(0.0, end_t),
+            ],
             band_color,
         );
     }
@@ -2281,18 +2644,76 @@ mod tests {
     }
 
     #[test]
-    fn surf_material_is_opaque_and_double_sided() {
+    fn surf_material_uses_forward_glossy_profile() {
         let mut cache = WorldAssetCache::default();
-        let mut materials = Assets::<StandardMaterial>::default();
-        let handle = cached_material(&mut cache, &mut materials, MaterialKey::SurfVertex);
+        let mut materials = Assets::<WorldSurfaceMaterial>::default();
+        let handle = cached_material(&mut cache, &mut materials, MaterialKey::SurfRamp);
         let material = materials
             .get(&handle)
             .expect("cached surf material should exist");
 
-        assert!(matches!(material.alpha_mode, AlphaMode::Opaque));
-        assert_eq!(material.base_color.alpha(), 1.0);
-        assert!(material.clearcoat >= 0.85);
-        assert!(material.cull_mode.is_none());
+        assert!(matches!(
+            material.base.opaque_render_method,
+            OpaqueRendererMethod::Forward
+        ));
+        assert!(matches!(material.base.alpha_mode, AlphaMode::Opaque));
+        assert!(material.base.clearcoat >= 0.8);
+        assert!(material.base.cull_mode.is_none());
+        assert!(material.extension.settings.params_a.x > 0.5);
+        assert!(material.extension.settings.params_c.x < material.extension.settings.params_c.y);
+        assert!(material.extension.settings.atmosphere.w > 0.0);
+    }
+
+    #[test]
+    fn bhop_material_uses_shader_detail_profile() {
+        let mut cache = WorldAssetCache::default();
+        let mut materials = Assets::<WorldSurfaceMaterial>::default();
+        let handle = cached_material(&mut cache, &mut materials, MaterialKey::BhopPlatform);
+        let material = materials
+            .get(&handle)
+            .expect("cached bhop material should exist");
+
+        assert!(matches!(
+            material.base.opaque_render_method,
+            OpaqueRendererMethod::Forward
+        ));
+        assert!(material.base.clearcoat <= 0.12);
+        assert!(material.extension.settings.params_a.x < 0.5);
+        assert!(material.extension.settings.params_a.y > 0.1);
+        assert!(material.extension.settings.params_b.z <= 5.0);
+        assert!(material.extension.settings.params_c.x < material.extension.settings.params_c.y);
+    }
+
+    #[test]
+    fn nebula_sky_material_uses_forward_unshadowed_pipeline() {
+        let material = nebula_sky_material();
+
+        assert!(matches!(
+            material.opaque_render_method(),
+            OpaqueRendererMethod::Forward
+        ));
+        assert!(!<NebulaSkyMaterial as Material>::enable_prepass());
+        assert!(!<NebulaSkyMaterial as Material>::enable_shadows());
+        assert!(material.settings.params_a.z > 100.0);
+        assert!(material.settings.halo.w > 0.0);
+    }
+
+    #[test]
+    fn post_process_defaults_stay_restrained() {
+        let settings = world_post_process_settings();
+
+        assert!(settings.params_a.x < 0.25);
+        assert!(settings.params_a.y > 1.0);
+        assert!(settings.params_b.x < 0.2);
+        assert!(settings.params_b.y < 0.05);
+    }
+
+    #[test]
+    fn visual_motion_factor_is_bounded() {
+        assert_eq!(visual_motion_factor(0.0), 0.0);
+        assert_eq!(visual_motion_factor(120.0), 0.0);
+        assert!(visual_motion_factor(450.0) > 0.0);
+        assert_eq!(visual_motion_factor(10_000.0), 1.0);
     }
 
     #[test]
@@ -2317,6 +2738,74 @@ mod tests {
         );
 
         assert_eq!(builder.positions.len(), 84);
+        assert_eq!(builder.uvs.len(), builder.positions.len());
+        assert!(
+            builder
+                .uvs
+                .iter()
+                .all(|uv| uv[0].is_finite() && uv[1].is_finite())
+        );
+    }
+
+    #[test]
+    fn surf_wedge_triangles_face_outward_for_mirrored_walls() {
+        let points = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(6.0, 0.0, 0.0),
+            Vec3::new(0.0, -1.2, 4.0),
+            Vec3::new(6.0, -1.2, 4.0),
+            Vec3::new(0.0, -0.24, 0.0),
+            Vec3::new(6.0, -0.24, 0.0),
+            Vec3::new(0.0, -1.44, 4.0),
+            Vec3::new(6.0, -1.44, 4.0),
+        ];
+
+        for render_points in [
+            points.clone(),
+            points
+                .iter()
+                .map(|point| Vec3::new(-point.x, point.y, point.z))
+                .collect::<Vec<_>>(),
+        ] {
+            let mut builder = ColoredMeshBuilder::default();
+            append_surf_wedge_render_geometry(
+                &mut builder,
+                Vec3::ZERO,
+                &render_points,
+                Color::srgb(0.2, 0.3, 0.5),
+                Color::srgb(0.9, 0.9, 1.0),
+            );
+
+            for triangle in builder
+                .positions
+                .chunks_exact(3)
+                .zip(builder.normals.chunks_exact(3))
+            {
+                let (positions, normals) = triangle;
+                let center = positions
+                    .iter()
+                    .map(|position| Vec3::from_array(*position))
+                    .sum::<Vec3>()
+                    / 3.0;
+                let normal = Vec3::from_array(normals[0]);
+                assert!(
+                    normal.dot(center) >= -0.001,
+                    "triangle normal should face away from wedge center"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_render_meshes_include_shader_uv_inputs() {
+        let mut cache = WorldAssetCache::default();
+        let mut meshes = Assets::<Mesh>::default();
+        let handle = cached_cuboid_mesh(&mut cache, &mut meshes, Vec3::new(4.0, 1.0, 4.0));
+        let mesh = meshes
+            .get(&handle)
+            .expect("cached cuboid mesh should exist");
+
+        assert!(mesh.attribute(Mesh::ATTRIBUTE_UV_0).is_some());
     }
 
     #[test]
