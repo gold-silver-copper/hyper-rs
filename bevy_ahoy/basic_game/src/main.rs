@@ -24,7 +24,10 @@ use crate::util::{ControlsOverlay, ExampleUtilPlugin, StableGround};
 
 mod util;
 
-const PLAYER_SPAWN_CLEARANCE: f32 = 2.4;
+const PLAYER_SPAWN_CLEARANCE: f32 = 3.1;
+const SURF_SPAWN_CLEARANCE: f32 = 8.0;
+const SURF_SPAWN_FACE_T: f32 = 0.42;
+const SPAWN_PLATFORM_EDGE_INSET: f32 = 3.0;
 const PLAYER_GRAVITY: f32 = 29.0;
 const PLAYER_STEP_SIZE: f32 = 1.0;
 const PLAYER_GROUND_DISTANCE: f32 = 0.05;
@@ -37,8 +40,6 @@ const SURF_SKIN_WIDTH: f32 = 0.003;
 const PLAYER_MOVE_AND_SLIDE_ITERATIONS: usize = 8;
 const PLAYER_DEPENETRATION_ITERATIONS: usize = 8;
 const PHYSICS_SUBSTEPS: u32 = 12;
-const CHECKPOINT_RADIUS: f32 = 3.2;
-const CHECKPOINT_DEATH_MARGIN: f32 = 90.0;
 const INITIAL_ROOM_COUNT: usize = 16;
 const APPEND_TRIGGER_ROOMS: usize = 4;
 const APPEND_BATCH_ROOMS: usize = 8;
@@ -55,11 +56,20 @@ const SURF_MAX_RENDER_SEGMENTS: usize = 224;
 const SURF_COLLIDER_SAMPLE_LENGTH: f32 = 0.85;
 const SURF_MAX_COLLIDER_SEGMENTS: usize = 640;
 const SURF_COLLIDER_COLUMNS: usize = 5;
-const ROLLOVER_FORWARD_SPEED_THRESHOLD: f32 = 3.5;
-const ROLLOVER_CATCH_DROP_MIN: f32 = 44.0;
-const ROLLOVER_CATCH_DROP_MAX: f32 = 72.0;
-const ROLLOVER_CATCH_DROP_SPEED_SCALE: f32 = 0.36;
-const ROLLOVER_ENTRY_LEAD: f32 = 10.0;
+const SURF_SECTION_GAP_MIN: f32 = 128.0;
+const SURF_SECTION_GAP_MAX: f32 = 168.0;
+const SURF_SECTION_DROP_MIN: f32 = 24.0;
+const SURF_SECTION_DROP_MAX: f32 = 36.0;
+const BHOP_SECTION_GAP_MIN: f32 = 98.0;
+const BHOP_SECTION_GAP_MAX: f32 = 132.0;
+const BHOP_SECTION_DROP_MIN: f32 = 16.0;
+const BHOP_SECTION_DROP_MAX: f32 = 28.0;
+const BHOP_ANCHOR_MARGIN_MIN: f32 = 14.0;
+const BHOP_ANCHOR_MARGIN_MAX: f32 = 22.0;
+const SURF_ENTRY_MARGIN_MIN: f32 = 10.0;
+const SURF_ENTRY_MARGIN_MAX: f32 = 18.0;
+const SURF_EXIT_MARGIN_MIN: f32 = 9.0;
+const SURF_EXIT_MARGIN_MAX: f32 = 16.0;
 
 struct BasicGamePlugin;
 
@@ -91,9 +101,7 @@ impl Plugin for BasicGamePlugin {
                 (
                     tick_run_timer,
                     queue_run_controls,
-                    activate_checkpoints,
                     extend_course_ahead,
-                    detect_failures,
                     process_run_request,
                     update_hud,
                 )
@@ -108,7 +116,6 @@ impl Plugin for BasicGamePlugin {
 
 fn main() -> AppExit {
     App::new()
-        .register_type::<SpawnPlayer>()
         .add_plugins((
             DefaultPlugins
                 .set(AssetPlugin {
@@ -162,23 +169,15 @@ fn setup_scene(
     });
 
     let blueprint = build_run_blueprint(current_run_seed());
-    let initial_look = respawn_look_for_checkpoint(&blueprint, 0);
+    let initial_look = spawn_look_for_blueprint(&blueprint);
     spawn_world(
         &blueprint,
-        0,
         &mut commands,
         &mut meshes,
         &mut materials,
         &mut asset_cache,
     );
     commands.insert_resource(RunState::new(blueprint.clone()));
-
-    commands.spawn((
-        Name::new("Spawn Point"),
-        SpawnPlayer,
-        Transform::from_translation(blueprint.spawn).with_rotation(initial_look.to_quat()),
-        GlobalTransform::default(),
-    ));
 
     let player = commands
         .spawn((
@@ -235,30 +234,19 @@ fn setup_scene(
 
 fn spawn_world(
     blueprint: &RunBlueprint,
-    epoch: u64,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     asset_cache: &mut WorldAssetCache,
 ) {
-    spawn_basic_lighting(epoch, commands);
-    spawn_world_range(
-        blueprint,
-        0,
-        0,
-        epoch,
-        commands,
-        meshes,
-        materials,
-        asset_cache,
-    );
+    spawn_basic_lighting(commands);
+    spawn_world_range(blueprint, 0, 0, commands, meshes, materials, asset_cache);
 }
 
 fn spawn_world_range(
     blueprint: &RunBlueprint,
     room_start: usize,
     segment_start: usize,
-    epoch: u64,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
@@ -266,17 +254,17 @@ fn spawn_world_range(
 ) {
     for room in &blueprint.rooms[room_start.min(blueprint.rooms.len())..] {
         let layout = build_room_layout(room);
-        spawn_layout(&layout, epoch, commands, meshes, materials, asset_cache);
+        spawn_layout(&layout, commands, meshes, materials, asset_cache);
     }
     for segment in &blueprint.segments[segment_start.min(blueprint.segments.len())..] {
         let layout = build_segment_layout(segment, &blueprint.rooms);
-        spawn_layout(&layout, epoch, commands, meshes, materials, asset_cache);
+        spawn_layout(&layout, commands, meshes, materials, asset_cache);
     }
 }
 
-fn spawn_basic_lighting(epoch: u64, commands: &mut Commands) {
+fn spawn_basic_lighting(commands: &mut Commands) {
     commands.spawn((
-        GeneratedWorld { epoch },
+        GeneratedWorld,
         Name::new("Sun"),
         Transform::from_xyz(80.0, 180.0, 60.0).looking_at(Vec3::new(0.0, 40.0, 0.0), Vec3::Y),
         DirectionalLight {
@@ -314,9 +302,7 @@ fn configure_controls_overlay(mut overlay: Single<&mut Text, With<ControlsOverla
 WASD: move\n\
 Space: jump\n\
 Ctrl: crouch\n\
-F5: rerun seed\n\
-N: new seed\n\
-R: reset to checkpoint\n\
+R: new seed\n\
 Esc: free mouse\n\
 Backtick: toggle debug"
         .into();
@@ -334,18 +320,15 @@ fn update_hud(
     hud.0 = format!(
         "Basic Game\n\
          Seed: {seed:016x}\n\
-         Sections: {rooms} | Checkpoint: {checkpoint}/{checkpoint_total}\n\
+         Sections: {rooms}\n\
          Height: {height:.1} | Speed: {speed:.1}\n\
-         Time: {time:.1}s | Deaths: {deaths}\n\
+         Time: {time:.1}s\n\
          Mode: Endless",
         seed = run.blueprint.seed,
         rooms = run.blueprint.rooms.len(),
-        checkpoint = run.current_checkpoint + 1,
-        checkpoint_total = run.checkpoint_count(),
         height = player.translation.y,
         speed = velocity.length(),
         time = run.timer.elapsed_secs(),
-        deaths = run.deaths,
     );
 }
 
@@ -355,56 +338,17 @@ fn tick_run_timer(time: Res<Time>, mut run: ResMut<RunState>) {
 
 fn queue_run_controls(
     keys: Res<ButtonInput<KeyCode>>,
-    run: Res<RunState>,
     mut director: ResMut<RunDirector>,
 ) {
     if director.pending.is_some() {
         return;
     }
 
-    if keys.just_pressed(KeyCode::F5) {
-        director.pending = Some(RunRequest {
-            kind: RunRequestKind::RestartSameSeed,
-            seed: run.blueprint.seed,
-        });
-    } else if keys.just_pressed(KeyCode::KeyR) {
-        director.pending = Some(RunRequest {
-            kind: RunRequestKind::Respawn,
-            seed: run.blueprint.seed,
-        });
-    } else if keys.just_pressed(KeyCode::KeyN) {
+    if keys.just_pressed(KeyCode::KeyR) {
         director.pending = Some(RunRequest {
             kind: RunRequestKind::RestartNewSeed,
             seed: current_run_seed(),
         });
-    }
-}
-
-fn activate_checkpoints(
-    players: Query<&Transform, With<Player>>,
-    pads: Query<(&Transform, &CheckpointPad), Without<SpawnPlayer>>,
-    mut run: ResMut<RunState>,
-    mut spawn_marker: Single<&mut Transform, (With<SpawnPlayer>, Without<Player>)>,
-) {
-    let Ok(player) = players.single() else {
-        return;
-    };
-
-    for (transform, checkpoint) in &pads {
-        if checkpoint.epoch != run.epoch {
-            continue;
-        }
-        let delta = transform.translation - player.translation;
-        if delta.y.abs() < 2.0
-            && delta.xz().length() <= CHECKPOINT_RADIUS
-            && checkpoint.index > run.current_checkpoint
-        {
-            run.current_checkpoint = checkpoint.index;
-            spawn_marker.translation = run.checkpoint_position(checkpoint.index);
-            spawn_marker.rotation =
-                respawn_look_for_checkpoint(&run.blueprint, checkpoint.index).to_quat();
-            run.death_plane = checkpoint_death_plane(&run.blueprint, checkpoint.index);
-        }
     }
 }
 
@@ -425,8 +369,7 @@ fn extend_course_ahead(
         return;
     };
 
-    let checkpoint_room = run.blueprint.checkpoint_room_index(run.current_checkpoint);
-    let focus_room = nearest_room_index(&run.blueprint, player.translation).max(checkpoint_room);
+    let focus_room = nearest_room_index(&run.blueprint, player.translation);
     let rooms_remaining = run.blueprint.rooms.len().saturating_sub(focus_room + 1);
     if rooms_remaining > APPEND_TRIGGER_ROOMS {
         return;
@@ -439,13 +382,11 @@ fn extend_course_ahead(
         &run.blueprint,
         room_start,
         segment_start,
-        run.epoch,
         &mut commands,
         &mut meshes,
         &mut materials,
         &mut asset_cache,
     );
-    run.death_plane = checkpoint_death_plane(&run.blueprint, run.current_checkpoint);
 }
 
 fn nearest_room_index(blueprint: &RunBlueprint, player_position: Vec3) -> usize {
@@ -465,32 +406,11 @@ fn room_focus_score(room: &RoomPlan, player_position: Vec3) -> f32 {
     delta.xz().length() + delta.y.abs() * 0.28
 }
 
-fn detect_failures(
-    players: Query<(&Transform, &LinearVelocity, &CharacterLook), With<Player>>,
-    run: Res<RunState>,
-    mut director: ResMut<RunDirector>,
-) {
-    if director.pending.is_some() {
-        return;
-    }
-
-    let Ok((player, velocity, look)) = players.single() else {
-        return;
-    };
-    if player.translation.y < run.death_plane {
-        let snapshot = FallSnapshot::new(player.translation, velocity.0, look_forward(look));
-        director.pending = Some(RunRequest {
-            kind: RunRequestKind::Rollover(snapshot.clone()),
-            seed: rollover_seed(&run, &snapshot),
-        });
-    }
-}
-
 fn process_run_request(
     mut commands: Commands,
     mut director: ResMut<RunDirector>,
     mut run: ResMut<RunState>,
-    generated: Query<(Entity, &GeneratedWorld)>,
+    generated: Query<Entity, With<GeneratedWorld>>,
     mut players: Query<
         (
             &mut Position,
@@ -500,11 +420,7 @@ fn process_run_request(
         ),
         With<Player>,
     >,
-    mut camera: Query<&mut Transform, (With<Camera3d>, Without<Player>, Without<SpawnPlayer>)>,
-    mut spawn_marker: Single<
-        &mut Transform,
-        (With<SpawnPlayer>, Without<Player>, Without<Camera3d>),
-    >,
+    mut camera: Query<&mut Transform, (With<Camera3d>, Without<Player>)>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut asset_cache: ResMut<WorldAssetCache>,
@@ -513,53 +429,26 @@ fn process_run_request(
         return;
     };
 
-    let mut reset_player = false;
-    let mut reset_velocity = true;
-    let mut reset_look = true;
-
-    match request.kind {
-        RunRequestKind::Respawn => {
-            reset_player = true;
-        }
-        RunRequestKind::RestartSameSeed | RunRequestKind::RestartNewSeed => {
-            let old_epoch = run.epoch;
-            let next_epoch = run.reserve_epoch();
+    let reset_player = match request.kind {
+        RunRequestKind::RestartNewSeed => {
+            for entity in &generated {
+                commands.entity(entity).despawn();
+            }
             let blueprint = build_run_blueprint(request.seed);
             spawn_world(
                 &blueprint,
-                next_epoch,
                 &mut commands,
                 &mut meshes,
                 &mut materials,
                 &mut asset_cache,
             );
-            despawn_generated_epoch(&mut commands, &generated, old_epoch);
-            run.apply_restart_blueprint(blueprint, next_epoch);
-            reset_player = true;
+            run.apply_restart_blueprint(blueprint);
+            true
         }
-        RunRequestKind::Rollover(snapshot) => {
-            let old_epoch = run.epoch;
-            let next_epoch = run.reserve_epoch();
-            let blueprint = build_rollover_blueprint(request.seed, &snapshot);
-            spawn_world(
-                &blueprint,
-                next_epoch,
-                &mut commands,
-                &mut meshes,
-                &mut materials,
-                &mut asset_cache,
-            );
-            despawn_generated_epoch(&mut commands, &generated, old_epoch);
-            run.apply_rollover_blueprint(blueprint, next_epoch);
-            reset_velocity = false;
-            reset_look = false;
-        }
-    }
+    };
 
-    let spawn = run.checkpoint_position(run.current_checkpoint);
-    let look = respawn_look_for_checkpoint(&run.blueprint, run.current_checkpoint);
-    spawn_marker.translation = spawn;
-    spawn_marker.rotation = look.to_quat();
+    let spawn = run.blueprint.spawn;
+    let look = spawn_look_for_blueprint(&run.blueprint);
 
     if reset_player
         && let Ok((mut position, mut transform, mut velocity, mut character_look)) =
@@ -567,55 +456,39 @@ fn process_run_request(
     {
         position.0 = spawn;
         transform.translation = spawn;
-        if reset_velocity {
-            velocity.0 = Vec3::ZERO;
-        }
-        if reset_look {
-            *character_look = look.clone();
-        }
+        velocity.0 = Vec3::ZERO;
+        *character_look = look.clone();
     }
 
-    if reset_look && let Ok(mut camera_transform) = camera.single_mut() {
+    if let Ok(mut camera_transform) = camera.single_mut() {
         camera_transform.rotation = look.to_quat();
     }
 }
 
-fn despawn_generated_epoch(
-    commands: &mut Commands,
-    generated: &Query<(Entity, &GeneratedWorld)>,
-    epoch: u64,
-) {
-    for (entity, generated) in generated.iter() {
-        if generated.epoch == epoch {
-            commands.entity(entity).despawn();
-        }
-    }
-}
-
-fn respawn_look_for_checkpoint(blueprint: &RunBlueprint, checkpoint_index: usize) -> CharacterLook {
-    let current_room = blueprint.checkpoint_room_index(checkpoint_index);
-    let next_room = (current_room + 1).min(blueprint.rooms.len().saturating_sub(1));
-    let mut facing = blueprint.rooms[next_room].top - blueprint.rooms[current_room].top;
-    facing.y = 0.0;
-    let facing = facing.normalize_or_zero();
+fn spawn_look_for_blueprint(blueprint: &RunBlueprint) -> CharacterLook {
+    let facing = spawn_facing_for_blueprint(blueprint);
     if facing == Vec3::ZERO {
         return CharacterLook::default();
     }
 
     CharacterLook {
-        yaw: facing.x.atan2(facing.z),
+        yaw: (-facing.x).atan2(-facing.z),
         pitch: 0.0,
     }
 }
 
-fn checkpoint_death_plane(blueprint: &RunBlueprint, checkpoint_index: usize) -> f32 {
-    let checkpoint_room = blueprint.checkpoint_room_index(checkpoint_index);
-    let end_room = (checkpoint_room + 4).min(blueprint.rooms.len().saturating_sub(1));
-    let min_y = blueprint.rooms[checkpoint_room..=end_room]
-        .iter()
-        .map(|room| room.top.y)
-        .fold(f32::INFINITY, f32::min);
-    min_y - CHECKPOINT_DEATH_MARGIN
+fn spawn_facing_for_blueprint(blueprint: &RunBlueprint) -> Vec3 {
+    if let Some(segment) = blueprint.first_segment() {
+        let layout = build_segment_layout(segment, &blueprint.rooms);
+        if let Some(facing) = first_segment_facing(&layout, segment.kind) {
+            return facing;
+        }
+    }
+
+    let next_room = 1.min(blueprint.rooms.len().saturating_sub(1));
+    let mut facing = blueprint.rooms[next_room].top - blueprint.rooms[0].top;
+    facing.y = 0.0;
+    facing.normalize_or_zero()
 }
 
 fn tune_player_camera(mut cameras: Query<&mut Projection, With<Camera3d>>) {
@@ -647,10 +520,6 @@ fn release_cursor(mut cursor: Single<&mut CursorOptions>) {
     cursor.grab_mode = CursorGrabMode::None;
 }
 
-#[derive(Component, Reflect, Default)]
-#[reflect(Component)]
-struct SpawnPlayer;
-
 #[derive(Component)]
 struct Player;
 
@@ -658,15 +527,7 @@ struct Player;
 struct RunHud;
 
 #[derive(Component)]
-struct GeneratedWorld {
-    epoch: u64,
-}
-
-#[derive(Component)]
-struct CheckpointPad {
-    index: usize,
-    epoch: u64,
-}
+struct GeneratedWorld;
 
 #[derive(Component)]
 struct SurfRampSurface;
@@ -772,64 +633,26 @@ struct RunRequest {
 }
 
 enum RunRequestKind {
-    Respawn,
-    RestartSameSeed,
     RestartNewSeed,
-    Rollover(FallSnapshot),
 }
 
 #[derive(Resource)]
 struct RunState {
     blueprint: RunBlueprint,
-    epoch: u64,
-    next_epoch: u64,
-    death_plane: f32,
-    current_checkpoint: usize,
-    deaths: u32,
     timer: Stopwatch,
 }
 
 impl RunState {
     fn new(blueprint: RunBlueprint) -> Self {
         Self {
-            death_plane: checkpoint_death_plane(&blueprint, 0),
             blueprint,
-            epoch: 0,
-            next_epoch: 1,
-            current_checkpoint: 0,
-            deaths: 0,
             timer: Stopwatch::new(),
         }
     }
 
-    fn reserve_epoch(&mut self) -> u64 {
-        let epoch = self.next_epoch;
-        self.next_epoch += 1;
-        epoch
-    }
-
-    fn apply_restart_blueprint(&mut self, blueprint: RunBlueprint, epoch: u64) {
+    fn apply_restart_blueprint(&mut self, blueprint: RunBlueprint) {
         self.blueprint = blueprint;
-        self.epoch = epoch;
-        self.current_checkpoint = 0;
-        self.death_plane = checkpoint_death_plane(&self.blueprint, 0);
-        self.deaths = 0;
         self.timer = Stopwatch::new();
-    }
-
-    fn apply_rollover_blueprint(&mut self, blueprint: RunBlueprint, epoch: u64) {
-        self.blueprint = blueprint;
-        self.epoch = epoch;
-        self.current_checkpoint = 0;
-        self.death_plane = checkpoint_death_plane(&self.blueprint, 0);
-    }
-
-    fn checkpoint_count(&self) -> usize {
-        self.blueprint.checkpoint_count()
-    }
-
-    fn checkpoint_position(&self, checkpoint_index: usize) -> Vec3 {
-        self.blueprint.checkpoint_position(checkpoint_index)
     }
 }
 
@@ -841,35 +664,12 @@ struct RunBlueprint {
     spawn: Vec3,
     tail_forward: Vec3,
     next_segment_kind: SegmentKind,
-    next_checkpoint_slot: usize,
     generator: RunRng,
 }
 
 impl RunBlueprint {
-    fn checkpoint_count(&self) -> usize {
-        self.rooms
-            .iter()
-            .filter(|room| room.checkpoint_slot.is_some())
-            .count()
-            .max(1)
-    }
-
-    fn checkpoint_room_index(&self, checkpoint_index: usize) -> usize {
-        self.rooms
-            .iter()
-            .enumerate()
-            .filter(|(_, room)| room.checkpoint_slot.is_some())
-            .nth(checkpoint_index.min(self.checkpoint_count().saturating_sub(1)))
-            .map(|(index, _)| index)
-            .unwrap_or(0)
-    }
-
-    fn checkpoint_position(&self, checkpoint_index: usize) -> Vec3 {
-        if checkpoint_index == 0 {
-            return self.spawn;
-        }
-        let room = &self.rooms[self.checkpoint_room_index(checkpoint_index)];
-        room.top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0)
+    fn first_segment(&self) -> Option<&SegmentPlan> {
+        self.segments.first()
     }
 }
 
@@ -877,7 +677,6 @@ impl RunBlueprint {
 struct RoomPlan {
     index: usize,
     top: Vec3,
-    checkpoint_slot: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -895,56 +694,10 @@ enum SegmentKind {
     SquareBhop,
 }
 
-#[derive(Clone, Debug)]
-struct FallSnapshot {
-    position: Vec3,
-    velocity: Vec3,
-    forward: Vec3,
-}
-
-impl FallSnapshot {
-    fn new(position: Vec3, velocity: Vec3, fallback_forward: Vec3) -> Self {
-        let horizontal_velocity = Vec3::new(velocity.x, 0.0, velocity.z);
-        let forward = if horizontal_velocity.length_squared()
-            >= ROLLOVER_FORWARD_SPEED_THRESHOLD * ROLLOVER_FORWARD_SPEED_THRESHOLD
-        {
-            horizontal_velocity.normalize()
-        } else {
-            direction_from_delta(fallback_forward)
-        };
-
-        Self {
-            position,
-            velocity,
-            forward,
-        }
-    }
-}
-
-fn look_forward(look: &CharacterLook) -> Vec3 {
-    direction_from_delta(Vec3::new(look.yaw.sin(), 0.0, look.yaw.cos()))
-}
-
-fn rollover_seed(run: &RunState, snapshot: &FallSnapshot) -> u64 {
-    let position_mix = (snapshot.position.x.to_bits() as u64).rotate_left(7)
-        ^ (snapshot.position.y.to_bits() as u64).rotate_left(23)
-        ^ (snapshot.position.z.to_bits() as u64).rotate_left(41);
-    let velocity_mix = (snapshot.velocity.x.to_bits() as u64).rotate_left(13)
-        ^ (snapshot.velocity.y.to_bits() as u64).rotate_left(29)
-        ^ (snapshot.velocity.z.to_bits() as u64).rotate_left(47);
-
-    run.blueprint.seed.rotate_left(11)
-        ^ run.epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ position_mix
-        ^ velocity_mix
-        ^ 0xC6A4_A793_5BD1_E995
-}
-
 fn build_run_blueprint(seed: u64) -> RunBlueprint {
     let spawn_room = RoomPlan {
         index: 0,
         top: Vec3::new(0.0, 160.0, 0.0),
-        checkpoint_slot: Some(0),
     };
     let mut blueprint = RunBlueprint {
         seed,
@@ -953,52 +706,11 @@ fn build_run_blueprint(seed: u64) -> RunBlueprint {
         spawn: Vec3::ZERO,
         tail_forward: Vec3::X,
         next_segment_kind: SegmentKind::SquareBhop,
-        next_checkpoint_slot: 1,
         generator: RunRng::new(seed),
     };
     append_run_blueprint(&mut blueprint, INITIAL_ROOM_COUNT.saturating_sub(1));
-    blueprint.spawn = spawn_on_first_bhop_platform(&blueprint);
+    blueprint.spawn = spawn_position_for_first_segment(&blueprint);
     blueprint
-}
-
-fn build_rollover_blueprint(seed: u64, snapshot: &FallSnapshot) -> RunBlueprint {
-    let catch_room = RoomPlan {
-        index: 0,
-        top: rollover_catch_room_top(snapshot),
-        checkpoint_slot: Some(0),
-    };
-    let spawn = catch_room.top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0);
-    let mut blueprint = RunBlueprint {
-        seed,
-        rooms: vec![catch_room],
-        segments: Vec::with_capacity(INITIAL_ROOM_COUNT.saturating_sub(1)),
-        spawn,
-        tail_forward: snapshot.forward,
-        next_segment_kind: SegmentKind::SurfRamp,
-        next_checkpoint_slot: 1,
-        generator: RunRng::new(seed),
-    };
-    append_run_blueprint(&mut blueprint, INITIAL_ROOM_COUNT.saturating_sub(1));
-    blueprint
-}
-
-fn rollover_catch_room_top(snapshot: &FallSnapshot) -> Vec3 {
-    let drop = rollover_drop_distance(snapshot.velocity.y);
-    let fall_time = solve_fall_time(snapshot.velocity.y, drop);
-    let horizontal_velocity = Vec3::new(snapshot.velocity.x, 0.0, snapshot.velocity.z);
-
-    snapshot.position + horizontal_velocity * fall_time + snapshot.forward * ROLLOVER_ENTRY_LEAD
-        - Vec3::Y * drop
-}
-
-fn rollover_drop_distance(vertical_velocity: f32) -> f32 {
-    (ROLLOVER_CATCH_DROP_MIN + (-vertical_velocity).max(0.0) * ROLLOVER_CATCH_DROP_SPEED_SCALE)
-        .clamp(ROLLOVER_CATCH_DROP_MIN, ROLLOVER_CATCH_DROP_MAX)
-}
-
-fn solve_fall_time(vertical_velocity: f32, drop: f32) -> f32 {
-    let discriminant = (vertical_velocity * vertical_velocity + 2.0 * PLAYER_GRAVITY * drop).sqrt();
-    ((vertical_velocity + discriminant) / PLAYER_GRAVITY).max(0.35)
 }
 
 fn append_run_blueprint(blueprint: &mut RunBlueprint, additional_rooms: usize) {
@@ -1016,17 +728,24 @@ fn append_run_blueprint(blueprint: &mut RunBlueprint, additional_rooms: usize) {
         let forward = (Quat::from_rotation_y(turn) * blueprint.tail_forward).normalize_or_zero();
         let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
         let gap = match kind {
-            SegmentKind::SurfRamp => blueprint.generator.range_f32(88.0, 116.0),
-            SegmentKind::SquareBhop => blueprint.generator.range_f32(72.0, 96.0),
+            SegmentKind::SurfRamp => blueprint
+                .generator
+                .range_f32(SURF_SECTION_GAP_MIN, SURF_SECTION_GAP_MAX),
+            SegmentKind::SquareBhop => blueprint
+                .generator
+                .range_f32(BHOP_SECTION_GAP_MIN, BHOP_SECTION_GAP_MAX),
         };
         let drop = match kind {
-            SegmentKind::SurfRamp => blueprint.generator.range_f32(18.0, 28.0),
-            SegmentKind::SquareBhop => blueprint.generator.range_f32(12.0, 22.0),
+            SegmentKind::SurfRamp => blueprint
+                .generator
+                .range_f32(SURF_SECTION_DROP_MIN, SURF_SECTION_DROP_MAX),
+            SegmentKind::SquareBhop => blueprint
+                .generator
+                .range_f32(BHOP_SECTION_DROP_MIN, BHOP_SECTION_DROP_MAX),
         };
         let lateral_jitter = right * blueprint.generator.range_f32(-4.0, 4.0);
         let next_top = from_top + forward * gap + lateral_jitter - Vec3::Y * drop;
         let next_index = blueprint.rooms.len();
-        let checkpoint_slot = checkpoint_slot_for_room(blueprint, next_index);
 
         blueprint.segments.push(SegmentPlan {
             index: blueprint.segments.len(),
@@ -1038,20 +757,9 @@ fn append_run_blueprint(blueprint: &mut RunBlueprint, additional_rooms: usize) {
         blueprint.rooms.push(RoomPlan {
             index: next_index,
             top: next_top,
-            checkpoint_slot,
         });
         blueprint.tail_forward = forward;
         blueprint.next_segment_kind = next_segment_kind(kind);
-    }
-}
-
-fn checkpoint_slot_for_room(blueprint: &mut RunBlueprint, index: usize) -> Option<usize> {
-    if should_assign_checkpoint(index) {
-        let slot = blueprint.next_checkpoint_slot;
-        blueprint.next_checkpoint_slot += 1;
-        Some(slot)
-    } else {
-        None
     }
 }
 
@@ -1060,10 +768,6 @@ fn next_segment_kind(kind: SegmentKind) -> SegmentKind {
         SegmentKind::SurfRamp => SegmentKind::SquareBhop,
         SegmentKind::SquareBhop => SegmentKind::SurfRamp,
     }
-}
-
-fn should_assign_checkpoint(index: usize) -> bool {
-    index == 0 || index == 1 || index % 3 == 0
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1121,11 +825,6 @@ enum SolidBody {
     },
 }
 
-#[derive(Clone)]
-enum FeatureSpec {
-    CheckpointPad { center: Vec3, index: usize },
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum PaintStyle {
     BhopPlatform,
@@ -1135,19 +834,10 @@ enum PaintStyle {
 #[derive(Default, Clone)]
 struct ModuleLayout {
     solids: Vec<SolidSpec>,
-    features: Vec<FeatureSpec>,
 }
 
-fn build_room_layout(room: &RoomPlan) -> ModuleLayout {
-    let mut layout = ModuleLayout::default();
-    if let Some(index) = room.checkpoint_slot {
-        layout.features.push(FeatureSpec::CheckpointPad {
-            center: room.top,
-            index,
-        });
-    }
-
-    layout
+fn build_room_layout(_room: &RoomPlan) -> ModuleLayout {
+    ModuleLayout::default()
 }
 
 fn build_segment_layout(segment: &SegmentPlan, rooms: &[RoomPlan]) -> ModuleLayout {
@@ -1178,57 +868,83 @@ fn build_segment_layout(segment: &SegmentPlan, rooms: &[RoomPlan]) -> ModuleLayo
     layout
 }
 
-fn spawn_on_first_bhop_platform(blueprint: &RunBlueprint) -> Vec3 {
-    let Some(segment) = blueprint
-        .segments
-        .iter()
-        .find(|segment| segment.kind == SegmentKind::SquareBhop)
-    else {
+fn spawn_position_for_first_segment(blueprint: &RunBlueprint) -> Vec3 {
+    let Some(segment) = blueprint.first_segment() else {
         return blueprint.rooms[0].top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0);
     };
     let layout = build_segment_layout(segment, &blueprint.rooms);
-    let Some(platform) = layout
+    match segment.kind {
+        SegmentKind::SquareBhop => square_bhop_spawn_position(&layout)
+            .unwrap_or(blueprint.rooms[0].top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0)),
+        SegmentKind::SurfRamp => surf_spawn_position(&layout)
+            .unwrap_or(blueprint.rooms[0].top + Vec3::new(0.0, SURF_SPAWN_CLEARANCE, 0.0)),
+    }
+}
+
+fn square_bhop_spawn_position(layout: &ModuleLayout) -> Option<Vec3> {
+    let platform = layout
         .solids
         .iter()
-        .find(|solid| matches!(solid.body, SolidBody::Static))
-    else {
-        return blueprint.rooms[0].top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0);
-    };
+        .find(|solid| matches!(solid.body, SolidBody::Static))?;
     let top = platform.center + Vec3::Y * (platform.size.y * 0.5);
-    top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0)
+    let forward = first_segment_facing(layout, SegmentKind::SquareBhop).unwrap_or(Vec3::X);
+    let edge_offset = (platform.size.x * 0.5 - SPAWN_PLATFORM_EDGE_INSET).max(0.0);
+    let spawn_top = top + forward * edge_offset;
+    Some(spawn_top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0))
+}
+
+fn first_segment_facing(layout: &ModuleLayout, kind: SegmentKind) -> Option<Vec3> {
+    match kind {
+        SegmentKind::SquareBhop => {
+            let mut platforms = layout
+                .solids
+                .iter()
+                .filter(|solid| matches!(solid.body, SolidBody::Static));
+            let first = platforms.next()?;
+            let second = platforms.next()?;
+            Some(direction_from_delta(second.center - first.center))
+        }
+        SegmentKind::SurfRamp => layout.solids.iter().find_map(|solid| match &solid.body {
+            SolidBody::StaticSurfWedge {
+                wall_side,
+                render_points,
+            } if *wall_side > 0.0 && render_points.len() >= 2 => Some(direction_from_delta(
+                (solid.center + render_points[1]) - (solid.center + render_points[0]),
+            )),
+            _ => None,
+        }),
+    }
+}
+
+fn surf_spawn_position(layout: &ModuleLayout) -> Option<Vec3> {
+    let wedge = layout.solids.iter().find_map(|solid| match &solid.body {
+        SolidBody::StaticSurfWedge {
+            wall_side,
+            render_points,
+        } if *wall_side > 0.0 && render_points.len() >= 4 => Some((solid.center, render_points)),
+        _ => None,
+    })?;
+
+    let (center, render_points) = wedge;
+    let (ridge, outer) = (center + render_points[0], center + render_points[2]);
+    let face_point = ridge.lerp(outer, SURF_SPAWN_FACE_T);
+    Some(face_point + Vec3::Y * SURF_SPAWN_CLEARANCE)
 }
 
 fn spawn_layout(
     layout: &ModuleLayout,
-    epoch: u64,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     asset_cache: &mut WorldAssetCache,
 ) {
     for solid in &layout.solids {
-        spawn_solid(solid, epoch, commands, meshes, materials, asset_cache);
-    }
-    for feature in &layout.features {
-        match feature {
-            FeatureSpec::CheckpointPad { center, index } => {
-                commands.spawn((
-                    GeneratedWorld { epoch },
-                    Name::new("Checkpoint Pad"),
-                    Transform::from_translation(*center),
-                    CheckpointPad {
-                        index: *index,
-                        epoch,
-                    },
-                ));
-            }
-        }
+        spawn_solid(solid, commands, meshes, materials, asset_cache);
     }
 }
 
 fn spawn_solid(
     spec: &SolidSpec,
-    epoch: u64,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
@@ -1242,7 +958,7 @@ fn spawn_solid(
     match &spec.body {
         SolidBody::Static => {
             let mut entity = commands.spawn((
-                GeneratedWorld { epoch },
+                GeneratedWorld,
                 Name::new(spec.label.clone()),
                 Mesh3d(cached_cuboid_mesh(asset_cache, meshes, spec.size)),
                 MeshMaterial3d(cached_material(
@@ -1261,7 +977,7 @@ fn spawn_solid(
         }
         SolidBody::StaticSurfWedge { render_points, .. } => {
             commands.spawn((
-                GeneratedWorld { epoch },
+                GeneratedWorld,
                 Name::new(spec.label.clone()),
                 Mesh3d(meshes.add(build_surf_wedge_mesh(
                     render_points,
@@ -1282,7 +998,7 @@ fn spawn_solid(
             ..
         } => {
             let mut entity = commands.spawn((
-                GeneratedWorld { epoch },
+                GeneratedWorld,
                 Name::new(spec.label.clone()),
                 Transform::from_translation(spec.center),
                 GlobalTransform::default(),
@@ -1394,8 +1110,8 @@ fn append_square_bhop_sequence(
 ) {
     let _ = forward;
     let distance = start.distance(end).max(18.0);
-    let start_margin = bhop_path_margin(distance, 0.15, 0.85);
-    let end_margin = bhop_path_margin(distance, 0.12, 0.75);
+    let start_margin = bhop_path_margin(distance, BHOP_ANCHOR_MARGIN_MIN, BHOP_ANCHOR_MARGIN_MAX);
+    let end_margin = bhop_path_margin(distance, BHOP_ANCHOR_MARGIN_MIN, BHOP_ANCHOR_MARGIN_MAX);
     let path_start = start + direction_from_delta(end - start) * start_margin + Vec3::Y * 0.24;
     let path_end = end - direction_from_delta(end - start) * end_margin + Vec3::Y * 0.18;
     let requested_count =
@@ -1454,14 +1170,14 @@ fn append_surf_sequence(
 ) {
     let direct_distance = start.distance(end).max(12.0);
     let entry_margin = if intense {
-        (direct_distance * 0.01).clamp(0.7, 2.2)
+        (direct_distance * 0.08).clamp(SURF_ENTRY_MARGIN_MIN, SURF_ENTRY_MARGIN_MAX)
     } else {
-        (direct_distance * 0.008).clamp(0.5, 1.8)
+        (direct_distance * 0.07).clamp(SURF_ENTRY_MARGIN_MIN, SURF_ENTRY_MARGIN_MAX - 1.5)
     };
     let exit_margin = if intense {
-        (direct_distance * 0.009).clamp(0.6, 2.0)
+        (direct_distance * 0.07).clamp(SURF_EXIT_MARGIN_MIN, SURF_EXIT_MARGIN_MAX)
     } else {
-        (direct_distance * 0.007).clamp(0.45, 1.5)
+        (direct_distance * 0.06).clamp(SURF_EXIT_MARGIN_MIN, SURF_EXIT_MARGIN_MAX - 1.0)
     };
     let surf_start = start + forward * entry_margin + Vec3::Y * 0.4;
     let surf_end = end - forward * exit_margin + Vec3::Y * 0.18;
@@ -2316,14 +2032,9 @@ enum CollisionLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    fn test_room(index: usize, top: Vec3, checkpoint_slot: Option<usize>) -> RoomPlan {
-        RoomPlan {
-            index,
-            top,
-            checkpoint_slot,
-        }
+    fn test_room(index: usize, top: Vec3) -> RoomPlan {
+        RoomPlan { index, top }
     }
 
     fn test_segment(index: usize, kind: SegmentKind, seed: u64) -> SegmentPlan {
@@ -2334,10 +2045,6 @@ mod tests {
             kind,
             seed,
         }
-    }
-
-    fn test_fall_snapshot(position: Vec3, velocity: Vec3, fallback_forward: Vec3) -> FallSnapshot {
-        FallSnapshot::new(position, velocity, fallback_forward)
     }
 
     #[test]
@@ -2378,45 +2085,53 @@ mod tests {
         assert_eq!(first_segment.kind, SegmentKind::SquareBhop);
 
         let layout = build_segment_layout(first_segment, &blueprint.rooms);
-        let first_platform = layout
-            .solids
-            .first()
-            .expect("first bhop segment should emit platforms");
-        let platform_top = first_platform.center + Vec3::Y * (first_platform.size.y * 0.5);
+        let expected_spawn =
+            square_bhop_spawn_position(&layout).expect("first bhop segment should emit platforms");
 
-        assert_eq!(
-            blueprint.spawn,
-            platform_top + Vec3::new(0.0, PLAYER_SPAWN_CLEARANCE, 0.0)
+        assert_eq!(blueprint.spawn, expected_spawn);
+    }
+
+    #[test]
+    fn initial_spawn_look_faces_into_the_course() {
+        let blueprint = build_run_blueprint(0xA11C_E123);
+        let look = spawn_look_for_blueprint(&blueprint);
+        let facing = spawn_facing_for_blueprint(&blueprint);
+        let forward = look.to_quat() * Vec3::NEG_Z;
+
+        assert!(
+            forward.dot(facing) > 0.98,
+            "{forward:?} should face {facing:?}"
         );
     }
 
     #[test]
-    fn rollover_blueprint_starts_below_fall_snapshot() {
-        let snapshot = test_fall_snapshot(
-            Vec3::new(180.0, -24.0, 32.0),
-            Vec3::new(18.0, -58.0, 6.0),
-            Vec3::Z,
-        );
-        let blueprint = build_rollover_blueprint(0xCAFE_BABE, &snapshot);
+    fn surf_first_blueprint_spawns_above_surf_face() {
+        let rooms = vec![
+            test_room(0, Vec3::new(0.0, 120.0, 0.0)),
+            test_room(1, Vec3::new(140.0, 88.0, 24.0)),
+        ];
+        let segment = test_segment(0, SegmentKind::SurfRamp, 0xC001_CAFE);
+        let layout = build_segment_layout(&segment, &rooms);
+        let expected =
+            surf_spawn_position(&layout).expect("surf segment should provide a spawn point");
 
-        assert!(blueprint.rooms[0].top.y <= snapshot.position.y - ROLLOVER_CATCH_DROP_MIN);
-        assert_eq!(blueprint.rooms[0].checkpoint_slot, Some(0));
+        assert!(expected.y > rooms[0].top.y);
     }
 
     #[test]
-    fn rollover_blueprint_first_segment_is_surf_and_append_stays_minimal() {
-        let snapshot = test_fall_snapshot(
-            Vec3::new(0.0, 16.0, 0.0),
-            Vec3::new(22.0, -44.0, 4.0),
-            Vec3::X,
-        );
-        let mut blueprint = build_rollover_blueprint(0x1234_ABCD, &snapshot);
+    fn build_room_layout_is_empty() {
+        let room = test_room(3, Vec3::new(0.0, 32.0, 0.0));
+        let layout = build_room_layout(&room);
+
+        assert!(layout.solids.is_empty());
+    }
+
+    #[test]
+    fn append_run_blueprint_keeps_only_surf_and_square_bhop_sections() {
+        let blueprint = build_run_blueprint(0xC001_CAFE);
+        let mut blueprint = blueprint.clone();
         append_run_blueprint(&mut blueprint, 6);
 
-        assert_eq!(
-            blueprint.segments.first().map(|segment| segment.kind),
-            Some(SegmentKind::SurfRamp)
-        );
         assert!(blueprint.segments.iter().all(|segment| matches!(
             segment.kind,
             SegmentKind::SurfRamp | SegmentKind::SquareBhop
@@ -2430,68 +2145,10 @@ mod tests {
     }
 
     #[test]
-    fn rollover_blueprint_preserves_forward_continuity() {
-        let snapshot = test_fall_snapshot(
-            Vec3::new(-80.0, 42.0, 24.0),
-            Vec3::new(28.0, -50.0, 2.0),
-            Vec3::new(1.0, 0.0, 0.0),
-        );
-        let blueprint = build_rollover_blueprint(0x5EED, &snapshot);
-        let first_forward = direction_from_delta(blueprint.rooms[1].top - blueprint.rooms[0].top);
-
-        assert!(
-            first_forward.dot(snapshot.forward) > 0.98,
-            "expected rollover path to follow fall direction, got {:?} vs {:?}",
-            first_forward,
-            snapshot.forward
-        );
-    }
-
-    #[test]
-    fn rollover_state_replaces_old_course_epoch_without_old_state() {
-        let mut run = RunState::new(build_run_blueprint(7));
-        run.current_checkpoint = 3;
-        run.deaths = 4;
-        run.timer.tick(Duration::from_secs_f32(18.0));
-        let previous_elapsed = run.timer.elapsed_secs();
-
-        let snapshot = test_fall_snapshot(
-            Vec3::new(240.0, -80.0, 10.0),
-            Vec3::new(14.0, -62.0, -3.0),
-            Vec3::new(1.0, 0.0, 0.0),
-        );
-        let next_epoch = run.reserve_epoch();
-        let blueprint = build_rollover_blueprint(0xBADC_0FFE, &snapshot);
-        let expected_spawn = blueprint.checkpoint_position(0);
-        let expected_death_plane = checkpoint_death_plane(&blueprint, 0);
-
-        run.apply_rollover_blueprint(blueprint, next_epoch);
-
-        assert_eq!(run.epoch, next_epoch);
-        assert_eq!(run.current_checkpoint, 0);
-        assert_eq!(run.checkpoint_position(0), expected_spawn);
-        assert_eq!(run.death_plane, expected_death_plane);
-        assert_eq!(run.deaths, 4);
-        assert!((run.timer.elapsed_secs() - previous_elapsed).abs() < 0.001);
-    }
-
-    #[test]
-    fn room_layout_keeps_only_checkpoint_feature() {
-        let room = test_room(3, Vec3::new(0.0, 32.0, 0.0), Some(2));
-        let layout = build_room_layout(&room);
-
-        assert!(layout.solids.is_empty());
-        assert!(matches!(
-            layout.features.as_slice(),
-            [FeatureSpec::CheckpointPad { index: 2, .. }]
-        ));
-    }
-
-    #[test]
     fn square_bhop_layout_emits_only_square_static_platforms() {
         let rooms = vec![
-            test_room(0, Vec3::new(0.0, 120.0, 0.0), Some(0)),
-            test_room(1, Vec3::new(92.0, 92.0, 18.0), Some(1)),
+            test_room(0, Vec3::new(0.0, 120.0, 0.0)),
+            test_room(1, Vec3::new(92.0, 92.0, 18.0)),
         ];
         let layout = build_segment_layout(
             &test_segment(0, SegmentKind::SquareBhop, 0xBEEF_CAFE),
@@ -2499,7 +2156,6 @@ mod tests {
         );
 
         assert!(!layout.solids.is_empty());
-        assert!(layout.features.is_empty());
         for solid in &layout.solids {
             assert!(matches!(solid.paint, PaintStyle::BhopPlatform));
             assert!(matches!(solid.body, SolidBody::Static));
@@ -2512,16 +2168,47 @@ mod tests {
     }
 
     #[test]
+    fn square_bhop_layout_keeps_platforms_clear_of_room_anchors() {
+        let rooms = vec![
+            test_room(0, Vec3::new(0.0, 120.0, 0.0)),
+            test_room(1, Vec3::new(118.0, 92.0, 22.0)),
+        ];
+        let layout = build_segment_layout(
+            &test_segment(0, SegmentKind::SquareBhop, 0xBEEF_CAFE),
+            &rooms,
+        );
+        let platforms = layout
+            .solids
+            .iter()
+            .filter(|solid| matches!(solid.body, SolidBody::Static))
+            .collect::<Vec<_>>();
+        let first = platforms.first().expect("expected first platform");
+        let last = platforms.last().expect("expected last platform");
+        let forward = direction_from_delta(rooms[1].top - rooms[0].top);
+
+        let start_clearance = (first.center - rooms[0].top).dot(forward) - first.size.x * 0.5;
+        let end_clearance = (rooms[1].top - last.center).dot(forward) - last.size.x * 0.5;
+
+        assert!(
+            start_clearance > 0.5,
+            "start clearance too small: {start_clearance}"
+        );
+        assert!(
+            end_clearance > 0.5,
+            "end clearance too small: {end_clearance}"
+        );
+    }
+
+    #[test]
     fn surf_layout_emits_only_wedges_and_collider_strips() {
         let rooms = vec![
-            test_room(0, Vec3::new(0.0, 120.0, 0.0), Some(0)),
-            test_room(1, Vec3::new(110.0, 94.0, 24.0), Some(1)),
+            test_room(0, Vec3::new(0.0, 120.0, 0.0)),
+            test_room(1, Vec3::new(110.0, 94.0, 24.0)),
         ];
         let layout =
             build_segment_layout(&test_segment(0, SegmentKind::SurfRamp, 0x1234_5678), &rooms);
 
         assert!(!layout.solids.is_empty());
-        assert!(layout.features.is_empty());
         assert!(
             layout
                 .solids
@@ -2579,7 +2266,6 @@ mod tests {
         let mut blueprint = build_run_blueprint(7);
         let original_room_count = blueprint.rooms.len();
         let original_segment_count = blueprint.segments.len();
-        let original_checkpoint_count = blueprint.checkpoint_count();
         let original_tail_y = blueprint.rooms.last().unwrap().top.y;
 
         append_run_blueprint(&mut blueprint, 6);
@@ -2587,41 +2273,10 @@ mod tests {
         assert_eq!(blueprint.rooms.len(), original_room_count + 6);
         assert_eq!(blueprint.segments.len(), original_segment_count + 6);
         assert_eq!(blueprint.segments.len(), blueprint.rooms.len() - 1);
-        assert!(blueprint.checkpoint_count() > original_checkpoint_count);
         assert!(blueprint.rooms.last().unwrap().top.y < original_tail_y);
         assert_eq!(
             blueprint.segments[original_segment_count].from,
             original_room_count - 1
-        );
-    }
-
-    #[test]
-    fn checkpoint_death_plane_looks_ahead_downstream() {
-        let blueprint = RunBlueprint {
-            seed: 7,
-            rooms: vec![
-                test_room(0, Vec3::new(0.0, 420.0, 0.0), Some(0)),
-                test_room(1, Vec3::new(120.0, 320.0, 0.0), None),
-                test_room(2, Vec3::new(240.0, 180.0, 0.0), None),
-                test_room(3, Vec3::new(360.0, 40.0, 0.0), Some(1)),
-            ],
-            segments: vec![
-                test_segment(0, SegmentKind::SurfRamp, 1),
-                test_segment(1, SegmentKind::SquareBhop, 2),
-                test_segment(2, SegmentKind::SurfRamp, 3),
-            ],
-            spawn: Vec3::new(0.0, 422.0, 0.0),
-            tail_forward: Vec3::X,
-            next_segment_kind: SegmentKind::SquareBhop,
-            next_checkpoint_slot: 2,
-            generator: RunRng::new(7),
-        };
-
-        let death_plane = checkpoint_death_plane(&blueprint, 0);
-        assert!(
-            death_plane <= blueprint.rooms[3].top.y - CHECKPOINT_DEATH_MARGIN,
-            "death plane {} did not look ahead to the deeper room",
-            death_plane
         );
     }
 
@@ -2667,8 +2322,8 @@ mod tests {
     #[test]
     fn surf_collider_strip_extends_past_render_seams() {
         let rooms = vec![
-            test_room(0, Vec3::new(0.0, 40.0, 0.0), Some(0)),
-            test_room(1, Vec3::new(120.0, 18.0, 26.0), Some(1)),
+            test_room(0, Vec3::new(0.0, 40.0, 0.0)),
+            test_room(1, Vec3::new(120.0, 18.0, 26.0)),
         ];
         let layout = build_segment_layout(
             &test_segment(0, SegmentKind::SurfRamp, 0x5eed_cafe_u64),

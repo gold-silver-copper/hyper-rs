@@ -33,7 +33,6 @@ impl Plugin for ExampleUtilPlugin {
                 tweak_materials,
                 generate_mipmaps::<StandardMaterial>,
                 calculate_stable_ground.run_if(on_timer(Duration::from_secs(1))),
-                apply_last_stable_ground.after(calculate_stable_ground),
             ),
         )
         .add_observer(toggle_debug)
@@ -245,13 +244,11 @@ fn tweak_materials(
 #[derive(Component, Reflect)]
 pub struct StableGround {
     previous: VecDeque<Vec3>,
-    fall_timer: Timer,
 }
 impl Default for StableGround {
     fn default() -> Self {
         Self {
             previous: VecDeque::default(),
-            fall_timer: Timer::new(Duration::from_secs(5), TimerMode::Once),
         }
     }
 }
@@ -275,34 +272,6 @@ pub(crate) fn calculate_stable_ground(
             while stable_ground.previous.len() > 5 {
                 stable_ground.previous.pop_back();
             }
-        }
-    }
-}
-
-pub(crate) fn apply_last_stable_ground(
-    mut kccs: Query<(
-        &mut Transform,
-        &LinearVelocity,
-        &CharacterController,
-        &mut StableGround,
-    )>,
-    time: Res<Time>,
-) {
-    for (mut transform, velocity, controller, mut stable_ground) in &mut kccs {
-        let speed_diff = 1. - (velocity.0.y.abs() / controller.max_speed);
-
-        // Terminal velocity will take quite a while to reach exactly 100., so we compare to 0.01
-        // to ensure that it doesn't take longer than expected
-        if speed_diff <= 0.01 {
-            stable_ground.fall_timer.tick(time.elapsed());
-        } else {
-            stable_ground.fall_timer.reset();
-        }
-
-        let max_fall_elapsed = stable_ground.fall_timer.is_finished();
-
-        if max_fall_elapsed && let Some(last_stable_ground) = stable_ground.previous.pop_front() {
-            transform.translation = last_stable_ground;
         }
     }
 }
