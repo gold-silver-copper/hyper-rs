@@ -9,11 +9,7 @@ use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
     camera::Exposure,
-    core_pipeline::{
-        core_3d::graph::Node3d,
-        fullscreen_material::{FullscreenMaterial, FullscreenMaterialPlugin},
-        tonemapping::Tonemapping,
-    },
+    core_pipeline::tonemapping::Tonemapping,
     input::common_conditions::input_just_pressed,
     light::CascadeShadowConfigBuilder,
     math::primitives::{Cuboid, Sphere},
@@ -22,16 +18,11 @@ use bevy::{
         ExtendedMaterial, Material, MaterialExtension, MaterialPipeline, MaterialPipelineKey,
         OpaqueRendererMethod,
     },
-    post_process::bloom::Bloom,
     prelude::*,
     reflect::TypePath,
-    render::{
-        extract_component::ExtractComponent,
-        render_graph::{InternedRenderLabel, RenderLabel},
-        render_resource::{
-            AsBindGroup, Face, PrimitiveTopology, RenderPipelineDescriptor, ShaderType,
-            SpecializedMeshPipelineError,
-        },
+    render::render_resource::{
+        AsBindGroup, Face, PrimitiveTopology, RenderPipelineDescriptor, ShaderType,
+        SpecializedMeshPipelineError,
     },
     shader::ShaderRef,
     window::{CursorGrabMode, CursorOptions, WindowResolution},
@@ -87,6 +78,7 @@ const BHOP_SECTION_DROP_MIN: f32 = 16.0;
 const BHOP_SECTION_DROP_MAX: f32 = 28.0;
 const BHOP_ANCHOR_MARGIN_MIN: f32 = 14.0;
 const BHOP_ANCHOR_MARGIN_MAX: f32 = 22.0;
+const BHOP_SURF_ALIGNMENT_DROP: f32 = 11.5;
 const SURF_ENTRY_MARGIN_MIN: f32 = 10.0;
 const SURF_ENTRY_MARGIN_MAX: f32 = 18.0;
 const SURF_EXIT_MARGIN_MIN: f32 = 9.0;
@@ -94,7 +86,6 @@ const SURF_EXIT_MARGIN_MAX: f32 = 16.0;
 const SKY_DOME_RADIUS: f32 = 1_240.0;
 const WORLD_SURFACE_SHADER_ASSET_PATH: &str = "shaders/world_surface_material.wgsl";
 const NEBULA_SKY_SHADER_ASSET_PATH: &str = "shaders/nebula_sky.wgsl";
-const WORLD_POST_PROCESS_SHADER_ASSET_PATH: &str = "shaders/world_post_process.wgsl";
 
 type WorldSurfaceMaterial = ExtendedMaterial<StandardMaterial, WorldSurfaceExtension>;
 
@@ -133,12 +124,6 @@ struct NebulaSkySettings {
     params_a: Vec4,
     params_b: Vec4,
     params_c: Vec4,
-}
-
-#[derive(Component, ExtractComponent, ShaderType, Clone, Copy, Default)]
-struct WorldPostProcessSettings {
-    params_a: Vec4,
-    params_b: Vec4,
 }
 
 impl MaterialExtension for WorldSurfaceExtension {
@@ -182,20 +167,6 @@ impl Material for NebulaSkyMaterial {
     }
 }
 
-impl FullscreenMaterial for WorldPostProcessSettings {
-    fn fragment_shader() -> ShaderRef {
-        WORLD_POST_PROCESS_SHADER_ASSET_PATH.into()
-    }
-
-    fn node_edges() -> Vec<InternedRenderLabel> {
-        vec![
-            Node3d::Tonemapping.intern(),
-            Self::node_label().intern(),
-            Node3d::EndMainPassPostProcessing.intern(),
-        ]
-    }
-}
-
 fn color_to_vec4(color: Color) -> Vec4 {
     let [r, g, b, a] = LinearRgba::from(color).to_f32_array();
     Vec4::new(r, g, b, a)
@@ -205,17 +176,10 @@ fn visual_motion_factor(speed: f32) -> f32 {
     ((speed - 120.0) / 780.0).clamp(0.0, 1.0)
 }
 
-fn world_post_process_settings() -> WorldPostProcessSettings {
-    WorldPostProcessSettings {
-        params_a: Vec4::new(0.16, 1.06, 0.76, 0.0022),
-        params_b: Vec4::new(0.14, 0.028, 0.0, 0.08),
-    }
-}
-
 fn bhop_world_material() -> WorldSurfaceMaterial {
     WorldSurfaceMaterial {
         base: StandardMaterial {
-            base_color: Color::srgb(0.035, 0.045, 0.06),
+            base_color: Color::srgb(0.014, 0.01, 0.022),
             reflectance: 0.12,
             clearcoat: 0.02,
             clearcoat_perceptual_roughness: 0.72,
@@ -225,13 +189,13 @@ fn bhop_world_material() -> WorldSurfaceMaterial {
         },
         extension: WorldSurfaceExtension {
             settings: WorldSurfaceSettings {
-                accent: color_to_vec4(Color::linear_rgb(0.92, 0.96, 0.99)),
-                secondary: color_to_vec4(Color::linear_rgb(0.24, 0.58, 0.7)),
-                emissive: color_to_vec4(Color::linear_rgb(0.0, 0.05, 0.08)),
-                atmosphere: color_to_vec4(Color::linear_rgb(0.03, 0.08, 0.14)),
-                params_a: Vec4::new(0.0, 0.12, 0.16, 0.26),
-                params_b: Vec4::new(0.22, 0.0, 1.0, 2.1),
-                params_c: Vec4::new(160.0, 1_220.0, 0.04, 0.58),
+                accent: color_to_vec4(Color::linear_rgb(1.0, 0.88, 0.96)),
+                secondary: color_to_vec4(Color::linear_rgb(0.9, 0.18, 0.78)),
+                emissive: color_to_vec4(Color::linear_rgb(0.22, 0.0, 0.16)),
+                atmosphere: color_to_vec4(Color::linear_rgb(0.05, 0.01, 0.09)),
+                params_a: Vec4::new(0.0, 0.11, 0.18, 0.22),
+                params_b: Vec4::new(0.18, 0.0, 3.2, 2.6),
+                params_c: Vec4::new(160.0, 1_220.0, 0.03, 0.44),
                 params_d: Vec4::new(0.0, 0.12, 0.0, 0.0),
             },
         },
@@ -241,7 +205,7 @@ fn bhop_world_material() -> WorldSurfaceMaterial {
 fn surf_world_material() -> WorldSurfaceMaterial {
     WorldSurfaceMaterial {
         base: StandardMaterial {
-            base_color: Color::srgb(0.2, 0.28, 0.4),
+            base_color: Color::srgb(0.13, 0.08, 0.24),
             cull_mode: None,
             reflectance: 0.54,
             clearcoat: 0.92,
@@ -252,10 +216,10 @@ fn surf_world_material() -> WorldSurfaceMaterial {
         },
         extension: WorldSurfaceExtension {
             settings: WorldSurfaceSettings {
-                accent: color_to_vec4(Color::linear_rgb(0.98, 0.995, 1.0)),
-                secondary: color_to_vec4(Color::linear_rgb(0.0, 0.76, 0.96)),
-                emissive: color_to_vec4(Color::linear_rgb(0.08, 0.42, 0.62)),
-                atmosphere: color_to_vec4(Color::linear_rgb(0.08, 0.22, 0.34)),
+                accent: color_to_vec4(Color::linear_rgb(1.0, 0.95, 0.985)),
+                secondary: color_to_vec4(Color::linear_rgb(0.78, 0.2, 0.98)),
+                emissive: color_to_vec4(Color::linear_rgb(0.34, 0.04, 0.48)),
+                atmosphere: color_to_vec4(Color::linear_rgb(0.08, 0.02, 0.16)),
                 params_a: Vec4::new(1.0, 0.12, 0.0, 0.28),
                 params_b: Vec4::new(0.68, 2.8, 24.0, 7.2),
                 params_c: Vec4::new(180.0, 1_260.0, 0.22, 0.18),
@@ -268,12 +232,12 @@ fn surf_world_material() -> WorldSurfaceMaterial {
 fn nebula_sky_material() -> NebulaSkyMaterial {
     NebulaSkyMaterial {
         settings: NebulaSkySettings {
-            zenith: color_to_vec4(Color::linear_rgb(0.004, 0.01, 0.02)),
-            horizon: color_to_vec4(Color::linear_rgb(0.03, 0.12, 0.19)),
-            nebula_a: color_to_vec4(Color::linear_rgb(0.0, 0.42, 0.56)),
-            nebula_b: color_to_vec4(Color::linear_rgb(0.94, 0.54, 0.24)),
-            star: color_to_vec4(Color::linear_rgba(1.0, 0.985, 0.92, 1.2)),
-            halo: color_to_vec4(Color::linear_rgba(0.6, 0.84, 1.0, 0.34)),
+            zenith: color_to_vec4(Color::linear_rgb(0.005, 0.001, 0.02)),
+            horizon: color_to_vec4(Color::linear_rgb(0.035, 0.006, 0.07)),
+            nebula_a: color_to_vec4(Color::linear_rgb(0.35, 0.04, 0.52)),
+            nebula_b: color_to_vec4(Color::linear_rgb(0.98, 0.18, 0.58)),
+            star: color_to_vec4(Color::linear_rgba(1.0, 0.95, 0.98, 1.2)),
+            halo: color_to_vec4(Color::linear_rgba(0.88, 0.28, 1.0, 0.28)),
             params_a: Vec4::new(2.1, 1.3, 360.0, 28.0),
             params_b: Vec4::new(0.0024, -0.0016, 0.34, 0.28),
             params_c: Vec4::new(-0.46, 0.22, 0.86, 7.5),
@@ -285,7 +249,7 @@ struct BasicGamePlugin;
 
 impl Plugin for BasicGamePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ClearColor(Color::srgb(0.01, 0.02, 0.04)))
+        app.insert_resource(ClearColor(Color::srgb(0.008, 0.002, 0.02)))
             .insert_resource(RunDirector::default())
             .insert_resource(WorldAssetCache::default())
             .insert_resource(SubstepCount(PHYSICS_SUBSTEPS))
@@ -350,7 +314,6 @@ fn main() -> AppExit {
             PhysicsPlugins::default(),
             MaterialPlugin::<WorldSurfaceMaterial>::default(),
             MaterialPlugin::<NebulaSkyMaterial>::default(),
-            FullscreenMaterialPlugin::<WorldPostProcessSettings>::default(),
             EnhancedInputPlugin,
             AhoyPlugins::default(),
             ExampleUtilPlugin,
@@ -381,7 +344,7 @@ fn setup_scene(
     mut asset_cache: ResMut<WorldAssetCache>,
 ) {
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.06, 0.1, 0.16),
+        color: Color::srgb(0.08, 0.03, 0.12),
         brightness: 30.0,
         affects_lightmapped_meshes: true,
     });
@@ -455,11 +418,9 @@ fn setup_scene(
         Transform::from_rotation(initial_look.to_quat()),
         Tonemapping::AcesFitted,
         Exposure { ev100: 9.0 },
-        Bloom::NATURAL,
-        world_post_process_settings(),
         DistanceFog {
-            color: Color::srgba(0.022, 0.075, 0.12, 0.42),
-            directional_light_color: Color::srgba(0.66, 0.88, 1.0, 0.16),
+            color: Color::srgba(0.035, 0.008, 0.07, 0.42),
+            directional_light_color: Color::srgba(0.86, 0.42, 1.0, 0.12),
             directional_light_exponent: 14.0,
             falloff: FogFalloff::Linear {
                 start: 250.0,
@@ -507,7 +468,7 @@ fn spawn_basic_lighting(commands: &mut Commands) {
         DirectionalLight {
             shadows_enabled: true,
             illuminance: 21_000.0,
-            color: Color::srgb(0.9, 0.97, 1.0),
+            color: Color::srgb(0.98, 0.9, 1.0),
             shadow_depth_bias: 0.12,
             shadow_normal_bias: 0.52,
             ..default()
@@ -528,7 +489,7 @@ fn spawn_basic_lighting(commands: &mut Commands) {
         DirectionalLight {
             shadows_enabled: false,
             illuminance: 7_500.0,
-            color: Color::srgb(0.6, 0.78, 0.92),
+            color: Color::srgb(0.8, 0.42, 0.96),
             ..default()
         },
     ));
@@ -566,7 +527,6 @@ fn update_render_dynamics(
     players: Query<&LinearVelocity, With<Player>>,
     asset_cache: Res<WorldAssetCache>,
     mut materials: ResMut<Assets<WorldSurfaceMaterial>>,
-    mut post_process: Query<&mut WorldPostProcessSettings, With<Camera3d>>,
 ) {
     let speed = players
         .single()
@@ -578,11 +538,6 @@ fn update_render_dynamics(
         if let Some(material) = materials.get_mut(handle) {
             material.extension.settings.params_d.x = motion;
         }
-    }
-
-    for mut settings in &mut post_process {
-        settings.params_b.z = motion;
-        settings.params_b.w = 0.08 + motion * 0.04;
     }
 }
 
@@ -1374,15 +1329,15 @@ fn material_key_for_paint(paint: PaintStyle) -> MaterialKey {
 
 fn paint_base_color(paint: PaintStyle) -> Color {
     match paint {
-        PaintStyle::BhopPlatform => Color::srgb(0.22, 0.28, 0.36),
-        PaintStyle::SurfRamp => Color::srgb(0.26, 0.44, 0.7),
+        PaintStyle::BhopPlatform => Color::srgb(0.07, 0.05, 0.12),
+        PaintStyle::SurfRamp => Color::srgb(0.18, 0.12, 0.34),
     }
 }
 
 fn paint_stripe_color(paint: PaintStyle) -> Color {
     match paint {
-        PaintStyle::BhopPlatform => Color::linear_rgb(0.78, 0.92, 1.0),
-        PaintStyle::SurfRamp => Color::linear_rgb(0.96, 0.99, 1.0),
+        PaintStyle::BhopPlatform => Color::linear_rgb(1.0, 0.82, 0.95),
+        PaintStyle::SurfRamp => Color::linear_rgb(1.0, 0.9, 0.97),
     }
 }
 
@@ -1407,8 +1362,11 @@ fn append_square_bhop_sequence(
     let distance = start.distance(end).max(18.0);
     let start_margin = bhop_path_margin(distance, BHOP_ANCHOR_MARGIN_MIN, BHOP_ANCHOR_MARGIN_MAX);
     let end_margin = bhop_path_margin(distance, BHOP_ANCHOR_MARGIN_MIN, BHOP_ANCHOR_MARGIN_MAX);
-    let path_start = start + direction_from_delta(end - start) * start_margin + Vec3::Y * 0.24;
-    let path_end = end - direction_from_delta(end - start) * end_margin + Vec3::Y * 0.18;
+    // Keep bhop sections visually closer to the lower surf face band instead of the abstract room top.
+    let path_start = start + direction_from_delta(end - start) * start_margin
+        - Vec3::Y * BHOP_SURF_ALIGNMENT_DROP;
+    let path_end =
+        end - direction_from_delta(end - start) * end_margin - Vec3::Y * BHOP_SURF_ALIGNMENT_DROP;
     let requested_count =
         ((distance / scaled_bhop_cadence(4.8, 6.6, rng)).round() as usize).clamp(6, 16);
     let pad_count =
@@ -2563,6 +2521,37 @@ mod tests {
     }
 
     #[test]
+    fn square_bhop_layout_sits_below_room_anchor_height() {
+        let rooms = vec![
+            test_room(0, Vec3::new(0.0, 120.0, 0.0)),
+            test_room(1, Vec3::new(118.0, 92.0, 22.0)),
+        ];
+        let layout = build_segment_layout(
+            &test_segment(0, SegmentKind::SquareBhop, 0xBEEF_CAFE),
+            &rooms,
+        );
+        let platforms = layout
+            .solids
+            .iter()
+            .filter(|solid| matches!(solid.body, SolidBody::Static))
+            .collect::<Vec<_>>();
+        let first = platforms.first().expect("expected first platform");
+        let last = platforms.last().expect("expected last platform");
+
+        let first_top = first.center.y + first.size.y * 0.5;
+        let last_top = last.center.y + last.size.y * 0.5;
+
+        assert!(
+            rooms[0].top.y - first_top > 8.0,
+            "first bhop top should sit noticeably below the room anchor"
+        );
+        assert!(
+            rooms[1].top.y - last_top > 8.0,
+            "last bhop top should sit noticeably below the room anchor"
+        );
+    }
+
+    #[test]
     fn surf_layout_emits_only_wedges_and_collider_strips() {
         let rooms = vec![
             test_room(0, Vec3::new(0.0, 120.0, 0.0)),
@@ -2696,16 +2685,6 @@ mod tests {
         assert!(!<NebulaSkyMaterial as Material>::enable_shadows());
         assert!(material.settings.params_a.z > 100.0);
         assert!(material.settings.halo.w > 0.0);
-    }
-
-    #[test]
-    fn post_process_defaults_stay_restrained() {
-        let settings = world_post_process_settings();
-
-        assert!(settings.params_a.x < 0.25);
-        assert!(settings.params_a.y > 1.0);
-        assert!(settings.params_b.x < 0.2);
-        assert!(settings.params_b.y < 0.05);
     }
 
     #[test]

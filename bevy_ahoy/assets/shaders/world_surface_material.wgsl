@@ -150,62 +150,118 @@ fn fragment(
     );
 
     let panel_edge = tile_edge_distance(tile_uv);
-    let inset_mask = smoothstep(material.params_a.z, material.params_a.z + 0.08, panel_edge);
-    let inset_frame =
-        1.0 - smoothstep(material.params_a.y - 0.01, material.params_a.y + 0.02, panel_edge);
-    let center_gradient = saturate(1.0 - distance(tile_uv, vec2<f32>(0.5)) * 1.7);
-    let center_line =
-        1.0 - smoothstep(0.025, 0.055, abs(tile_uv.x - 0.5));
+    let panel_feather = max(fwidth(panel_edge) * 2.0, 0.003);
+    let inset_mask = smoothstep(
+        material.params_a.z - panel_feather,
+        material.params_a.z + panel_feather,
+        panel_edge,
+    );
+    let inset_frame = (
+        1.0
+            - smoothstep(
+                material.params_a.y - panel_feather,
+                material.params_a.y + panel_feather,
+                panel_edge,
+            )
+    ) * inset_mask;
+    let bevel_band = smoothstep(
+        material.params_a.z + 0.045 - panel_feather,
+        material.params_a.z + 0.045 + panel_feather,
+        panel_edge,
+    ) * (
+        1.0
+            - smoothstep(
+                material.params_a.z + 0.13 - panel_feather,
+                material.params_a.z + 0.13 + panel_feather,
+                panel_edge,
+            )
+    );
+    let panel_depth = smoothstep(
+        material.params_a.z + 0.03,
+        material.params_a.z + 0.22,
+        panel_edge,
+    );
+    let line_feather = max(fwidth(tile_uv.x) * 2.0, 0.003);
+    let center_line = 1.0
+        - smoothstep(
+            0.016 - line_feather,
+            0.016 + line_feather,
+            abs(tile_uv.x - 0.5),
+        );
+    let detail_uv = world_pos.xz * material.params_b.z;
+    let detail_phase = detail_uv.x * 0.92 + detail_uv.y * 0.16;
+    let detail_feather = max(fwidth(detail_phase) * 2.0, 0.01);
+    let micro_lines = 1.0
+        - smoothstep(
+            0.44 - detail_feather,
+            0.44 + detail_feather,
+            abs(fract(detail_phase) - 0.5),
+        );
+    let scan_phase = detail_uv.y * 0.24 - globals.time * material.params_b.x * 0.16 * speed_boost;
+    let scan_band = 1.0
+        - smoothstep(
+            0.34,
+            0.46,
+            abs(fract(scan_phase) - 0.5),
+        );
     let energy_scan = 1.0
         - smoothstep(
             0.22,
             0.38,
-            abs(fract(tile_uv.y * material.params_b.w - globals.time * material.params_b.x * 0.18 * speed_boost) - 0.5),
+            abs(fract(tile_uv.y * material.params_b.w - globals.time * material.params_b.x * 0.14 * speed_boost) - 0.5),
         );
-    let border_glow = inset_frame * (0.72 + 0.28 * energy_scan);
+    let border_glow = inset_frame * (0.78 + 0.22 * energy_scan);
     let body_rgb = mix(
-        vec3<f32>(0.018, 0.022, 0.03),
-        base_rgb * 0.28 + material.atmosphere.rgb * 0.03,
+        vec3<f32>(0.008, 0.006, 0.014),
+        base_rgb * 0.18 + material.atmosphere.rgb * 0.04,
         top_face * 0.66 + 0.1,
     );
     let panel_tint = mix(
-        material.atmosphere.rgb * 0.38,
-        material.secondary.rgb * 0.12 + material.accent.rgb * 0.01,
+        material.atmosphere.rgb * 0.45,
+        material.secondary.rgb * 0.1 + material.accent.rgb * 0.018,
         0.3 + 0.7 * top_face,
     );
-    let panel_rgb =
-        panel_tint + material.secondary.rgb * center_gradient * 0.025 + material.accent.rgb * center_line * 0.015;
+    let panel_rgb = panel_tint
+        + material.secondary.rgb * panel_depth * 0.06
+        + material.accent.rgb * bevel_band * 0.022
+        + material.accent.rgb * center_line * 0.016
+        + material.secondary.rgb * micro_lines * inset_mask * top_face * 0.018
+        + material.emissive.rgb * scan_band * inset_mask * top_face * 0.05;
 
     var platform_rgb = body_rgb;
-    platform_rgb = mix(platform_rgb, panel_rgb, inset_mask * top_face * 0.7);
-    platform_rgb += material.accent.rgb * border_glow * (0.03 + 0.04 * top_face);
+    platform_rgb = mix(platform_rgb, panel_rgb, inset_mask * top_face * 0.82);
+    platform_rgb += material.accent.rgb * border_glow * (0.026 + 0.035 * top_face);
     platform_rgb += sky_reflection
         * material.params_c.z
-        * (0.02 + 0.05 * fresnel)
+        * (0.016 + 0.04 * fresnel)
         * (0.3 + 0.7 * top_face);
     platform_rgb *= 1.0 - underside * material.params_a.w;
-    platform_rgb *= mix(0.76, 1.0, top_face);
+    platform_rgb *= mix(0.72, 1.0, top_face);
 
     base_rgb = mix(base_rgb, platform_rgb, platform_mask);
     emissive_rgb += material.emissive.rgb
         * border_glow
-        * (0.22 + 0.38 * top_face)
+        * (0.18 + 0.28 * top_face)
         * platform_mask;
-    emissive_rgb += material.secondary.rgb * center_line * inset_mask * 0.012 * platform_mask;
+    emissive_rgb += material.secondary.rgb
+        * (center_line * 0.012 + scan_band * 0.03)
+        * inset_mask
+        * top_face
+        * platform_mask;
 
     pbr_input.material.perceptual_roughness = mix(
         pbr_input.material.perceptual_roughness,
-        mix(0.94, 0.62, top_face),
+        mix(0.96, 0.68, top_face),
         platform_mask,
     );
     pbr_input.material.clearcoat = mix(
         pbr_input.material.clearcoat,
-        0.015 + 0.04 * inset_mask * top_face,
+        0.01 + 0.03 * inset_mask * top_face,
         platform_mask,
     );
     pbr_input.material.clearcoat_perceptual_roughness = mix(
         pbr_input.material.clearcoat_perceptual_roughness,
-        mix(0.78, 0.54, top_face),
+        mix(0.82, 0.58, top_face),
         platform_mask,
     );
 
