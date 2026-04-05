@@ -58,6 +58,13 @@ const APPEND_BATCH_ROOMS: usize = 8;
 const MAX_SECTION_TURN_RADIANS: f32 = 18.0_f32.to_radians();
 const BHOP_OBJECT_SCALE: f32 = 5.0;
 const BHOP_CADENCE_SCALE: f32 = 4.1;
+const BHOP_MIN_ROUTE_EDGE_GAP: f32 = 4.0;
+const BHOP_MIN_BRANCH_EDGE_GAP: f32 = 3.0;
+const BHOP_MIN_ANCHOR_EDGE_CLEARANCE: f32 = 0.75;
+const BHOP_VERTICAL_CLEARANCE_BIAS: f32 = 1.0;
+const BHOP_SPACING_EPSILON: f32 = 0.05;
+const BHOP_MAX_REPAIR_PASSES: usize = 6;
+const BHOP_MAX_BUILD_ATTEMPTS: usize = 8;
 const SURF_WEDGE_THICKNESS: f32 = 0.16;
 const SURF_COLLIDER_OVERLAP_MIN: f32 = 0.14;
 const SURF_COLLIDER_OVERLAP_MAX: f32 = 0.42;
@@ -76,13 +83,12 @@ const BHOP_SECTION_GAP_MIN: f32 = 98.0;
 const BHOP_SECTION_GAP_MAX: f32 = 132.0;
 const BHOP_SECTION_DROP_MIN: f32 = 16.0;
 const BHOP_SECTION_DROP_MAX: f32 = 28.0;
-const BHOP_ANCHOR_MARGIN_MIN: f32 = 14.0;
-const BHOP_ANCHOR_MARGIN_MAX: f32 = 22.0;
+const BHOP_ANCHOR_MARGIN_MIN: f32 = 4.5;
+const BHOP_ANCHOR_MARGIN_MAX: f32 = 9.5;
 const BHOP_SURF_ALIGNMENT_DROP: f32 = 11.5;
-const SURF_ENTRY_MARGIN_MIN: f32 = 10.0;
-const SURF_ENTRY_MARGIN_MAX: f32 = 18.0;
-const SURF_EXIT_MARGIN_MIN: f32 = 9.0;
-const SURF_EXIT_MARGIN_MAX: f32 = 16.0;
+const SURF_ENTRY_MARGIN: f32 = 1.0;
+const SURF_EXIT_MARGIN_MIN: f32 = 4.5;
+const SURF_EXIT_MARGIN_MAX: f32 = 9.0;
 const SKY_DOME_RADIUS: f32 = 1_240.0;
 const WORLD_SURFACE_SHADER_ASSET_PATH: &str = "shaders/world_surface_material.wgsl";
 const NEBULA_SKY_SHADER_ASSET_PATH: &str = "shaders/nebula_sky.wgsl";
@@ -1125,9 +1131,15 @@ fn build_segment_layout(segment: &SegmentPlan, rooms: &[RoomPlan]) -> ModuleLayo
             right,
             segment.index == 0,
         ),
-        SegmentKind::SquareBhop => {
-            append_square_bhop_sequence(&mut layout, &mut rng, start, end, forward, right)
-        }
+        SegmentKind::SquareBhop => append_square_bhop_sequence(
+            &mut layout,
+            &mut rng,
+            start,
+            end,
+            forward,
+            right,
+            segment.index,
+        ),
     }
 
     layout
@@ -1341,13 +1353,95 @@ fn paint_stripe_color(paint: PaintStyle) -> Color {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PathLateralStyle {
     Straight,
     Serpentine,
     Switchback,
     Arc,
     OneSidedArc,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum BhopPattern {
+    Rhythm,
+    LaneSwitch,
+    DropStrafe,
+    SplitMerge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BhopDifficultyBand {
+    Intro,
+    Mid,
+    Advanced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BhopProfile {
+    band: BhopDifficultyBand,
+    pattern: BhopPattern,
+    pad_count: usize,
+    min_pad_count: usize,
+    path_style: PathLateralStyle,
+    weave_cycles: f32,
+    phase: f32,
+    lateral_amplitude: f32,
+    vertical_wave: f32,
+    lane_offset: f32,
+    drop_depth: f32,
+    catch_interval: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BhopPadSpec {
+    step: usize,
+    route_mask: u8,
+    top: Vec3,
+    side: f32,
+    height: f32,
+    catch: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct BhopPlacementPlan {
+    usable_length: f32,
+    step_samples: Vec<f32>,
+    pads: Vec<BhopPadSpec>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BhopSpacingRules {
+    min_route_edge_gap: f32,
+    min_branch_edge_gap: f32,
+    epsilon: f32,
+}
+
+impl Default for BhopSpacingRules {
+    fn default() -> Self {
+        Self {
+            min_route_edge_gap: BHOP_MIN_ROUTE_EDGE_GAP,
+            min_branch_edge_gap: BHOP_MIN_BRANCH_EDGE_GAP,
+            epsilon: BHOP_SPACING_EPSILON,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BhopSpacingIssueKind {
+    RouteGap,
+    BranchGap,
+    Overlap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BhopSpacingIssue {
+    kind: BhopSpacingIssueKind,
+    left: usize,
+    right: usize,
+    deficit: f32,
+    earlier_step: usize,
+    later_step: usize,
 }
 
 fn append_square_bhop_sequence(
@@ -1357,58 +1451,966 @@ fn append_square_bhop_sequence(
     end: Vec3,
     forward: Vec3,
     right: Vec3,
+    segment_index: usize,
 ) {
-    let _ = forward;
-    let distance = start.distance(end).max(18.0);
-    let start_margin = bhop_path_margin(distance, BHOP_ANCHOR_MARGIN_MIN, BHOP_ANCHOR_MARGIN_MAX);
-    let end_margin = bhop_path_margin(distance, BHOP_ANCHOR_MARGIN_MIN, BHOP_ANCHOR_MARGIN_MAX);
-    // Keep bhop sections visually closer to the lower surf face band instead of the abstract room top.
-    let path_start = start + direction_from_delta(end - start) * start_margin
-        - Vec3::Y * BHOP_SURF_ALIGNMENT_DROP;
-    let path_end =
-        end - direction_from_delta(end - start) * end_margin - Vec3::Y * BHOP_SURF_ALIGNMENT_DROP;
-    let requested_count =
-        ((distance / scaled_bhop_cadence(4.8, 6.6, rng)).round() as usize).clamp(6, 16);
-    let pad_count =
-        clamp_platform_count_for_spacing(distance, requested_count, scaled_bhop_size(4.0), 4);
-    let tops = sample_descending_platform_tops(
-        path_start,
-        path_end,
-        right,
-        pad_count,
-        choose_bhop_path_style(rng),
-        rng.range_f32(1.6, 3.2),
-        rng.range_f32(0.0, TAU),
-        scaled_bhop_size(rng.range_f32(1.0, 1.8)),
-        scaled_bhop_size(rng.range_f32(0.06, 0.22)),
-    );
-
-    for (step, top) in tops.into_iter().enumerate() {
-        let catch_platform = step == 0 || step + 1 == pad_count || step % 5 == 0;
-        let square_side = scaled_bhop_size(if catch_platform {
-            rng.range_f32(3.8, 5.4)
-        } else if step % 3 == 0 {
-            rng.range_f32(2.8, 3.6)
-        } else {
-            rng.range_f32(1.9, 2.8)
-        });
-        let pad_height = scaled_bhop_size(if catch_platform {
-            rng.range_f32(0.9, 1.15)
-        } else {
-            rng.range_f32(0.72, 0.94)
-        }) * 0.45;
+    let (_, pads) = build_square_bhop_pads(segment_index, rng, start, end, forward, right);
+    for pad in pads {
         layout.solids.push(SolidSpec {
-            label: if catch_platform {
-                format!("Square Bhop Catch {step}")
+            label: if pad.catch {
+                format!("Square Bhop Catch {}", pad.step)
             } else {
-                format!("Square Bhop Pad {step}")
+                format!("Square Bhop Pad {}", pad.step)
             },
-            center: top_to_center(top, pad_height),
-            size: Vec3::new(square_side, pad_height, square_side),
+            center: top_to_center(pad.top, pad.height),
+            size: Vec3::new(pad.side, pad.height, pad.side),
             paint: PaintStyle::BhopPlatform,
             body: SolidBody::Static,
             friction: None,
         });
+    }
+}
+
+fn build_square_bhop_pads(
+    segment_index: usize,
+    rng: &mut RunRng,
+    start: Vec3,
+    end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+) -> (BhopProfile, Vec<BhopPadSpec>) {
+    let distance = start.distance(end).max(18.0);
+    let rules = BhopSpacingRules::default();
+    let path_forward = direction_from_delta(end - start);
+    let path_forward = if path_forward == Vec3::ZERO {
+        forward
+    } else {
+        path_forward
+    };
+    let start_margin = bhop_path_margin(distance, BHOP_ANCHOR_MARGIN_MIN, BHOP_ANCHOR_MARGIN_MAX);
+    let end_margin = bhop_path_margin(distance, BHOP_ANCHOR_MARGIN_MIN, BHOP_ANCHOR_MARGIN_MAX);
+    let path_start = start + path_forward * start_margin
+        - Vec3::Y * (BHOP_SURF_ALIGNMENT_DROP + BHOP_VERTICAL_CLEARANCE_BIAS);
+    let path_end = end
+        - path_forward * end_margin
+        - Vec3::Y * (BHOP_SURF_ALIGNMENT_DROP + BHOP_VERTICAL_CLEARANCE_BIAS);
+    let usable_length = path_start.distance(path_end).max(1.0);
+    let base_rng = rng.clone();
+    let mut profile_rng = base_rng.fork(0xB105_F11E);
+    let base_profile = choose_bhop_profile(segment_index, usable_length, &mut profile_rng);
+
+    for retry in 0..BHOP_MAX_BUILD_ATTEMPTS {
+        let profile = retry_bhop_profile(base_profile, retry);
+        let mut attempt_rng = base_rng.fork(0xA11E_0000_u64.wrapping_add(retry as u64));
+        let Some(mut plan) = build_bhop_placement_plan(
+            &profile,
+            &mut attempt_rng,
+            path_start,
+            path_end,
+            path_forward,
+            right,
+            &rules,
+        ) else {
+            continue;
+        };
+        if repair_bhop_spacing(&profile, &mut plan, path_forward, right, &rules)
+            && validate_bhop_spacing(&profile, &plan.pads, &rules).is_empty()
+        {
+            return (profile, plan.pads);
+        }
+    }
+
+    let mut fallback_profile = base_profile;
+    fallback_profile.pattern = BhopPattern::LaneSwitch;
+    fallback_profile.path_style = match fallback_profile.path_style {
+        PathLateralStyle::Straight
+        | PathLateralStyle::Serpentine
+        | PathLateralStyle::Switchback => fallback_profile.path_style,
+        _ => PathLateralStyle::Serpentine,
+    };
+    fallback_profile.pad_count = fallback_profile.min_pad_count;
+    let mut fallback_plan = None;
+    while fallback_profile.pad_count >= 2 && fallback_plan.is_none() {
+        let mut fallback_rng =
+            base_rng.fork(0xFA11_BACC_u64.wrapping_add(fallback_profile.pad_count as u64));
+        fallback_plan = build_bhop_placement_plan(
+            &fallback_profile,
+            &mut fallback_rng,
+            path_start,
+            path_end,
+            path_forward,
+            right,
+            &rules,
+        );
+        if fallback_plan.is_none() && fallback_profile.pad_count > 2 {
+            fallback_profile.pad_count -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut fallback_plan = fallback_plan.expect("fallback lane-switch bhop placement should fit");
+    let _ = repair_bhop_spacing(
+        &fallback_profile,
+        &mut fallback_plan,
+        path_forward,
+        right,
+        &rules,
+    );
+    (fallback_profile, fallback_plan.pads)
+}
+
+fn choose_bhop_profile(segment_index: usize, usable_length: f32, rng: &mut RunRng) -> BhopProfile {
+    let ordinal = bhop_segment_ordinal(segment_index);
+    let band = bhop_difficulty_band(ordinal);
+    let pattern = choose_bhop_pattern(rng, band);
+    let path_style = choose_bhop_path_style(rng, band, pattern);
+    let (cadence_min, cadence_max, min_count, max_count, min_spacing, catch_interval) = match band {
+        BhopDifficultyBand::Intro => (5.4, 6.8, 6, 11, scaled_bhop_size(4.6), 3),
+        BhopDifficultyBand::Mid => (4.8, 6.2, 7, 13, scaled_bhop_size(4.0), 4),
+        BhopDifficultyBand::Advanced => (4.2, 5.6, 8, 16, scaled_bhop_size(3.6), 7),
+    };
+    let requested_count = ((usable_length / scaled_bhop_cadence(cadence_min, cadence_max, rng))
+        .round() as usize)
+        .clamp(min_count, max_count);
+    let mut pad_count =
+        clamp_platform_count_for_spacing(usable_length, requested_count, min_spacing, min_count);
+    if pattern == BhopPattern::SplitMerge {
+        pad_count = pad_count.max(8);
+    }
+
+    let weave_cycles = bhop_weave_cycles(path_style, band, rng);
+    let lateral_amplitude = match band {
+        BhopDifficultyBand::Intro => scaled_bhop_size(rng.range_f32(0.35, 0.82)),
+        BhopDifficultyBand::Mid => scaled_bhop_size(rng.range_f32(0.7, 1.22)),
+        BhopDifficultyBand::Advanced => scaled_bhop_size(rng.range_f32(1.0, 1.7)),
+    };
+    let vertical_wave = match band {
+        BhopDifficultyBand::Intro => scaled_bhop_size(rng.range_f32(0.04, 0.12)),
+        BhopDifficultyBand::Mid => scaled_bhop_size(rng.range_f32(0.08, 0.18)),
+        BhopDifficultyBand::Advanced => scaled_bhop_size(rng.range_f32(0.1, 0.24)),
+    };
+    let lane_offset = match band {
+        BhopDifficultyBand::Intro => 0.0,
+        BhopDifficultyBand::Mid => scaled_bhop_size(rng.range_f32(0.8, 1.15)),
+        BhopDifficultyBand::Advanced => scaled_bhop_size(rng.range_f32(1.1, 1.45)),
+    };
+    let drop_depth = match band {
+        BhopDifficultyBand::Intro => 0.0,
+        BhopDifficultyBand::Mid => scaled_bhop_size(rng.range_f32(0.45, 0.85)),
+        BhopDifficultyBand::Advanced => scaled_bhop_size(rng.range_f32(0.85, 1.35)),
+    };
+
+    BhopProfile {
+        band,
+        pattern,
+        pad_count,
+        min_pad_count: min_count,
+        path_style,
+        weave_cycles,
+        phase: rng.range_f32(0.0, TAU),
+        lateral_amplitude,
+        vertical_wave,
+        lane_offset,
+        drop_depth,
+        catch_interval,
+    }
+}
+
+fn retry_bhop_profile(base: BhopProfile, retry: usize) -> BhopProfile {
+    let mut profile = base;
+    let max_reduction = base.pad_count.saturating_sub(base.min_pad_count);
+    let reduction = retry.saturating_sub(1).min(max_reduction);
+    profile.pad_count = base
+        .pad_count
+        .saturating_sub(reduction)
+        .max(base.min_pad_count);
+
+    if retry >= 5 && base.pattern == BhopPattern::SplitMerge {
+        profile.pattern = BhopPattern::LaneSwitch;
+        profile.path_style = match base.path_style {
+            PathLateralStyle::Straight
+            | PathLateralStyle::Serpentine
+            | PathLateralStyle::Switchback => base.path_style,
+            _ => PathLateralStyle::Serpentine,
+        };
+    }
+
+    profile
+}
+
+fn bhop_segment_ordinal(segment_index: usize) -> usize {
+    segment_index / 2
+}
+
+fn bhop_difficulty_band(ordinal: usize) -> BhopDifficultyBand {
+    match ordinal {
+        0..=2 => BhopDifficultyBand::Intro,
+        3..=5 => BhopDifficultyBand::Mid,
+        _ => BhopDifficultyBand::Advanced,
+    }
+}
+
+fn choose_bhop_pattern(rng: &mut RunRng, band: BhopDifficultyBand) -> BhopPattern {
+    match band {
+        BhopDifficultyBand::Intro => BhopPattern::Rhythm,
+        BhopDifficultyBand::Mid => rng.weighted_choice(&[
+            (BhopPattern::Rhythm, 4),
+            (BhopPattern::LaneSwitch, 3),
+            (BhopPattern::DropStrafe, 2),
+        ]),
+        BhopDifficultyBand::Advanced => rng.weighted_choice(&[
+            (BhopPattern::Rhythm, 2),
+            (BhopPattern::LaneSwitch, 3),
+            (BhopPattern::DropStrafe, 2),
+            (BhopPattern::SplitMerge, 3),
+        ]),
+    }
+}
+
+fn choose_bhop_path_style(
+    rng: &mut RunRng,
+    band: BhopDifficultyBand,
+    pattern: BhopPattern,
+) -> PathLateralStyle {
+    match pattern {
+        BhopPattern::Rhythm => match band {
+            BhopDifficultyBand::Intro => {
+                rng.weighted_choice(&[(PathLateralStyle::Straight, 6), (PathLateralStyle::Arc, 3)])
+            }
+            BhopDifficultyBand::Mid => rng.weighted_choice(&[
+                (PathLateralStyle::Straight, 2),
+                (PathLateralStyle::Serpentine, 4),
+                (PathLateralStyle::Arc, 3),
+            ]),
+            BhopDifficultyBand::Advanced => rng.weighted_choice(&[
+                (PathLateralStyle::Serpentine, 4),
+                (PathLateralStyle::Switchback, 3),
+                (PathLateralStyle::Arc, 3),
+            ]),
+        },
+        BhopPattern::LaneSwitch => rng.weighted_choice(&[
+            (PathLateralStyle::Straight, 2),
+            (PathLateralStyle::Serpentine, 4),
+            (PathLateralStyle::Switchback, 4),
+        ]),
+        BhopPattern::DropStrafe => rng.weighted_choice(&[
+            (PathLateralStyle::Straight, 3),
+            (PathLateralStyle::Arc, 4),
+            (PathLateralStyle::Serpentine, 2),
+        ]),
+        BhopPattern::SplitMerge => rng.weighted_choice(&[
+            (PathLateralStyle::Straight, 4),
+            (PathLateralStyle::Arc, 4),
+            (PathLateralStyle::Serpentine, 1),
+        ]),
+    }
+}
+
+fn bhop_weave_cycles(style: PathLateralStyle, band: BhopDifficultyBand, rng: &mut RunRng) -> f32 {
+    match style {
+        PathLateralStyle::Straight => match band {
+            BhopDifficultyBand::Intro => rng.range_f32(0.25, 0.55),
+            BhopDifficultyBand::Mid => rng.range_f32(0.35, 0.8),
+            BhopDifficultyBand::Advanced => rng.range_f32(0.45, 1.0),
+        },
+        PathLateralStyle::Arc => match band {
+            BhopDifficultyBand::Intro => rng.range_f32(0.35, 0.8),
+            BhopDifficultyBand::Mid => rng.range_f32(0.6, 1.1),
+            BhopDifficultyBand::Advanced => rng.range_f32(0.8, 1.25),
+        },
+        PathLateralStyle::Serpentine => match band {
+            BhopDifficultyBand::Intro => rng.range_f32(0.8, 1.3),
+            BhopDifficultyBand::Mid => rng.range_f32(1.0, 1.9),
+            BhopDifficultyBand::Advanced => rng.range_f32(1.35, 2.5),
+        },
+        PathLateralStyle::Switchback => match band {
+            BhopDifficultyBand::Intro => rng.range_f32(0.8, 1.2),
+            BhopDifficultyBand::Mid => rng.range_f32(1.2, 2.0),
+            BhopDifficultyBand::Advanced => rng.range_f32(1.6, 2.8),
+        },
+        PathLateralStyle::OneSidedArc => rng.range_f32(0.2, 0.5),
+    }
+}
+
+fn build_bhop_placement_plan(
+    profile: &BhopProfile,
+    rng: &mut RunRng,
+    path_start: Vec3,
+    path_end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    rules: &BhopSpacingRules,
+) -> Option<BhopPlacementPlan> {
+    let mut pads = build_bhop_pad_specs(profile, rng);
+    if !fit_bhop_pad_sizes_to_length(profile, &mut pads, path_start.distance(path_end), rules) {
+        return None;
+    }
+    let gap_weights = build_bhop_gap_weights(profile, rng);
+    let step_samples = place_bhop_step_samples(
+        profile,
+        &pads,
+        path_start.distance(path_end),
+        &gap_weights,
+        rules,
+    )?;
+    let mut plan = BhopPlacementPlan {
+        usable_length: path_start.distance(path_end).max(1.0),
+        step_samples,
+        pads,
+    };
+    materialize_bhop_placement_plan(
+        profile, &mut plan, path_start, path_end, forward, right, rules,
+    );
+    Some(plan)
+}
+
+fn build_bhop_pad_specs(profile: &BhopProfile, rng: &mut RunRng) -> Vec<BhopPadSpec> {
+    match profile.pattern {
+        BhopPattern::Rhythm => build_rhythm_bhop_pads(profile, rng),
+        BhopPattern::LaneSwitch => build_lane_switch_bhop_pads(profile, rng),
+        BhopPattern::DropStrafe => build_drop_strafe_bhop_pads(profile, rng),
+        BhopPattern::SplitMerge => build_split_merge_bhop_pads(profile, rng),
+    }
+}
+
+fn build_rhythm_bhop_pads(profile: &BhopProfile, rng: &mut RunRng) -> Vec<BhopPadSpec> {
+    (0..profile.pad_count)
+        .map(|step| {
+            let catch =
+                bhop_is_catch_step(profile, step) || step == 0 || step + 1 == profile.pad_count;
+            let beat_scale = match step % 4 {
+                0 => 1.08,
+                1 => 0.94,
+                2 => 1.0,
+                _ => 0.88,
+            };
+            make_bhop_pad(profile, rng, step, 0b01, catch, beat_scale, 1.0)
+        })
+        .collect()
+}
+
+fn build_lane_switch_bhop_pads(profile: &BhopProfile, rng: &mut RunRng) -> Vec<BhopPadSpec> {
+    (0..profile.pad_count)
+        .map(|step| {
+            let catch =
+                bhop_is_catch_step(profile, step) || step == 0 || step + 1 == profile.pad_count;
+            make_bhop_pad(profile, rng, step, 0b01, catch, 1.0, 1.0)
+        })
+        .collect()
+}
+
+fn build_drop_strafe_bhop_pads(profile: &BhopProfile, rng: &mut RunRng) -> Vec<BhopPadSpec> {
+    let last = profile.pad_count.saturating_sub(1).max(1);
+    (0..profile.pad_count)
+        .map(|step| {
+            let t = step as f32 / last as f32;
+            let basin = (1.0 - ((t - 0.5).abs() / 0.34).clamp(0.0, 1.0)).powf(1.7);
+            let catch =
+                bhop_is_catch_step(profile, step) || step <= 1 || step + 2 >= profile.pad_count;
+            let size_scale = lerp(1.04, 0.82, basin);
+            make_bhop_pad(profile, rng, step, 0b01, catch, size_scale, 1.0)
+        })
+        .collect()
+}
+
+fn build_split_merge_bhop_pads(profile: &BhopProfile, rng: &mut RunRng) -> Vec<BhopPadSpec> {
+    let split_start = (profile.pad_count / 3).max(2);
+    let merge_start = profile
+        .pad_count
+        .saturating_sub((profile.pad_count / 3).max(2));
+    let mut pads = Vec::with_capacity(profile.pad_count + merge_start.saturating_sub(split_start));
+
+    for step in 0..profile.pad_count {
+        let shared = step < split_start || step >= merge_start;
+        if shared {
+            let catch = step == 0
+                || step + 1 == profile.pad_count
+                || step + 1 == split_start
+                || step == merge_start;
+            pads.push(make_bhop_pad(profile, rng, step, 0b11, catch, 1.02, 1.0));
+            continue;
+        }
+
+        pads.push(make_bhop_pad(profile, rng, step, 0b01, false, 1.18, 1.04));
+        pads.push(make_bhop_pad(profile, rng, step, 0b10, false, 0.82, 0.94));
+    }
+
+    pads
+}
+
+fn build_bhop_gap_weights(profile: &BhopProfile, rng: &mut RunRng) -> Vec<f32> {
+    if profile.pad_count <= 1 {
+        return Vec::new();
+    }
+
+    match profile.pattern {
+        BhopPattern::Rhythm => rhythm_gap_weights(profile.pad_count, rng),
+        BhopPattern::DropStrafe => (0..profile.pad_count - 1)
+            .map(|gap| {
+                let t = (gap + 1) as f32 / profile.pad_count as f32;
+                1.0 + (1.0 - ((t - 0.5).abs() / 0.45).clamp(0.0, 1.0)) * 0.35
+            })
+            .collect(),
+        _ => vec![1.0; profile.pad_count - 1],
+    }
+}
+
+fn fit_bhop_pad_sizes_to_length(
+    profile: &BhopProfile,
+    pads: &mut [BhopPadSpec],
+    usable_length: f32,
+    rules: &BhopSpacingRules,
+) -> bool {
+    for _ in 0..BHOP_MAX_REPAIR_PASSES {
+        let required_total = bhop_required_path_length(profile, pads, rules);
+        if required_total <= usable_length {
+            return true;
+        }
+
+        let overflow = required_total - usable_length;
+        let shrinkable = pads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pad)| {
+                (!pad.catch && pad.side > bhop_min_side_for_repair(profile.band) + rules.epsilon)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if shrinkable.is_empty() {
+            return false;
+        }
+
+        let per_pad = overflow / shrinkable.len() as f32 + rules.epsilon;
+        for index in shrinkable {
+            let min_side = bhop_min_side_for_repair(profile.band);
+            pads[index].side = (pads[index].side - per_pad).max(min_side);
+        }
+    }
+
+    bhop_required_path_length(profile, pads, rules) <= usable_length
+}
+
+fn place_bhop_step_samples(
+    profile: &BhopProfile,
+    pads: &[BhopPadSpec],
+    usable_length: f32,
+    gap_weights: &[f32],
+    rules: &BhopSpacingRules,
+) -> Option<Vec<f32>> {
+    if profile.pad_count == 0 {
+        return Some(Vec::new());
+    }
+    if profile.pad_count == 1 {
+        return Some(vec![0.5]);
+    }
+
+    let usable_length = usable_length.max(1.0);
+    let (start_clearance, end_clearance, required_gaps) = bhop_path_budget(profile, pads, rules)?;
+    let total_required = start_clearance + end_clearance + required_gaps.iter().sum::<f32>();
+    if total_required > usable_length {
+        return None;
+    }
+
+    let slack = (usable_length - total_required).max(0.0);
+    let weight_sum = gap_weights.iter().sum::<f32>().max(0.001);
+    let mut samples = Vec::with_capacity(profile.pad_count);
+    let mut traveled = start_clearance;
+    samples.push((traveled / usable_length).clamp(0.0, 1.0));
+    for (index, required_gap) in required_gaps.into_iter().enumerate() {
+        let extra = slack * gap_weights.get(index).copied().unwrap_or(1.0) / weight_sum;
+        traveled += required_gap + extra;
+        samples.push((traveled / usable_length).clamp(0.0, 1.0));
+    }
+    Some(samples)
+}
+
+fn bhop_path_budget(
+    profile: &BhopProfile,
+    pads: &[BhopPadSpec],
+    rules: &BhopSpacingRules,
+) -> Option<(f32, f32, Vec<f32>)> {
+    let route_masks = bhop_route_masks(profile.pattern);
+    let start_clearance = bhop_step_half_extent(pads, 0) + BHOP_MIN_ANCHOR_EDGE_CLEARANCE;
+    let end_clearance =
+        bhop_step_half_extent(pads, profile.pad_count - 1) + BHOP_MIN_ANCHOR_EDGE_CLEARANCE;
+    let mut required_gaps = Vec::with_capacity(profile.pad_count - 1);
+    for step in 1..profile.pad_count {
+        let mut required: f32 = 0.0;
+        for route_mask in route_masks {
+            let prev = route_pad_for_step(pads, step - 1, *route_mask)?;
+            let curr = route_pad_for_step(pads, step, *route_mask)?;
+            required = required.max(bhop_required_center_gap(
+                prev.side,
+                curr.side,
+                rules.min_route_edge_gap,
+            ));
+        }
+        required_gaps.push(required);
+    }
+    Some((start_clearance, end_clearance, required_gaps))
+}
+
+fn bhop_required_path_length(
+    profile: &BhopProfile,
+    pads: &[BhopPadSpec],
+    rules: &BhopSpacingRules,
+) -> f32 {
+    bhop_path_budget(profile, pads, rules)
+        .map(|(start_clearance, end_clearance, required_gaps)| {
+            start_clearance + end_clearance + required_gaps.iter().sum::<f32>()
+        })
+        .unwrap_or(f32::INFINITY)
+}
+
+fn materialize_bhop_placement_plan(
+    profile: &BhopProfile,
+    plan: &mut BhopPlacementPlan,
+    path_start: Vec3,
+    path_end: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    rules: &BhopSpacingRules,
+) {
+    let base_tops = sample_descending_platform_tops_with_samples(
+        path_start,
+        path_end,
+        right,
+        &plan.step_samples,
+        profile.path_style,
+        profile.weave_cycles,
+        profile.phase,
+        profile.lateral_amplitude,
+        profile.vertical_wave,
+    );
+
+    for pad in &mut plan.pads {
+        pad.top = base_tops
+            .get(pad.step)
+            .copied()
+            .unwrap_or_else(|| path_start.lerp(path_end, 0.5));
+    }
+
+    match profile.pattern {
+        BhopPattern::Rhythm => {}
+        BhopPattern::LaneSwitch => materialize_lane_switch_bhop_pads(profile, plan, right),
+        BhopPattern::DropStrafe => materialize_drop_strafe_bhop_pads(profile, plan),
+        BhopPattern::SplitMerge => {
+            materialize_split_merge_bhop_pads(profile, plan, forward, right, rules)
+        }
+    }
+}
+
+fn materialize_lane_switch_bhop_pads(
+    profile: &BhopProfile,
+    plan: &mut BhopPlacementPlan,
+    right: Vec3,
+) {
+    let lane_cycles = match profile.band {
+        BhopDifficultyBand::Intro => 0.0,
+        BhopDifficultyBand::Mid => 1.7,
+        BhopDifficultyBand::Advanced => 2.6,
+    };
+
+    for pad in &mut plan.pads {
+        let t = plan.step_samples.get(pad.step).copied().unwrap_or(0.5);
+        let envelope = (t * PI).sin().max(0.0).powf(0.76);
+        let lane_shift =
+            (t * lane_cycles * TAU + profile.phase * 0.9).sin() * profile.lane_offset * envelope;
+        pad.top += right * lane_shift;
+    }
+}
+
+fn materialize_drop_strafe_bhop_pads(profile: &BhopProfile, plan: &mut BhopPlacementPlan) {
+    let last = profile.pad_count.saturating_sub(1).max(1);
+    for pad in &mut plan.pads {
+        let t = pad.step as f32 / last as f32;
+        let basin = (1.0 - ((t - 0.5).abs() / 0.34).clamp(0.0, 1.0)).powf(1.7);
+        pad.top -= Vec3::Y * profile.drop_depth * basin;
+    }
+}
+
+fn materialize_split_merge_bhop_pads(
+    profile: &BhopProfile,
+    plan: &mut BhopPlacementPlan,
+    _forward: Vec3,
+    right: Vec3,
+    rules: &BhopSpacingRules,
+) {
+    for step in 0..profile.pad_count {
+        let indices = plan
+            .pads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pad)| (pad.step == step).then_some(index))
+            .collect::<Vec<_>>();
+        if indices.len() < 2 {
+            continue;
+        }
+
+        let safe_index = indices
+            .iter()
+            .copied()
+            .find(|index| plan.pads[*index].route_mask == 0b01);
+        let risk_index = indices
+            .iter()
+            .copied()
+            .find(|index| plan.pads[*index].route_mask == 0b10);
+        let (Some(safe_index), Some(risk_index)) = (safe_index, risk_index) else {
+            continue;
+        };
+        let separation = solve_split_merge_lane_offset(
+            plan.pads[safe_index].side,
+            plan.pads[risk_index].side,
+            profile.lane_offset,
+            rules,
+        );
+        let safe_offset = separation * 0.44;
+        let risk_offset = separation * 0.56;
+        let base = plan.pads[safe_index]
+            .top
+            .lerp(plan.pads[risk_index].top, 0.5);
+        plan.pads[safe_index].top = base - right * safe_offset;
+        plan.pads[risk_index].top = base + right * risk_offset;
+    }
+}
+
+fn validate_bhop_spacing(
+    profile: &BhopProfile,
+    pads: &[BhopPadSpec],
+    rules: &BhopSpacingRules,
+) -> Vec<BhopSpacingIssue> {
+    let mut issues = Vec::new();
+
+    for route_mask in bhop_route_masks(profile.pattern) {
+        for step in 1..profile.pad_count {
+            let Some(prev_index) = route_pad_index_for_step(pads, step - 1, *route_mask) else {
+                continue;
+            };
+            let Some(curr_index) = route_pad_index_for_step(pads, step, *route_mask) else {
+                continue;
+            };
+            let gap = bhop_edge_gap(&pads[prev_index], &pads[curr_index]);
+            if gap + rules.epsilon < rules.min_route_edge_gap {
+                issues.push(BhopSpacingIssue {
+                    kind: BhopSpacingIssueKind::RouteGap,
+                    left: prev_index,
+                    right: curr_index,
+                    deficit: rules.min_route_edge_gap - gap,
+                    earlier_step: step - 1,
+                    later_step: step,
+                });
+            }
+        }
+    }
+
+    for step in 0..profile.pad_count {
+        let step_indices = pads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pad)| (pad.step == step).then_some(index))
+            .collect::<Vec<_>>();
+        for left_offset in 0..step_indices.len() {
+            for right_offset in left_offset + 1..step_indices.len() {
+                let left = step_indices[left_offset];
+                let right = step_indices[right_offset];
+                let gap = bhop_edge_gap(&pads[left], &pads[right]);
+                if gap + rules.epsilon < rules.min_branch_edge_gap {
+                    issues.push(BhopSpacingIssue {
+                        kind: BhopSpacingIssueKind::BranchGap,
+                        left,
+                        right,
+                        deficit: rules.min_branch_edge_gap - gap,
+                        earlier_step: step,
+                        later_step: step,
+                    });
+                }
+            }
+        }
+    }
+
+    for left in 0..pads.len() {
+        for right in left + 1..pads.len() {
+            let left_pad = &pads[left];
+            let right_pad = &pads[right];
+            let adjacent_same_route = left_pad.step.abs_diff(right_pad.step) == 1
+                && left_pad.route_mask & right_pad.route_mask != 0;
+            let branch_pair = left_pad.step == right_pad.step;
+            if adjacent_same_route || branch_pair {
+                continue;
+            }
+
+            let gap = bhop_edge_gap(left_pad, right_pad);
+            if gap + rules.epsilon < 0.0 {
+                issues.push(BhopSpacingIssue {
+                    kind: BhopSpacingIssueKind::Overlap,
+                    left,
+                    right,
+                    deficit: -gap,
+                    earlier_step: left_pad.step.min(right_pad.step),
+                    later_step: left_pad.step.max(right_pad.step),
+                });
+            }
+        }
+    }
+
+    issues.sort_by(|left, right| {
+        left.later_step
+            .cmp(&right.later_step)
+            .then(left.earlier_step.cmp(&right.earlier_step))
+            .then_with(|| right.deficit.total_cmp(&left.deficit))
+    });
+    issues
+}
+
+fn repair_bhop_spacing(
+    profile: &BhopProfile,
+    plan: &mut BhopPlacementPlan,
+    path_forward: Vec3,
+    right: Vec3,
+    rules: &BhopSpacingRules,
+) -> bool {
+    for _ in 0..BHOP_MAX_REPAIR_PASSES {
+        let issues = validate_bhop_spacing(profile, &plan.pads, rules);
+        if issues.is_empty() {
+            return true;
+        }
+
+        let separated = separate_bhop_spacing_issues(plan, path_forward, right, &issues, rules);
+        let issues = validate_bhop_spacing(profile, &plan.pads, rules);
+        if issues.is_empty() {
+            return true;
+        }
+
+        let shrunk = shrink_bhop_spacing_issues(profile, &mut plan.pads, &issues, rules);
+        if !separated && !shrunk {
+            break;
+        }
+    }
+
+    validate_bhop_spacing(profile, &plan.pads, rules).is_empty()
+}
+
+fn separate_bhop_spacing_issues(
+    plan: &mut BhopPlacementPlan,
+    path_forward: Vec3,
+    right: Vec3,
+    issues: &[BhopSpacingIssue],
+    rules: &BhopSpacingRules,
+) -> bool {
+    let max_step = plan.pads.iter().map(|pad| pad.step).max().unwrap_or(0);
+    let mut route_shift_starts = vec![0.0_f32; max_step + 1];
+    let mut branch_shift_by_step = vec![0.0_f32; max_step + 1];
+    let mut changed = false;
+
+    for issue in issues {
+        match issue.kind {
+            BhopSpacingIssueKind::BranchGap => {
+                branch_shift_by_step[issue.later_step] =
+                    branch_shift_by_step[issue.later_step].max(issue.deficit * 0.5 + rules.epsilon);
+            }
+            BhopSpacingIssueKind::RouteGap | BhopSpacingIssueKind::Overlap => {
+                if issue.later_step <= max_step {
+                    route_shift_starts[issue.later_step] += issue.deficit + rules.epsilon;
+                }
+            }
+        }
+    }
+
+    let mut cumulative_route_shift = 0.0;
+    for step in 0..=max_step {
+        cumulative_route_shift += route_shift_starts[step];
+        if cumulative_route_shift > 0.0 {
+            changed = true;
+        }
+
+        let branch_shift = branch_shift_by_step[step];
+        if branch_shift > 0.0 {
+            changed = true;
+        }
+
+        for pad in plan.pads.iter_mut().filter(|pad| pad.step == step) {
+            if cumulative_route_shift > 0.0 {
+                pad.top += path_forward * cumulative_route_shift;
+            }
+            if branch_shift > 0.0 {
+                match pad.route_mask {
+                    0b01 => pad.top -= right * branch_shift,
+                    0b10 => pad.top += right * branch_shift,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+fn shrink_bhop_spacing_issues(
+    profile: &BhopProfile,
+    pads: &mut [BhopPadSpec],
+    issues: &[BhopSpacingIssue],
+    rules: &BhopSpacingRules,
+) -> bool {
+    let mut shrink_requests = vec![0.0; pads.len()];
+    for issue in issues {
+        let mut shrinkable = Vec::new();
+        if !pads[issue.left].catch && pads[issue.left].side > bhop_min_side_for_repair(profile.band)
+        {
+            shrinkable.push(issue.left);
+        }
+        if !pads[issue.right].catch
+            && pads[issue.right].side > bhop_min_side_for_repair(profile.band)
+        {
+            shrinkable.push(issue.right);
+        }
+        if shrinkable.is_empty() {
+            continue;
+        }
+
+        let per_pad = ((issue.deficit * 2.0) / shrinkable.len() as f32) + rules.epsilon;
+        for index in shrinkable {
+            shrink_requests[index] += per_pad;
+        }
+    }
+
+    let mut changed = false;
+    for (index, requested) in shrink_requests.into_iter().enumerate() {
+        if requested <= 0.0 {
+            continue;
+        }
+        let min_side = bhop_min_side_for_repair(profile.band);
+        let new_side = (pads[index].side - requested).max(min_side);
+        if new_side + rules.epsilon < pads[index].side {
+            pads[index].side = new_side;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn bhop_route_masks(pattern: BhopPattern) -> &'static [u8] {
+    match pattern {
+        BhopPattern::SplitMerge => &[0b01, 0b10],
+        _ => &[0b01],
+    }
+}
+
+fn route_pad_for_step<'a>(
+    pads: &'a [BhopPadSpec],
+    step: usize,
+    route_mask: u8,
+) -> Option<&'a BhopPadSpec> {
+    route_pad_index_for_step(pads, step, route_mask).map(|index| &pads[index])
+}
+
+fn route_pad_index_for_step(pads: &[BhopPadSpec], step: usize, route_mask: u8) -> Option<usize> {
+    pads.iter()
+        .position(|pad| pad.step == step && pad.route_mask & route_mask != 0)
+}
+
+fn bhop_required_center_gap(left_side: f32, right_side: f32, min_edge_gap: f32) -> f32 {
+    left_side * 0.5 + right_side * 0.5 + min_edge_gap
+}
+
+fn bhop_step_half_extent(pads: &[BhopPadSpec], step: usize) -> f32 {
+    pads.iter()
+        .filter(|pad| pad.step == step)
+        .map(|pad| pad.side * 0.5)
+        .fold(0.0, f32::max)
+}
+
+fn bhop_edge_gap(left: &BhopPadSpec, right: &BhopPadSpec) -> f32 {
+    left.top.xz().distance(right.top.xz()) - (left.side + right.side) * 0.5
+}
+
+fn solve_split_merge_lane_offset(
+    safe_side: f32,
+    risk_side: f32,
+    desired_lane_offset: f32,
+    rules: &BhopSpacingRules,
+) -> f32 {
+    let required_center_gap =
+        bhop_required_center_gap(safe_side, risk_side, rules.min_branch_edge_gap);
+    (desired_lane_offset * 2.0).max(required_center_gap)
+}
+
+fn make_bhop_pad(
+    profile: &BhopProfile,
+    rng: &mut RunRng,
+    step: usize,
+    route_mask: u8,
+    catch: bool,
+    side_scale: f32,
+    height_scale: f32,
+) -> BhopPadSpec {
+    let accent = !catch && step % 3 == 0;
+    let side = bhop_pad_side(profile.band, catch, accent, rng) * side_scale;
+    let height = bhop_pad_height(profile.band, catch, rng) * height_scale;
+    BhopPadSpec {
+        step,
+        route_mask,
+        top: Vec3::ZERO,
+        side,
+        height,
+        catch,
+    }
+}
+
+fn bhop_pad_side(band: BhopDifficultyBand, catch: bool, accent: bool, rng: &mut RunRng) -> f32 {
+    let side = match (band, catch, accent) {
+        (BhopDifficultyBand::Intro, true, _) => rng.range_f32(4.6, 5.8),
+        (BhopDifficultyBand::Intro, false, true) => rng.range_f32(3.6, 4.4),
+        (BhopDifficultyBand::Intro, false, false) => rng.range_f32(3.0, 3.8),
+        (BhopDifficultyBand::Mid, true, _) => rng.range_f32(4.2, 5.4),
+        (BhopDifficultyBand::Mid, false, true) => rng.range_f32(3.1, 3.9),
+        (BhopDifficultyBand::Mid, false, false) => rng.range_f32(2.3, 3.2),
+        (BhopDifficultyBand::Advanced, true, _) => rng.range_f32(3.9, 5.0),
+        (BhopDifficultyBand::Advanced, false, true) => rng.range_f32(2.6, 3.4),
+        (BhopDifficultyBand::Advanced, false, false) => rng.range_f32(1.8, 2.7),
+    };
+    scaled_bhop_size(side).max(scaled_bhop_size(1.6))
+}
+
+fn bhop_pad_height(band: BhopDifficultyBand, catch: bool, rng: &mut RunRng) -> f32 {
+    let height = match (band, catch) {
+        (BhopDifficultyBand::Intro, true) => rng.range_f32(0.94, 1.12),
+        (BhopDifficultyBand::Intro, false) => rng.range_f32(0.78, 0.96),
+        (BhopDifficultyBand::Mid, true) => rng.range_f32(0.9, 1.08),
+        (BhopDifficultyBand::Mid, false) => rng.range_f32(0.74, 0.9),
+        (BhopDifficultyBand::Advanced, true) => rng.range_f32(0.86, 1.04),
+        (BhopDifficultyBand::Advanced, false) => rng.range_f32(0.68, 0.86),
+    };
+    scaled_bhop_size(height) * 0.45
+}
+
+fn bhop_is_catch_step(profile: &BhopProfile, step: usize) -> bool {
+    step == 0 || step + 1 == profile.pad_count || step % profile.catch_interval == 0
+}
+
+fn rhythm_gap_weights(count: usize, rng: &mut RunRng) -> Vec<f32> {
+    if count <= 1 {
+        return Vec::new();
+    }
+    let short = rng.range_f32(0.7, 0.86);
+    let long = rng.range_f32(1.08, 1.28);
+    let settle = rng.range_f32(0.9, 1.06);
+    let mut weights = Vec::with_capacity(count - 1);
+    for gap in 0..count - 1 {
+        weights.push(match gap % 4 {
+            0 => 1.0,
+            1 => short,
+            2 => long,
+            _ => settle,
+        });
+    }
+    weights
+}
+
+fn bhop_min_side_for_repair(band: BhopDifficultyBand) -> f32 {
+    match band {
+        BhopDifficultyBand::Intro => scaled_bhop_size(2.8),
+        BhopDifficultyBand::Mid => scaled_bhop_size(2.0),
+        BhopDifficultyBand::Advanced => scaled_bhop_size(1.6),
     }
 }
 
@@ -1422,11 +2424,7 @@ fn append_surf_sequence(
     intense: bool,
 ) {
     let direct_distance = start.distance(end).max(12.0);
-    let entry_margin = if intense {
-        (direct_distance * 0.08).clamp(SURF_ENTRY_MARGIN_MIN, SURF_ENTRY_MARGIN_MAX)
-    } else {
-        (direct_distance * 0.07).clamp(SURF_ENTRY_MARGIN_MIN, SURF_ENTRY_MARGIN_MAX - 1.5)
-    };
+    let entry_margin = SURF_ENTRY_MARGIN;
     let exit_margin = if intense {
         (direct_distance * 0.07).clamp(SURF_EXIT_MARGIN_MIN, SURF_EXIT_MARGIN_MAX)
     } else {
@@ -1594,31 +2592,27 @@ fn append_surf_sequence(
     }
 }
 
-fn sample_descending_platform_tops(
+fn sample_descending_platform_tops_with_samples(
     start: Vec3,
     end: Vec3,
     right: Vec3,
-    count: usize,
+    samples: &[f32],
     style: PathLateralStyle,
     weave_cycles: f32,
     phase: f32,
     lateral_amplitude: f32,
     vertical_wave: f32,
 ) -> Vec<Vec3> {
-    if count == 0 {
+    if samples.is_empty() {
         return Vec::new();
     }
 
-    let mut points = Vec::with_capacity(count);
-    let last = count.saturating_sub(1);
-    for step in 0..count {
-        let t = if count == 1 {
-            0.5
-        } else {
-            step as f32 / last as f32
-        };
+    let last = samples.len().saturating_sub(1);
+    let mut points = Vec::with_capacity(samples.len());
+    for (step, sample) in samples.iter().copied().enumerate() {
+        let t = sample.clamp(0.0, 1.0);
         let envelope = (t * PI).sin().max(0.0).powf(0.72);
-        let endpoint_factor = match step.min(last - step) {
+        let endpoint_factor = match step.min(last.saturating_sub(step)) {
             0 => 0.0,
             1 => 0.22,
             _ => 1.0,
@@ -1636,15 +2630,6 @@ fn sample_descending_platform_tops(
         points.push(start.lerp(end, t) + right * lateral + Vec3::Y * vertical);
     }
     points
-}
-
-fn choose_bhop_path_style(rng: &mut RunRng) -> PathLateralStyle {
-    rng.weighted_choice(&[
-        (PathLateralStyle::Straight, 2),
-        (PathLateralStyle::Serpentine, 6),
-        (PathLateralStyle::Switchback, 6),
-        (PathLateralStyle::Arc, 4),
-    ])
 }
 
 fn choose_surf_path_style(rng: &mut RunRng, intense: bool) -> PathLateralStyle {
@@ -2321,6 +3306,12 @@ impl RunRng {
         z ^ (z >> 31)
     }
 
+    fn fork(&self, salt: u64) -> Self {
+        Self {
+            state: self.state ^ salt.wrapping_mul(0xD6E8_FD50_1A7F_6D4B),
+        }
+    }
+
     fn next_f32(&mut self) -> f32 {
         let sample = (self.next_u64() >> 40) as u32;
         sample as f32 / 16_777_215.0
@@ -2353,6 +3344,7 @@ enum CollisionLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn test_room(index: usize, top: Vec3) -> RoomPlan {
         RoomPlan { index, top }
@@ -2366,6 +3358,252 @@ mod tests {
             kind,
             seed,
         }
+    }
+
+    fn test_bhop_rooms() -> Vec<RoomPlan> {
+        vec![
+            test_room(0, Vec3::new(0.0, 120.0, 0.0)),
+            test_room(1, Vec3::new(118.0, 92.0, 22.0)),
+        ]
+    }
+
+    fn bhop_path_frame(rooms: &[RoomPlan]) -> (Vec3, Vec3, Vec3, Vec3) {
+        let start = rooms[0].top;
+        let end = rooms[1].top;
+        let forward = direction_from_delta(end - start);
+        let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
+        let distance = start.distance(end).max(18.0);
+        let start_margin =
+            bhop_path_margin(distance, BHOP_ANCHOR_MARGIN_MIN, BHOP_ANCHOR_MARGIN_MAX);
+        let end_margin = bhop_path_margin(distance, BHOP_ANCHOR_MARGIN_MIN, BHOP_ANCHOR_MARGIN_MAX);
+        let path_start = start + forward * start_margin
+            - Vec3::Y * (BHOP_SURF_ALIGNMENT_DROP + BHOP_VERTICAL_CLEARANCE_BIAS);
+        let path_end = end
+            - forward * end_margin
+            - Vec3::Y * (BHOP_SURF_ALIGNMENT_DROP + BHOP_VERTICAL_CLEARANCE_BIAS);
+        (path_start, path_end, forward, right)
+    }
+
+    fn build_test_bhop_section(
+        segment_index: usize,
+        seed: u64,
+    ) -> (BhopProfile, Vec<BhopPadSpec>, Vec<RoomPlan>) {
+        let rooms = test_bhop_rooms();
+        let (profile, pads) = build_test_bhop_section_in_rooms(segment_index, seed, &rooms);
+        (profile, pads, rooms)
+    }
+
+    fn build_test_bhop_section_in_rooms(
+        segment_index: usize,
+        seed: u64,
+        rooms: &[RoomPlan],
+    ) -> (BhopProfile, Vec<BhopPadSpec>) {
+        let from = &rooms[0];
+        let to = &rooms[1];
+        let forward = direction_from_delta(to.top - from.top);
+        let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
+        let mut rng = RunRng::new(seed);
+        build_square_bhop_pads(segment_index, &mut rng, from.top, to.top, forward, right)
+    }
+
+    fn forced_bhop_profile(pattern: BhopPattern, band: BhopDifficultyBand) -> BhopProfile {
+        BhopProfile {
+            band,
+            pattern,
+            pad_count: if pattern == BhopPattern::SplitMerge {
+                8
+            } else {
+                6
+            },
+            min_pad_count: if pattern == BhopPattern::SplitMerge {
+                8
+            } else {
+                5
+            },
+            path_style: match pattern {
+                BhopPattern::Rhythm => PathLateralStyle::Straight,
+                BhopPattern::LaneSwitch => PathLateralStyle::Serpentine,
+                BhopPattern::DropStrafe => PathLateralStyle::Arc,
+                BhopPattern::SplitMerge => PathLateralStyle::Straight,
+            },
+            weave_cycles: 1.6,
+            phase: 0.8,
+            lateral_amplitude: match band {
+                BhopDifficultyBand::Intro => scaled_bhop_size(0.5),
+                BhopDifficultyBand::Mid => scaled_bhop_size(0.95),
+                BhopDifficultyBand::Advanced => scaled_bhop_size(1.25),
+            },
+            vertical_wave: scaled_bhop_size(0.14),
+            lane_offset: match band {
+                BhopDifficultyBand::Intro => 0.0,
+                BhopDifficultyBand::Mid => scaled_bhop_size(0.95),
+                BhopDifficultyBand::Advanced => scaled_bhop_size(1.25),
+            },
+            drop_depth: match band {
+                BhopDifficultyBand::Intro => 0.0,
+                BhopDifficultyBand::Mid => scaled_bhop_size(0.7),
+                BhopDifficultyBand::Advanced => scaled_bhop_size(1.1),
+            },
+            catch_interval: match band {
+                BhopDifficultyBand::Intro => 3,
+                BhopDifficultyBand::Mid => 4,
+                BhopDifficultyBand::Advanced => 7,
+            },
+        }
+    }
+
+    fn build_forced_bhop_section(
+        profile: BhopProfile,
+        seed: u64,
+    ) -> (BhopProfile, Vec<BhopPadSpec>, Vec<RoomPlan>) {
+        let rooms = test_bhop_rooms();
+        let (profile, pads) = build_forced_bhop_section_in_rooms(profile, seed, &rooms);
+        (profile, pads, rooms)
+    }
+
+    fn build_forced_bhop_section_in_rooms(
+        profile: BhopProfile,
+        seed: u64,
+        rooms: &[RoomPlan],
+    ) -> (BhopProfile, Vec<BhopPadSpec>) {
+        let (path_start, path_end, forward, right) = bhop_path_frame(rooms);
+        let rules = BhopSpacingRules::default();
+        let mut profile = profile;
+        let mut plan = None;
+        while profile.pad_count >= 2 && plan.is_none() {
+            let mut rng = RunRng::new(seed ^ profile.pad_count as u64);
+            plan = build_bhop_placement_plan(
+                &profile, &mut rng, path_start, path_end, forward, right, &rules,
+            );
+            if plan.is_none() && profile.pad_count > 2 {
+                profile.pad_count -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut plan = plan.expect("forced bhop section should fit");
+        assert!(repair_bhop_spacing(
+            &profile, &mut plan, forward, right, &rules
+        ));
+        (profile, plan.pads)
+    }
+
+    fn route_covers_all_steps(pads: &[BhopPadSpec], route_mask: u8, step_count: usize) -> bool {
+        (0..step_count).all(|step| {
+            pads.iter()
+                .any(|pad| pad.step == step && pad.route_mask & route_mask != 0)
+        })
+    }
+
+    fn assert_has_complete_route(profile: &BhopProfile, pads: &[BhopPadSpec]) {
+        assert!(
+            route_covers_all_steps(pads, 0b01, profile.pad_count)
+                || route_covers_all_steps(pads, 0b10, profile.pad_count),
+            "expected at least one start-to-finish route for {:?}",
+            profile.pattern
+        );
+    }
+
+    fn assert_boundary_catches(profile: &BhopProfile, pads: &[BhopPadSpec]) {
+        assert!(pads.iter().any(|pad| pad.step == 0 && pad.catch));
+        assert!(
+            pads.iter()
+                .any(|pad| pad.step + 1 == profile.pad_count && pad.catch)
+        );
+    }
+
+    fn assert_anchor_clearance(profile: &BhopProfile, pads: &[BhopPadSpec], rooms: &[RoomPlan]) {
+        let start_pad = pads
+            .iter()
+            .find(|pad| pad.step == 0)
+            .expect("expected start pad");
+        let end_pad = pads
+            .iter()
+            .rev()
+            .find(|pad| pad.step + 1 == profile.pad_count)
+            .expect("expected end pad");
+        let forward = direction_from_delta(rooms[1].top - rooms[0].top);
+        let start_clearance = (start_pad.top - rooms[0].top).dot(forward) - start_pad.side * 0.5;
+        let end_clearance = (rooms[1].top - end_pad.top).dot(forward) - end_pad.side * 0.5;
+
+        assert!(
+            start_clearance > 0.5,
+            "start clearance too small: {start_clearance}"
+        );
+        assert!(
+            end_clearance > 0.5,
+            "end clearance too small: {end_clearance}"
+        );
+    }
+
+    fn average_pad_side(pads: &[BhopPadSpec]) -> f32 {
+        pads.iter().map(|pad| pad.side).sum::<f32>() / pads.len().max(1) as f32
+    }
+
+    fn catch_pad_count(pads: &[BhopPadSpec]) -> usize {
+        pads.iter().filter(|pad| pad.catch).count()
+    }
+
+    fn catch_pad_rate(pads: &[BhopPadSpec]) -> f32 {
+        catch_pad_count(pads) as f32 / pads.len().max(1) as f32
+    }
+
+    fn spacing_issues(profile: &BhopProfile, pads: &[BhopPadSpec]) -> Vec<BhopSpacingIssue> {
+        validate_bhop_spacing(profile, pads, &BhopSpacingRules::default())
+    }
+
+    fn route_gaps_for_mask(
+        profile: &BhopProfile,
+        pads: &[BhopPadSpec],
+        route_mask: u8,
+    ) -> Vec<f32> {
+        let mut gaps = Vec::new();
+        for step in 1..profile.pad_count {
+            let prev = route_pad_for_step(pads, step - 1, route_mask).expect("expected route pad");
+            let curr = route_pad_for_step(pads, step, route_mask).expect("expected route pad");
+            gaps.push(bhop_edge_gap(prev, curr));
+        }
+        gaps
+    }
+
+    fn min_route_gap(profile: &BhopProfile, pads: &[BhopPadSpec]) -> f32 {
+        bhop_route_masks(profile.pattern)
+            .iter()
+            .flat_map(|route_mask| route_gaps_for_mask(profile, pads, *route_mask))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    fn min_branch_gap(profile: &BhopProfile, pads: &[BhopPadSpec]) -> Option<f32> {
+        let mut min_gap: Option<f32> = None;
+        for step in 0..profile.pad_count {
+            let step_pads = pads
+                .iter()
+                .filter(|pad| pad.step == step)
+                .collect::<Vec<_>>();
+            for left in 0..step_pads.len() {
+                for right in left + 1..step_pads.len() {
+                    let gap = bhop_edge_gap(step_pads[left], step_pads[right]);
+                    min_gap = Some(min_gap.map_or(gap, |current| current.min(gap)));
+                }
+            }
+        }
+        min_gap
+    }
+
+    fn surf_end_ridge(layout: &ModuleLayout) -> Option<Vec3> {
+        layout
+            .solids
+            .iter()
+            .filter_map(|solid| match &solid.body {
+                SolidBody::StaticSurfWedge {
+                    wall_side,
+                    render_points,
+                } if *wall_side > 0.0 && render_points.len() >= 2 => {
+                    Some(solid.center + render_points[1])
+                }
+                _ => None,
+            })
+            .last()
     }
 
     #[test]
@@ -2549,6 +3787,182 @@ mod tests {
             rooms[1].top.y - last_top > 8.0,
             "last bhop top should sit noticeably below the room anchor"
         );
+    }
+
+    #[test]
+    fn surf_to_bhop_transition_stays_close_to_shared_anchor() {
+        let rooms = vec![
+            test_room(0, Vec3::new(0.0, 132.0, 0.0)),
+            test_room(1, Vec3::new(138.0, 102.0, 24.0)),
+            test_room(2, Vec3::new(244.0, 78.0, 54.0)),
+        ];
+        let surf_segment = SegmentPlan {
+            index: 1,
+            from: 0,
+            to: 1,
+            kind: SegmentKind::SurfRamp,
+            seed: 0x5EED_CAFE,
+        };
+        let bhop_segment = SegmentPlan {
+            index: 2,
+            from: 1,
+            to: 2,
+            kind: SegmentKind::SquareBhop,
+            seed: 0xBEEF_CAFE,
+        };
+        let surf_layout = build_segment_layout(&surf_segment, &rooms);
+        let bhop_layout = build_segment_layout(&bhop_segment, &rooms);
+
+        let surf_end = surf_end_ridge(&surf_layout).expect("surf layout should have an end ridge");
+        let bhop_pad = bhop_layout
+            .solids
+            .iter()
+            .find(|solid| matches!(solid.body, SolidBody::Static))
+            .expect("bhop layout should have a first platform");
+        let bhop_forward = direction_from_delta(rooms[2].top - rooms[1].top);
+        let bhop_room_facing_edge = bhop_pad.center - bhop_forward * (bhop_pad.size.x * 0.5);
+
+        assert!(
+            surf_end.xz().distance(rooms[1].top.xz()) <= 10.5,
+            "surf exit should stay near the shared room anchor"
+        );
+        assert!(
+            bhop_room_facing_edge.xz().distance(rooms[1].top.xz()) <= 11.0,
+            "bhop entry should stay near the shared room anchor"
+        );
+        assert!(
+            surf_end.xz().distance(bhop_room_facing_edge.xz()) <= 18.0,
+            "surf-to-bhop handoff should not leave a large dead zone"
+        );
+    }
+
+    #[test]
+    fn bhop_profile_selection_is_deterministic_for_seed_and_ordinal() {
+        let (profile_a, pads_a, _) = build_test_bhop_section(12, 0xD15C_A11E);
+        let (profile_b, pads_b, _) = build_test_bhop_section(12, 0xD15C_A11E);
+
+        assert_eq!(profile_a, profile_b);
+        assert_eq!(pads_a, pads_b);
+    }
+
+    #[test]
+    fn bhop_patterns_emit_complete_routes_boundary_catches_and_anchor_clearance() {
+        for (pattern, band) in [
+            (BhopPattern::Rhythm, BhopDifficultyBand::Intro),
+            (BhopPattern::LaneSwitch, BhopDifficultyBand::Mid),
+            (BhopPattern::DropStrafe, BhopDifficultyBand::Mid),
+            (BhopPattern::SplitMerge, BhopDifficultyBand::Advanced),
+        ] {
+            let profile = forced_bhop_profile(pattern, band);
+            let (profile, pads, rooms) = build_forced_bhop_section(profile, 0xABCD_EF01);
+
+            assert_has_complete_route(&profile, &pads);
+            assert_boundary_catches(&profile, &pads);
+            assert_anchor_clearance(&profile, &pads, &rooms);
+            assert!(pads.iter().all(|pad| pad.side > 0.0 && pad.height > 0.0));
+        }
+    }
+
+    #[test]
+    fn bhop_difficulty_ramp_reduces_average_pad_size_and_catch_frequency() {
+        let mut intro_side = 0.0;
+        let mut advanced_side = 0.0;
+        let mut intro_catch_rate = 0.0;
+        let mut advanced_catch_rate = 0.0;
+
+        for seed in 0_u64..24 {
+            let (_, intro_pads, _) = build_test_bhop_section(0, seed ^ 0x1000);
+            let (_, advanced_pads, _) = build_test_bhop_section(14, seed ^ 0x2000);
+            intro_side += average_pad_side(&intro_pads);
+            advanced_side += average_pad_side(&advanced_pads);
+            intro_catch_rate += catch_pad_rate(&intro_pads);
+            advanced_catch_rate += catch_pad_rate(&advanced_pads);
+        }
+
+        assert!(intro_side > advanced_side);
+        assert!(intro_catch_rate > advanced_catch_rate);
+    }
+
+    #[test]
+    fn split_merge_pattern_only_appears_in_advanced_bands() {
+        let intro_mid_has_split_merge = [0_usize, 6_usize].into_iter().any(|segment_index| {
+            (0_u64..128).any(|seed| {
+                build_test_bhop_section(segment_index, seed).0.pattern == BhopPattern::SplitMerge
+            })
+        });
+        let long_rooms = vec![
+            test_room(0, Vec3::new(0.0, 120.0, 0.0)),
+            test_room(1, Vec3::new(176.0, 80.0, 28.0)),
+        ];
+        let advanced_patterns = (0_u64..128)
+            .map(|seed| {
+                build_test_bhop_section_in_rooms(14, seed, &long_rooms)
+                    .0
+                    .pattern
+            })
+            .collect::<HashSet<_>>();
+
+        assert!(!intro_mid_has_split_merge);
+        assert!(advanced_patterns.contains(&BhopPattern::SplitMerge));
+    }
+
+    #[test]
+    fn bhop_spacing_regression_fixtures_remain_valid() {
+        let fixtures = [
+            (0_usize, 0xBEEF_CAFE_u64),
+            (12_usize, 0xD15C_A11E_u64),
+            (14_usize, 0xABCD_EF01_u64),
+        ];
+
+        for (segment_index, seed) in fixtures {
+            let (profile, pads, _) = build_test_bhop_section(segment_index, seed);
+            let issues = spacing_issues(&profile, &pads);
+            assert!(
+                issues.is_empty(),
+                "segment {segment_index} seed {seed:#x} had spacing issues: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rhythm_spacing_preserves_variation_without_breaking_min_gaps() {
+        let profile = forced_bhop_profile(BhopPattern::Rhythm, BhopDifficultyBand::Intro);
+        let long_rooms = vec![
+            test_room(0, Vec3::new(0.0, 120.0, 0.0)),
+            test_room(1, Vec3::new(182.0, 82.0, 34.0)),
+        ];
+        let (profile, pads) = build_forced_bhop_section_in_rooms(profile, 0x1A2B_3C4D, &long_rooms);
+        let gaps = route_gaps_for_mask(&profile, &pads, 0b01);
+        let min_gap = gaps.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_gap = gaps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+        assert!(spacing_issues(&profile, &pads).is_empty());
+        assert!(min_gap >= BHOP_MIN_ROUTE_EDGE_GAP);
+        assert!(max_gap - min_gap > 0.25, "rhythm gaps should still vary");
+    }
+
+    #[test]
+    fn bhop_spacing_is_hard_guaranteed_across_seed_sweep() {
+        let mut min_observed_route_gap = f32::INFINITY;
+        let mut min_observed_branch_gap = f32::INFINITY;
+
+        for segment_index in 0_usize..=20 {
+            for seed in 0_u64..=2047 {
+                let (profile, pads, _) = build_test_bhop_section(segment_index, seed);
+                let issues = spacing_issues(&profile, &pads);
+                assert!(
+                    issues.is_empty(),
+                    "segment {segment_index} seed {seed:#x} had spacing issues: {issues:?}"
+                );
+                min_observed_route_gap = min_observed_route_gap.min(min_route_gap(&profile, &pads));
+                if let Some(branch_gap) = min_branch_gap(&profile, &pads) {
+                    min_observed_branch_gap = min_observed_branch_gap.min(branch_gap);
+                }
+            }
+        }
+
+        assert!(min_observed_route_gap + BHOP_SPACING_EPSILON >= BHOP_MIN_ROUTE_EDGE_GAP);
+        assert!(min_observed_branch_gap + BHOP_SPACING_EPSILON >= BHOP_MIN_BRANCH_EDGE_GAP);
     }
 
     #[test]
